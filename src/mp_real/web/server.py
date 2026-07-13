@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from collections.abc import Callable
 import copy
 import dataclasses
 from http import HTTPStatus
@@ -14,11 +15,9 @@ import json
 import logging
 import os
 import pathlib
-import queue
 import secrets
 import threading
 import time
-import traceback
 from typing import Any
 import urllib.parse
 
@@ -31,13 +30,15 @@ except ImportError:
     cv2 = None
 
 from mp_real.common.image import preprocess_image
-from mp_real.common.runtime import RealTimeChunkingBuffer, rtc_replan_stride, select_rtc_cursor
+from mp_real.common.runtime import rtc_replan_stride
 from mp_real.policy_client import msgpack_numpy
+from mp_real.robots.base import Robot
 from mp_real.robots.piper import infer as infer_piper
 from mp_real.robots.rm2 import infer as infer_rm2
 from mp_real.robots.registry import create_robot
 from mp_real.runtime.config import InferenceLoopConfig
-from mp_real.runtime.inference import run_policy_loop
+from mp_real.runtime.controller import ControllerAlreadyRunningError, RuntimeController
+from mp_real.web.runtime import CachedFrameObservationSource, WebInferenceAdapter, WebLoopHooks
 
 
 CAMERA_NAMES = ("cam_head", "cam_left_wrist", "cam_right_wrist")
@@ -287,17 +288,31 @@ def _coerce_float_tuple(value: Any, *, length: int, field: str) -> tuple[float, 
 
 
 class PiperWebRuntime:
-    def __init__(self, initial_args: infer_piper.Args | None = None, *, policy_timeout: float = 3.0) -> None:
+    def __init__(
+        self,
+        initial_args: infer_piper.Args | None = None,
+        *,
+        policy_timeout: float = 3.0,
+        robot_factory: Callable[[str, Any], Robot] = create_robot,
+        policy_client_factory: Callable[[str, str | None, float], PolicyClient] | None = None,
+        camera_factory: Callable[[infer_piper.Args], dict[str, infer_piper.Camera]] | None = None,
+    ) -> None:
         self._lock = threading.RLock()
-        self._robot_lock = threading.Lock()
         self._frame_condition = threading.Condition(self._lock)
         self._args = copy.deepcopy(initial_args) if initial_args is not None else _default_args()
         self._camera_stream_fps = 10.0
         self._policy_timeout = policy_timeout
+        self._robot_factory = robot_factory
+        self._policy_client_factory = policy_client_factory or (
+            lambda server_url, api_key, timeout: PolicyClient(server_url, api_key, timeout=timeout)
+        )
+        self._camera_factory = camera_factory or infer_piper.make_cameras
 
-        self._client: PolicyClient | None = None
-        self._left: infer_piper.PiperArm | None = None
-        self._right: infer_piper.PiperArm | None = None
+        self._controller: RuntimeController | None = None
+        self._loop_hooks = WebLoopHooks(
+            error_callback=self._record_loop_error,
+            stopped_callback=self._record_loop_stopped,
+        )
         self._cameras: dict[str, infer_piper.Camera] = {}
         self._frames: dict[str, FrameSnapshot] = {
             name: FrameSnapshot(
@@ -306,9 +321,7 @@ class PiperWebRuntime:
             for name in CAMERA_NAMES
         }
 
-        self._run_thread: threading.Thread | None = None
         self._camera_thread: threading.Thread | None = None
-        self._stop_event = threading.Event()
         self._camera_stop_event = threading.Event()
         self._logs: deque[str] = deque(maxlen=200)
 
@@ -320,19 +333,26 @@ class PiperWebRuntime:
         self._last_error: str | None = None
         self._server_metadata: dict[str, Any] | None = None
 
-        self._step = 0
-        self._action_queue_len = 0
-        self._last_infer_latency_ms: float | None = None
-        self._last_loop_ms: float | None = None
-        self._last_control_hz: float | None = None
-        self._last_infer_hz: float | None = None
-        self._started_at: float | None = None
-
     def log(self, message: str) -> None:
         line = f"{time.strftime('%H:%M:%S')} {message}"
         with self._lock:
             self._logs.append(line)
         logging.info(message)
+
+    def _record_loop_error(self, error: BaseException) -> None:
+        with self._lock:
+            self._policy_connected = False
+            self._last_error = str(error)
+            self._phase = "error"
+            self._logs.append(f"{time.strftime('%H:%M:%S')} Inference loop failed: {error}")
+
+    def _record_loop_stopped(self) -> None:
+        with self._lock:
+            self._running = False
+            self._stop_requested = False
+            if self._phase != "error":
+                self._phase = "stopped"
+            self._logs.append(f"{time.strftime('%H:%M:%S')} Inference loop stopped")
 
     def get_config(self) -> dict[str, Any]:
         with self._lock:
@@ -344,6 +364,7 @@ class PiperWebRuntime:
 
     def update_config(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
+            self._refresh_controller_state_locked()
             if not self._can_edit_config_locked():
                 raise ApiError("Parameters can only be changed while the robot is not running")
             args = copy.deepcopy(self._args)
@@ -509,44 +530,89 @@ class PiperWebRuntime:
     def _can_edit_connection_config_locked(self) -> bool:
         return self._can_edit_config_locked() and not self._connected
 
+    def _make_inference_adapter(self, robot: Robot, args: infer_piper.Args) -> WebInferenceAdapter:
+        source = CachedFrameObservationSource(
+            robot=robot,
+            read_images=lambda: (self._latest_images_for_inference(args), None),
+            image_masks=_camera_masks(args),
+            prompt=args.prompt,
+        )
+
+        def decode(response: dict[str, Any], replan_steps: int) -> np.ndarray:
+            if replan_steps != args.replan_steps:
+                raise ValueError("Piper replan_steps must match the Web runtime configuration")
+            return infer_piper.response_to_action_chunk(response, args)
+
+        return WebInferenceAdapter(
+            name="piper",
+            robot=robot,
+            observation_source=source,
+            decode_chunk=decode,
+            stabilize=lambda action, previous: infer_piper.stabilize_action(action, previous, args),
+            infer_interval_s=1.0 / args.fps,
+        )
+
+    @staticmethod
+    def _loop_config(args: infer_piper.Args) -> InferenceLoopConfig:
+        config = InferenceLoopConfig.from_args(args)
+        if args.infer_only and args.max_steps is not None:
+            config = dataclasses.replace(config, infer_only_chunks=args.max_steps)
+        return config
+
+    def _refresh_controller_state_locked(self) -> None:
+        if self._controller is None:
+            return
+        controller_status = self._controller.status()
+        self._running = controller_status.running
+        self._stop_requested = controller_status.stop_requested
+        if controller_status.error is not None:
+            self._policy_connected = False
+            self._last_error = str(controller_status.error)
+            self._phase = "error"
+        elif not controller_status.running and self._phase == "running":
+            self._phase = "stopped"
+
     def start(self) -> dict[str, Any]:
         with self._lock:
+            self._refresh_controller_state_locked()
             if self._running or self._stop_requested:
                 raise ApiError("Runtime is already running or stopping", HTTPStatus.CONFLICT)
             args = copy.deepcopy(self._args)
-            camera_stream_fps = self._camera_stream_fps
             policy_timeout = self._policy_timeout
 
         if not self._connected:
             self._connect(args, policy_timeout=policy_timeout)
 
         with self._lock:
-            if self._running:
-                raise ApiError("Runtime is already running", HTTPStatus.CONFLICT)
-            if self._client is None or self._left is None or self._right is None:
+            self._refresh_controller_state_locked()
+            controller = self._controller
+            if controller is None:
                 raise ApiError("Runtime is not fully connected", HTTPStatus.CONFLICT)
             args = copy.deepcopy(self._args)
-            self._apply_arm_runtime_settings(args)
-            self._stop_event.clear()
+            controller.configure_robot(args)
+            self._loop_hooks.reset()
+            controller.configure(
+                self._make_inference_adapter(controller.robot, args),
+                self._loop_config(args),
+                hooks=self._loop_hooks,
+                on_step=self._loop_hooks.on_step,
+            )
             self._stop_requested = False
             self._running = True
             self._phase = "running"
             self._last_error = None
-            self._step = 0
-            self._action_queue_len = 0
-            self._last_infer_latency_ms = None
-            self._last_loop_ms = None
-            self._last_control_hz = None
-            self._last_infer_hz = None
-            self._started_at = time.monotonic()
-            self._ensure_camera_thread_locked(args, camera_stream_fps)
-            self._run_thread = threading.Thread(target=self._run_loop, args=(args,), daemon=True, name="piper-web-run")
-            self._run_thread.start()
+            self._ensure_camera_thread_locked(args, self._camera_stream_fps)
+            try:
+                controller.start()
+            except ControllerAlreadyRunningError as exc:
+                self._refresh_controller_state_locked()
+                raise ApiError(str(exc), HTTPStatus.CONFLICT) from exc
             self.log("Started inference loop")
             return self.status()
 
     def connect(self) -> dict[str, Any]:
         with self._lock:
+            self._refresh_controller_state_locked()
             if self._running or self._stop_requested:
                 raise ApiError("Runtime is running or stopping", HTTPStatus.CONFLICT)
             if self._connected:
@@ -564,28 +630,33 @@ class PiperWebRuntime:
         self.log("Connecting Piper arms")
 
         client: PolicyClient | None = None
-        left: infer_piper.PiperArm | None = None
-        right: infer_piper.PiperArm | None = None
+        robot: Robot | None = None
         cameras: dict[str, infer_piper.Camera] = {}
         try:
-            robot = create_robot("piper", args)
-            if not isinstance(robot, infer_piper.PiperRobot):
-                raise RuntimeError("Piper registry factory returned an incompatible robot")
-            left = robot.left
-            right = robot.right
+            robot = self._robot_factory("piper", args)
             if not args.infer_only:
-                with self._robot_lock:
-                    infer_piper.maybe_reset_arms(left, right, args)
+                robot.reset()
 
             self.log(f"Connecting policy server {args.server_url}")
-            client = PolicyClient(args.server_url, args.api_key, timeout=policy_timeout)
+            client = self._policy_client_factory(args.server_url, args.api_key, policy_timeout)
             self.log("Connected policy server")
-            cameras = infer_piper.make_cameras(args)
+            cameras = self._camera_factory(args)
+            adapter = self._make_inference_adapter(robot, args)
+            controller = RuntimeController(
+                robot,
+                adapter,
+                client,
+                self._loop_config(args),
+                hooks=self._loop_hooks,
+                on_step=self._loop_hooks.on_step,
+                thread_name="piper-web-run",
+                print_infer_only_chunks=False,
+            )
         except Exception as exc:
             if cameras:
                 infer_piper.close_cameras(cameras)
-            infer_piper.close_arm(left)
-            infer_piper.close_arm(right)
+            if robot is not None:
+                robot.close()
             if client is not None:
                 client.close()
             with self._lock:
@@ -597,11 +668,9 @@ class PiperWebRuntime:
             raise ApiError(str(exc), HTTPStatus.BAD_GATEWAY) from exc
 
         with self._lock:
-            self._client = client
-            self._left = left
-            self._right = right
+            self._controller = controller
             self._cameras = cameras
-            self._server_metadata = client.metadata
+            self._server_metadata = getattr(client, "metadata", {})
             self._connected = True
             self._policy_connected = True
             self._phase = "stopped"
@@ -614,21 +683,21 @@ class PiperWebRuntime:
         self._camera_thread = threading.Thread(
             target=self._camera_loop,
             args=(copy.deepcopy(args), camera_stream_fps),
-            daemon=True,
+            daemon=False,
             name="piper-web-camera",
         )
         self._camera_thread.start()
 
     def stop(self, *, wait: bool = False) -> dict[str, Any]:
         with self._lock:
+            self._refresh_controller_state_locked()
             if not self._running and not self._stop_requested:
                 return self.status()
             self._stop_requested = True
-            self._stop_event.set()
-            thread = self._run_thread
+            controller = self._controller
         self.log("Stop requested")
-        if wait and thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=5.0)
+        if controller is not None:
+            controller.stop(wait=wait, timeout=5.0 if wait else None)
         return self.status()
 
     def disconnect(self) -> dict[str, Any]:
@@ -641,18 +710,15 @@ class PiperWebRuntime:
 
         if camera_thread is not None and camera_thread is not threading.current_thread():
             camera_thread.join(timeout=max(1.0, self._args.camera_timeout + 1.0))
+            if camera_thread.is_alive():
+                raise ApiError("Camera preview is still stopping; retry disconnect shortly", HTTPStatus.CONFLICT)
 
         with self._lock:
-            client = self._client
-            left = self._left
-            right = self._right
+            controller = self._controller
             cameras = self._cameras
-            self._client = None
-            self._left = None
-            self._right = None
+            self._controller = None
             self._cameras = {}
             self._camera_thread = None
-            self._run_thread = None
             self._connected = False
             self._policy_connected = False
             self._running = False
@@ -660,29 +726,27 @@ class PiperWebRuntime:
             self._phase = "idle"
             self._last_error = None
             self._server_metadata = None
-            self._action_queue_len = 0
+            self._loop_hooks.reset()
             self._reset_placeholder_frames_locked(self._args.resize_size)
 
         if cameras:
             infer_piper.close_cameras(cameras)
-        infer_piper.close_arm(left)
-        infer_piper.close_arm(right)
-        if client is not None:
-            client.close()
+        if controller is not None:
+            controller.close()
         self.log("Disconnected runtime")
         return self.status()
 
     def reset_arms(self) -> dict[str, Any]:
         with self._lock:
+            self._refresh_controller_state_locked()
             if self._running and self._policy_connected:
                 raise ApiError("Reset is only allowed while stopped or when the policy server is disconnected")
-            left = self._left
-            right = self._right
+            controller = self._controller
             args = copy.deepcopy(self._args)
 
         if self._running:
             self.stop(wait=True)
-        if left is None or right is None:
+        if controller is None:
             raise ApiError("Arms are not connected", HTTPStatus.CONFLICT)
 
         args.reset_on_start = True
@@ -690,13 +754,19 @@ class PiperWebRuntime:
         args.init_right_joints = RESET_RIGHT_JOINTS
         args.init_left_gripper = RESET_LEFT_GRIPPER
         args.init_right_gripper = RESET_RIGHT_GRIPPER
-        with self._robot_lock:
-            infer_piper.maybe_reset_arms(left, right, args)
+        robot = controller.robot
+        if isinstance(robot, infer_piper.PiperRobot):
+            robot.args = args
+        try:
+            controller.reset_robot()
+        except ControllerAlreadyRunningError as exc:
+            raise ApiError(str(exc), HTTPStatus.CONFLICT) from exc
         self.log("Reset arms to zero joints and open grippers")
         return self.status()
 
     def ping_policy(self) -> dict[str, Any]:
         with self._lock:
+            self._refresh_controller_state_locked()
             if self._running:
                 return {
                     "ok": self._policy_connected,
@@ -709,7 +779,7 @@ class PiperWebRuntime:
         client: PolicyClient | None = None
         started = time.monotonic()
         try:
-            client = PolicyClient(args.server_url, args.api_key, timeout=timeout)
+            client = self._policy_client_factory(args.server_url, args.api_key, timeout)
             latency_ms = (time.monotonic() - started) * 1000.0
             return {
                 "robot": "piper",
@@ -780,209 +850,6 @@ class PiperWebRuntime:
                     raise RuntimeError(f"Camera frames unavailable: missing={missing}, errors={errors}")
                 self._frame_condition.wait(min(0.05, remaining))
 
-    def _prepare_observation(self, args: infer_piper.Args) -> dict[str, Any]:
-        with self._lock:
-            left = self._left
-            right = self._right
-        if left is None or right is None:
-            raise RuntimeError("Arms are not connected")
-        return {
-            "images": self._latest_images_for_inference(args),
-            "image_masks": _camera_masks(args),
-            "state": infer_piper.read_state(left, right, args, robot_lock=self._robot_lock),
-            "prompt": args.prompt,
-        }
-
-    def _infer_action_chunk(self, args: infer_piper.Args) -> np.ndarray:
-        with self._lock:
-            client = self._client
-        if client is None:
-            raise RuntimeError("Policy client is not connected")
-
-        obs = self._prepare_observation(args)
-        infer_t0 = time.monotonic()
-        response = client.infer(obs)
-        infer_latency = time.monotonic() - infer_t0
-        action_chunk = infer_piper.response_to_action_chunk(response, args)
-
-        with self._lock:
-            self._last_infer_latency_ms = infer_latency * 1000.0
-            self._last_infer_hz = 1.0 / infer_latency if infer_latency > 0 else None
-        return action_chunk
-
-    def _update_loop_metrics(self, loop_t0: float, *, action_queue_len: int = 0) -> None:
-        elapsed = time.monotonic() - loop_t0
-        with self._lock:
-            self._last_loop_ms = elapsed * 1000.0
-            self._last_control_hz = 1.0 / elapsed if elapsed > 0 else None
-            self._action_queue_len = action_queue_len
-
-    def _get_arms(self) -> tuple[infer_piper.PiperArm, infer_piper.PiperArm]:
-        with self._lock:
-            left = self._left
-            right = self._right
-        if left is None or right is None:
-            raise RuntimeError("Arms are not connected")
-        return left, right
-
-    def _apply_arm_runtime_settings(self, args: infer_piper.Args) -> None:
-        left, right = self._get_arms()
-        with self._robot_lock:
-            left.arm.set_speed_percent(args.speed_percent)
-            right.arm.set_speed_percent(args.speed_percent)
-
-    def _run_infer_only_loop(self, args: infer_piper.Args) -> None:
-        dt = 1.0 / args.fps
-        max_chunks = args.max_steps if args.max_steps is not None else args.infer_only_chunks
-        while not self._stop_event.is_set() and self._step < max_chunks:
-            loop_t0 = time.monotonic()
-            action_chunk = self._infer_action_chunk(args)
-            with self._lock:
-                self._step += 1
-            self._update_loop_metrics(loop_t0, action_queue_len=len(action_chunk))
-            self._stop_event.wait(max(0.0, dt - (time.monotonic() - loop_t0)))
-
-    def _run_sync_control_loop(self, args: infer_piper.Args) -> None:
-        action_plan: deque[np.ndarray] = deque()
-        dt = 1.0 / args.fps
-        left, right = self._get_arms()
-        last_action: np.ndarray | None = infer_piper.read_state(left, right, args, robot_lock=self._robot_lock)
-
-        while not self._stop_event.is_set() and (args.max_steps is None or self._step < args.max_steps):
-            loop_t0 = time.monotonic()
-            if not action_plan:
-                action_plan.extend(self._infer_action_chunk(args))
-
-            action = infer_piper.stabilize_action(action_plan.popleft(), last_action, args)
-            last_action = infer_piper.execute_action_transition(
-                last_action,
-                action,
-                left,
-                right,
-                args,
-                robot_lock=self._robot_lock,
-            )
-
-            with self._lock:
-                self._step += 1
-            self._update_loop_metrics(loop_t0, action_queue_len=len(action_plan))
-            self._stop_event.wait(max(0.0, dt - (time.monotonic() - loop_t0)))
-
-    def _rtc_action_producer_loop(
-        self,
-        args: infer_piper.Args,
-        rtc: RealTimeChunkingBuffer,
-        producer_stop: threading.Event,
-        errors: queue.Queue[BaseException],
-    ) -> None:
-        while not producer_stop.is_set() and not self._stop_event.is_set():
-            cursor = select_rtc_cursor(rtc, args)
-            if cursor is None:
-                producer_stop.wait(min(0.005, 0.25 / args.fps))
-                continue
-
-            generation = rtc.get_generation()
-            try:
-                action_chunk = self._infer_action_chunk(args)
-                rtc.enqueue(action_chunk, cursor, generation)
-            except Exception as exc:
-                errors.put(exc)
-                producer_stop.set()
-                self._stop_event.set()
-                return
-
-    def _raise_producer_error(self, errors: queue.Queue[BaseException]) -> None:
-        try:
-            exc = errors.get_nowait()
-        except queue.Empty:
-            return
-        raise RuntimeError("RTC action producer failed") from exc
-
-    def _run_rtc_control_loop(self, args: infer_piper.Args) -> None:
-        left, right = self._get_arms()
-        rtc = RealTimeChunkingBuffer(exp_weight=args.rtc_exp_weight)
-        rtc.clear()
-
-        producer_stop = threading.Event()
-        errors: queue.Queue[BaseException] = queue.Queue()
-        producer = threading.Thread(
-            target=self._rtc_action_producer_loop,
-            args=(args, rtc, producer_stop, errors),
-            daemon=True,
-            name="piper-web-rtc-producer",
-        )
-        producer.start()
-
-        dt = 1.0 / args.fps
-        last_action: np.ndarray | None = infer_piper.read_state(left, right, args, robot_lock=self._robot_lock)
-        try:
-            while not self._stop_event.is_set() and (args.max_steps is None or self._step < args.max_steps):
-                loop_t0 = time.monotonic()
-                self._raise_producer_error(errors)
-
-                rtc.set_control_time(self._step)
-                action = rtc.get_action(self._step)
-                if action is None:
-                    if last_action is not None and args.hold_last_action:
-                        last_action = infer_piper.execute_action_transition(
-                            last_action,
-                            last_action,
-                            left,
-                            right,
-                            args,
-                            robot_lock=self._robot_lock,
-                        )
-                    self._update_loop_metrics(loop_t0)
-                    self._stop_event.wait(max(0.0, dt - (time.monotonic() - loop_t0)))
-                    continue
-
-                action = infer_piper.stabilize_action(action, last_action, args)
-                last_action = infer_piper.execute_action_transition(
-                    last_action,
-                    action,
-                    left,
-                    right,
-                    args,
-                    robot_lock=self._robot_lock,
-                )
-
-                with self._lock:
-                    self._step += 1
-                self._update_loop_metrics(loop_t0)
-                self._stop_event.wait(max(0.0, dt - (time.monotonic() - loop_t0)))
-        finally:
-            producer_stop.set()
-            producer.join(timeout=2.0)
-            self._raise_producer_error(errors)
-
-    def _run_loop(self, args: infer_piper.Args) -> None:
-        error: str | None = None
-
-        try:
-            if args.infer_only:
-                self._run_infer_only_loop(args)
-            elif args.use_rtc:
-                self._run_rtc_control_loop(args)
-            else:
-                self._run_sync_control_loop(args)
-        except Exception as exc:
-            error = str(exc)
-            with self._lock:
-                self._policy_connected = False
-                self._last_error = error
-            self.log(f"Inference loop failed: {exc}")
-            logging.debug("Inference loop traceback:\n%s", traceback.format_exc())
-        finally:
-            with self._lock:
-                self._running = False
-                self._stop_requested = False
-                self._action_queue_len = 0
-                if error:
-                    self._phase = "error"
-                else:
-                    self._phase = "stopped"
-            self.log("Inference loop stopped")
-
     def wait_frame(self, camera_name: str, last_sequence: int, *, timeout: float = 5.0) -> FrameSnapshot:
         if camera_name not in CAMERA_NAMES:
             raise ApiError(f"Unknown camera {camera_name}", HTTPStatus.NOT_FOUND)
@@ -999,7 +866,13 @@ class PiperWebRuntime:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
+            self._refresh_controller_state_locked()
+            loop = self._loop_hooks.snapshot()
             now = time.monotonic()
+            controller_status = self._controller.status() if self._controller is not None else None
+            started_at_ns = loop.started_at_monotonic_ns
+            if started_at_ns is None and controller_status is not None:
+                started_at_ns = controller_status.started_at_monotonic_ns
             frames = {
                 name: {
                     "sequence": frame.sequence,
@@ -1008,9 +881,7 @@ class PiperWebRuntime:
                 }
                 for name, frame in self._frames.items()
             }
-            can_reset = (
-                self._left is not None and self._right is not None and (not self._running or not self._policy_connected)
-            )
+            can_reset = self._controller is not None and (not self._running or not self._policy_connected)
             return {
                 "robot": "piper",
                 "phase": self._phase,
@@ -1030,7 +901,7 @@ class PiperWebRuntime:
                 "can_stop": self._running or self._stop_requested,
                 "can_disconnect": self._connected or self._running or self._phase in {"connecting", "error", "stopped"},
                 "can_reset": can_reset,
-                "step": self._step,
+                "step": loop.step,
                 "max_steps": self._args.max_steps,
                 "prompt": self._args.prompt,
                 "infer_only": self._args.infer_only,
@@ -1038,14 +909,14 @@ class PiperWebRuntime:
                 "server_metadata": _json_safe(self._server_metadata or {}),
                 "last_error": self._last_error,
                 "metrics": {
-                    "infer_latency_ms": round(self._last_infer_latency_ms, 2)
-                    if self._last_infer_latency_ms is not None
+                    "infer_latency_ms": round(loop.infer_latency_ms, 2) if loop.infer_latency_ms is not None else None,
+                    "infer_hz": round(loop.infer_hz, 2) if loop.infer_hz is not None else None,
+                    "loop_ms": round(loop.loop_ms, 2) if loop.loop_ms is not None else None,
+                    "control_hz": round(loop.control_hz, 2) if loop.control_hz is not None else None,
+                    "action_queue_len": loop.action_queue_len,
+                    "uptime_s": round((time.monotonic_ns() - started_at_ns) / 1e9, 1)
+                    if started_at_ns is not None
                     else None,
-                    "infer_hz": round(self._last_infer_hz, 2) if self._last_infer_hz is not None else None,
-                    "loop_ms": round(self._last_loop_ms, 2) if self._last_loop_ms is not None else None,
-                    "control_hz": round(self._last_control_hz, 2) if self._last_control_hz is not None else None,
-                    "action_queue_len": self._action_queue_len,
-                    "uptime_s": round(now - self._started_at, 1) if self._started_at else None,
                 },
                 "frames": frames,
                 "logs": list(self._logs),
@@ -1059,79 +930,56 @@ _RM_STREAM_TO_POLICY = {
 }
 
 
-class _Rm2WebAdapter:
-    name = "rm2"
-
-    def __init__(self, runtime: "Rm2WebRuntime", args: infer_rm2.Args) -> None:
-        self.runtime = runtime
-        self.args = args
-
-    def observe(self) -> dict[str, Any]:
-        images, camera_params = self.runtime._latest_policy_images()
-        return {
-            "images": images,
-            "image_masks": {name: np.bool_(self.args.camera_backend != "black") for name in images},
-            "camera_params": camera_params,
-            "state": self.runtime._robot.read_state().values,
-            "prompt": self.args.prompt,
-        }
-
-    def decode_action_chunk(self, response: dict[str, Any], replan_steps: int) -> np.ndarray:
-        if replan_steps != self.args.replan_steps:
-            raise ValueError("RM2 replan_steps must match the Web runtime configuration")
-        return infer_rm2.response_to_action_chunk(response, self.args)
-
-    def initial_action(self) -> np.ndarray:
-        return self.runtime._robot.read_state().values
-
-    def stabilize_action(self, action: np.ndarray, previous: np.ndarray | None) -> np.ndarray:
-        return infer_rm2.stabilize_action(action, previous, self.args)
-
-    def execute_transition(self, previous: np.ndarray | None, target: np.ndarray) -> np.ndarray:
-        return self.runtime._robot.execute_transition(previous, target)
-
-    def infer_only_metadata(self, observation: dict[str, Any]) -> dict[str, Any]:
-        return {"camera_params": observation["camera_params"]}
-
-    def profile(self, stage: str, elapsed_s: float) -> None:
-        if self.args.profile_timing:
-            logging.info("rm2 web profile %s=%.3fs", stage, elapsed_s)
-
-    def infer_only_interval_s(self) -> float:
-        return 0.0
-
-
 class Rm2WebRuntime:
     """RM2 implementation of the same Web lifecycle exposed by PiperWebRuntime."""
 
-    def __init__(self, initial_args: infer_rm2.Args | None = None, *, policy_timeout: float = 3.0) -> None:
+    def __init__(
+        self,
+        initial_args: infer_rm2.Args | None = None,
+        *,
+        policy_timeout: float = 3.0,
+        robot_factory: Callable[[str, Any], Robot] = create_robot,
+        policy_client_factory: Callable[[str, str | None, float], PolicyClient] | None = None,
+        camera_factory: Callable[[infer_rm2.Args], dict[str, infer_rm2.Camera]] | None = None,
+    ) -> None:
         self._lock = threading.RLock()
         self._frame_condition = threading.Condition(self._lock)
         self._args = copy.deepcopy(initial_args) if initial_args is not None else infer_rm2.Args()
         self._policy_timeout = policy_timeout
         self._camera_stream_fps = 10.0
-        self._client: PolicyClient | None = None
-        self._robot: infer_rm2.Rm2Robot | None = None
+        self._robot_factory = robot_factory
+        self._policy_client_factory = policy_client_factory or (
+            lambda server_url, api_key, timeout: PolicyClient(server_url, api_key, timeout=timeout)
+        )
+        self._camera_factory = camera_factory or infer_rm2.make_cameras
+        self._controller: RuntimeController | None = None
+        self._loop_hooks = WebLoopHooks(error_callback=self._record_loop_error)
         self._cameras: dict[str, infer_rm2.Camera] = {}
         self._frames = {
-            name: FrameSnapshot(_black_frame(self._args.resize_size), _encode_jpeg_rgb(_black_frame(self._args.resize_size)))
+            name: FrameSnapshot(
+                _black_frame(self._args.resize_size),
+                _encode_jpeg_rgb(_black_frame(self._args.resize_size)),
+            )
             for name in CAMERA_NAMES
         }
-        self._run_thread: threading.Thread | None = None
         self._camera_thread: threading.Thread | None = None
-        self._stop_event = threading.Event()
         self._camera_stop_event = threading.Event()
         self._connected = False
         self._running = False
         self._phase = "idle"
         self._last_error: str | None = None
-        self._step = 0
         self._logs: deque[str] = deque(maxlen=200)
 
     def log(self, message: str) -> None:
         with self._lock:
             self._logs.append(f"{time.strftime('%H:%M:%S')} {message}")
         logging.info(message)
+
+    def _record_loop_error(self, error: BaseException) -> None:
+        with self._lock:
+            self._phase = "error"
+            self._last_error = str(error)
+            self._logs.append(f"{time.strftime('%H:%M:%S')} RM2 inference failed: {error}")
 
     def get_config(self) -> dict[str, Any]:
         with self._lock:
@@ -1168,10 +1016,20 @@ class Rm2WebRuntime:
 
     def update_config(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
+            self._refresh_controller_state_locked()
             if self._connected or self._running:
                 raise ApiError("Disconnect RM2 before changing parameters", HTTPStatus.CONFLICT)
             args = copy.deepcopy(self._args)
-            for field in ("server_url", "api_key", "prompt", "left_ip", "right_ip", "cam_left_topic", "cam_right_topic", "cam_head_topic"):
+            for field in (
+                "server_url",
+                "api_key",
+                "prompt",
+                "left_ip",
+                "right_ip",
+                "cam_left_topic",
+                "cam_right_topic",
+                "cam_head_topic",
+            ):
                 if field in payload:
                     value = str(payload[field])
                     setattr(args, field, value if field != "api_key" or value else None)
@@ -1200,31 +1058,85 @@ class Rm2WebRuntime:
             self._args = args
             return self.get_config()
 
+    def _make_inference_adapter(self, robot: Robot, args: infer_rm2.Args) -> WebInferenceAdapter:
+        source = CachedFrameObservationSource(
+            robot=robot,
+            read_images=self._latest_policy_images,
+            image_masks={
+                policy_name: np.bool_(args.camera_backend != "black")
+                for policy_name in _RM_STREAM_TO_POLICY.values()
+            },
+            prompt=args.prompt,
+        )
+
+        def decode(response: dict[str, Any], replan_steps: int) -> np.ndarray:
+            if replan_steps != args.replan_steps:
+                raise ValueError("RM2 replan_steps must match the Web runtime configuration")
+            return infer_rm2.response_to_action_chunk(response, args)
+
+        def profile(stage: str, elapsed_s: float) -> None:
+            if args.profile_timing:
+                logging.info("rm2 web profile %s=%.3fs", stage, elapsed_s)
+
+        return WebInferenceAdapter(
+            name="rm2",
+            robot=robot,
+            observation_source=source,
+            decode_chunk=decode,
+            stabilize=lambda action, previous: infer_rm2.stabilize_action(action, previous, args),
+            metadata_keys=("camera_params",),
+            profile_callback=profile,
+        )
+
+    def _refresh_controller_state_locked(self) -> None:
+        if self._controller is None:
+            return
+        controller_status = self._controller.status()
+        self._running = controller_status.running
+        if controller_status.error is not None:
+            self._phase = "error"
+            self._last_error = str(controller_status.error)
+        elif not controller_status.running and self._phase == "running":
+            self._phase = "stopped"
+
     def connect(self) -> dict[str, Any]:
         with self._lock:
+            self._refresh_controller_state_locked()
             if self._connected:
                 return self.status()
             args = copy.deepcopy(self._args)
             self._phase = "connecting"
         client: PolicyClient | None = None
+        robot: Robot | None = None
         cameras: dict[str, infer_rm2.Camera] = {}
         try:
-            client = PolicyClient(args.server_url, args.api_key, timeout=self._policy_timeout)
-            cameras = infer_rm2.make_cameras(args)
-            robot = create_robot("rm2", args)
-            if not isinstance(robot, infer_rm2.Rm2Robot):
-                raise RuntimeError("RM2 registry factory returned an incompatible robot")
+            client = self._policy_client_factory(args.server_url, args.api_key, self._policy_timeout)
+            cameras = self._camera_factory(args)
+            robot = self._robot_factory("rm2", args)
             robot.reset()
+            adapter = self._make_inference_adapter(robot, args)
+            controller = RuntimeController(
+                robot,
+                adapter,
+                client,
+                InferenceLoopConfig.from_args(args),
+                hooks=self._loop_hooks,
+                on_step=self._loop_hooks.on_step,
+                thread_name="rm2-web-run",
+                print_infer_only_chunks=False,
+            )
         except Exception as exc:
             if cameras:
                 infer_rm2.close_cameras(cameras)
+            if robot is not None:
+                robot.close()
             if client is not None:
                 client.close()
             with self._lock:
                 self._phase, self._last_error = "error", str(exc)
             raise ApiError(str(exc), HTTPStatus.BAD_GATEWAY) from exc
         with self._lock:
-            self._client, self._cameras, self._robot = client, cameras, robot
+            self._controller, self._cameras = controller, cameras
             self._connected, self._phase, self._last_error = True, "stopped", None
             self._ensure_camera_thread_locked(args)
         self.log("Connected RM2 runtime")
@@ -1234,48 +1146,72 @@ class Rm2WebRuntime:
         if not self._connected:
             self.connect()
         with self._lock:
-            if self._running or self._client is None or self._robot is None:
+            self._refresh_controller_state_locked()
+            controller = self._controller
+            if self._running or controller is None:
                 raise ApiError("RM2 runtime is not ready", HTTPStatus.CONFLICT)
             args = copy.deepcopy(self._args)
-            self._stop_event.clear()
-            self._running, self._phase, self._step, self._last_error = True, "running", 0, None
-            self._run_thread = threading.Thread(target=self._run_loop, args=(args,), daemon=True, name="rm2-web-run")
-            self._run_thread.start()
+            self._loop_hooks.reset()
+            controller.configure(
+                self._make_inference_adapter(controller.robot, args),
+                InferenceLoopConfig.from_args(args),
+                hooks=self._loop_hooks,
+                on_step=self._loop_hooks.on_step,
+            )
+            self._running, self._phase, self._last_error = True, "running", None
+            try:
+                controller.start()
+            except ControllerAlreadyRunningError as exc:
+                self._refresh_controller_state_locked()
+                raise ApiError(str(exc), HTTPStatus.CONFLICT) from exc
         return self.status()
 
     def stop(self, *, wait: bool = False) -> dict[str, Any]:
-        self._stop_event.set()
-        thread = self._run_thread
-        if wait and thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=5.0)
+        with self._lock:
+            self._refresh_controller_state_locked()
+            controller = self._controller
+        if controller is not None:
+            controller.stop(wait=wait, timeout=5.0 if wait else None)
         return self.status()
 
     def disconnect(self) -> dict[str, Any]:
         self.stop(wait=True)
+        with self._lock:
+            self._refresh_controller_state_locked()
+            if self._running:
+                raise ApiError("RM2 runtime is still stopping", HTTPStatus.CONFLICT)
         self._camera_stop_event.set()
         if self._camera_thread is not None:
             self._camera_thread.join(timeout=3.0)
+            if self._camera_thread.is_alive():
+                raise ApiError("RM2 camera preview is still stopping", HTTPStatus.CONFLICT)
         with self._lock:
-            client, cameras, robot = self._client, self._cameras, self._robot
-            self._client, self._cameras, self._robot = None, {}, None
+            controller, cameras = self._controller, self._cameras
+            self._controller, self._cameras = None, {}
+            self._camera_thread = None
             self._connected, self._running, self._phase = False, False, "idle"
+            self._loop_hooks.reset()
         infer_rm2.close_cameras(cameras)
-        if robot is not None:
-            robot.close()
-        if client is not None:
-            client.close()
+        if controller is not None:
+            controller.close()
         return self.status()
 
     def reset_arms(self) -> dict[str, Any]:
-        if self._robot is None:
+        with self._lock:
+            self._refresh_controller_state_locked()
+            controller = self._controller
+        if controller is None:
             raise ApiError("RM2 is not connected", HTTPStatus.CONFLICT)
-        self._robot.reset()
+        try:
+            controller.reset_robot()
+        except ControllerAlreadyRunningError as exc:
+            raise ApiError(str(exc), HTTPStatus.CONFLICT) from exc
         return self.status()
 
     def ping_policy(self) -> dict[str, Any]:
         client: PolicyClient | None = None
         try:
-            client = PolicyClient(self._args.server_url, self._args.api_key, timeout=self._policy_timeout)
+            client = self._policy_client_factory(self._args.server_url, self._args.api_key, self._policy_timeout)
             return {"ok": True, "connected": True, "metadata": _json_safe(client.metadata)}
         except Exception as exc:
             return {"ok": False, "connected": False, "error": str(exc)}
@@ -1285,7 +1221,12 @@ class Rm2WebRuntime:
 
     def _ensure_camera_thread_locked(self, args: infer_rm2.Args) -> None:
         self._camera_stop_event.clear()
-        self._camera_thread = threading.Thread(target=self._camera_loop, args=(args,), daemon=True, name="rm2-web-camera")
+        self._camera_thread = threading.Thread(
+            target=self._camera_loop,
+            args=(args,),
+            daemon=False,
+            name="rm2-web-camera",
+        )
         self._camera_thread.start()
 
     def _camera_loop(self, args: infer_rm2.Args) -> None:
@@ -1298,7 +1239,12 @@ class Rm2WebRuntime:
                     image = preprocess_image(camera.read(timeout=args.camera_timeout), args.resize_size)
                     with self._frame_condition:
                         old = self._frames[stream_name]
-                        self._frames[stream_name] = FrameSnapshot(image, _encode_jpeg_rgb(image), old.sequence + 1, time.monotonic())
+                        self._frames[stream_name] = FrameSnapshot(
+                            image,
+                            _encode_jpeg_rgb(image),
+                            old.sequence + 1,
+                            time.monotonic(),
+                        )
                         self._frame_condition.notify_all()
                 except Exception as exc:
                     with self._frame_condition:
@@ -1316,26 +1262,6 @@ class Rm2WebRuntime:
             images = {policy: self._frames[stream].image.copy() for stream, policy in _RM_STREAM_TO_POLICY.items()}
         return images, {name: camera.camera_info() for name, camera in self._cameras.items()}
 
-    def _run_loop(self, args: infer_rm2.Args) -> None:
-        try:
-            adapter = _Rm2WebAdapter(self, args)
-            run_policy_loop(
-                self._client,
-                adapter,
-                InferenceLoopConfig.from_args(args),
-                stop_event=self._stop_event,
-                on_step=lambda step, _: setattr(self, "_step", step),
-            )
-            with self._lock:
-                self._phase = "stopped"
-        except Exception as exc:
-            with self._lock:
-                self._phase, self._last_error = "error", str(exc)
-            self.log(f"RM2 inference failed: {exc}")
-        finally:
-            with self._lock:
-                self._running = False
-
     def wait_frame(self, camera_name: str, last_sequence: int, *, timeout: float = 5.0) -> FrameSnapshot:
         deadline = time.monotonic() + timeout
         with self._frame_condition:
@@ -1345,15 +1271,21 @@ class Rm2WebRuntime:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
+            self._refresh_controller_state_locked()
+            loop = self._loop_hooks.snapshot()
             return {
                 "robot": "rm2", "phase": self._phase, "connected": self._connected, "policy_connected": self._connected,
                 "running": self._running, "can_edit_config": not self._connected and not self._running,
                 "can_edit_connection_config": not self._connected, "can_connect": not self._connected,
                 "can_start": self._connected and not self._running, "can_stop": self._running,
-                "can_disconnect": self._connected, "can_reset": self._robot is not None and not self._running,
-                "step": self._step, "max_steps": self._args.max_steps, "prompt": self._args.prompt,
+                "can_disconnect": self._connected, "can_reset": self._controller is not None and not self._running,
+                "step": loop.step, "max_steps": self._args.max_steps, "prompt": self._args.prompt,
                 "server_url": self._args.server_url, "server_metadata": {}, "last_error": self._last_error,
-                "metrics": {}, "frames": {name: {"sequence": frame.sequence, "age_ms": None, "error": frame.error} for name, frame in self._frames.items()},
+                "metrics": {},
+                "frames": {
+                    name: {"sequence": frame.sequence, "age_ms": None, "error": frame.error}
+                    for name, frame in self._frames.items()
+                },
                 "logs": list(self._logs),
             }
 
@@ -1486,7 +1418,12 @@ class PiperWebHandler(BaseHTTPRequestHandler):
 
 class PiperWebServer(ThreadingHTTPServer):
     def __init__(
-        self, server_address: tuple[str, int], handler: type[PiperWebHandler], runtime: Any, *, access_key: str | None = None
+        self,
+        server_address: tuple[str, int],
+        handler: type[PiperWebHandler],
+        runtime: Any,
+        *,
+        access_key: str | None = None,
     ) -> None:
         super().__init__(server_address, handler)
         self.runtime = runtime
@@ -1496,7 +1433,9 @@ class PiperWebServer(ThreadingHTTPServer):
         self.static_dir = packaged_static if packaged_static.is_dir() else source_static
 
     def authorize(self, provided_key: str | None) -> bool:
-        return self.access_key is None or (provided_key is not None and secrets.compare_digest(provided_key, self.access_key))
+        return self.access_key is None or (
+            provided_key is not None and secrets.compare_digest(provided_key, self.access_key)
+        )
 
     def select_robot(self, name: str) -> dict[str, Any]:
         if name not in {"piper", "rm2"}:
@@ -1544,7 +1483,8 @@ def main() -> None:
         if value is not None:
             setattr(runtime_args, field, value)
     for name in CAMERA_NAMES:
-        setattr(runtime_args, f"{name}_backend", getattr(cli_args, f"{name}_backend") or getattr(runtime_args, f"{name}_backend"))
+        backend = getattr(cli_args, f"{name}_backend") or getattr(runtime_args, f"{name}_backend")
+        setattr(runtime_args, f"{name}_backend", backend)
         selector = getattr(cli_args, name)
         if selector is not None:
             setattr(runtime_args, name, selector)

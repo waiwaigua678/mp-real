@@ -186,6 +186,14 @@ class PiperRobot(Robot):
         with self.robot_lock:
             maybe_reset_arms(self.left, self.right, self.args)
 
+    def configure_runtime(self, config: object) -> None:
+        if not isinstance(config, Args):
+            raise TypeError(f"Expected Piper Args, got {type(config).__name__}")
+        with self.robot_lock:
+            self.left.arm.set_speed_percent(config.speed_percent)
+            self.right.arm.set_speed_percent(config.speed_percent)
+            self.args = config
+
     def close(self) -> None:
         close_arm(self.left)
         close_arm(self.right)
