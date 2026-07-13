@@ -213,7 +213,9 @@ label span {
 .video-box {
   display: grid;
   place-items: center;
-  aspect-ratio: 4 / 3;
+  /* The stream is the square image produced by preprocess_image().  Keeping
+     this box square makes the preview an undistorted view of policy input. */
+  aspect-ratio: 1 / 1;
   width: 100%;
   background: #101418;
   overflow: hidden;
