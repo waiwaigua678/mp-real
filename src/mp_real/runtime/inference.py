@@ -18,6 +18,7 @@ from mp_real.common.runtime import (
     sleep_remaining,
 )
 from mp_real.runtime.config import InferenceLoopConfig
+from mp_real.runtime.models import ObservationSnapshot
 
 
 class PolicyClient(Protocol):
@@ -69,14 +70,29 @@ class InferenceHooks:
     def on_observation(self, observation: Mapping[str, Any]) -> None:
         del observation
 
+    def on_observation_captured(self, snapshot: ObservationSnapshot) -> None:
+        del snapshot
+
     def on_inference_started(self, observation: Mapping[str, Any]) -> None:
         del observation
+
+    def on_inference_started_context(self, observation: Mapping[str, Any], stage: str) -> None:
+        del stage
+        self.on_inference_started(observation)
 
     def on_inference_finished(self, response: Mapping[str, Any], elapsed_s: float) -> None:
         del response, elapsed_s
 
+    def on_inference_finished_context(self, response: Mapping[str, Any], elapsed_s: float, stage: str) -> None:
+        del stage
+        self.on_inference_finished(response, elapsed_s)
+
     def on_chunk_received(self, chunk: np.ndarray) -> None:
         del chunk
+
+    def on_chunk_received_context(self, chunk: np.ndarray, stage: str) -> None:
+        del stage
+        self.on_chunk_received(chunk)
 
     def on_action_selected(self, step: int, action: np.ndarray) -> None:
         del step, action
@@ -87,11 +103,97 @@ class InferenceHooks:
     def on_action_executed(self, step: int, action: np.ndarray) -> None:
         del step, action
 
+    def on_safety_rejected(self, step: int | None, action: np.ndarray | None, error: BaseException) -> None:
+        del step, action, error
+
+    def on_policy_warmup_started(self, requests: int) -> None:
+        del requests
+
+    def on_policy_warmup_finished(self, elapsed_s: float) -> None:
+        del elapsed_s
+
+    def on_policy_warmup_failed(self, error: BaseException) -> None:
+        del error
+
+    def on_policy_ready(self, initial_chunk: np.ndarray | None) -> None:
+        del initial_chunk
+
     def on_loop_stopped(self, mode: str) -> None:
         del mode
 
     def on_error(self, error: BaseException) -> None:
         del error
+
+
+class CompositeInferenceHooks(InferenceHooks):
+    """Fan out compatible hooks without changing the existing hook API."""
+
+    def __init__(self, *delegates: InferenceHooks) -> None:
+        self._delegates = delegates
+
+    def on_loop_started(self, mode: str, config: InferenceLoopConfig) -> None:
+        for delegate in self._delegates:
+            delegate.on_loop_started(mode, config)
+
+    def on_observation(self, observation: Mapping[str, Any]) -> None:
+        for delegate in self._delegates:
+            delegate.on_observation(observation)
+
+    def on_observation_captured(self, snapshot: ObservationSnapshot) -> None:
+        for delegate in self._delegates:
+            delegate.on_observation_captured(snapshot)
+
+    def on_inference_started_context(self, observation: Mapping[str, Any], stage: str) -> None:
+        for delegate in self._delegates:
+            delegate.on_inference_started_context(observation, stage)
+
+    def on_inference_finished_context(self, response: Mapping[str, Any], elapsed_s: float, stage: str) -> None:
+        for delegate in self._delegates:
+            delegate.on_inference_finished_context(response, elapsed_s, stage)
+
+    def on_chunk_received_context(self, chunk: np.ndarray, stage: str) -> None:
+        for delegate in self._delegates:
+            delegate.on_chunk_received_context(chunk, stage)
+
+    def on_action_selected(self, step: int, action: np.ndarray) -> None:
+        for delegate in self._delegates:
+            delegate.on_action_selected(step, action)
+
+    def on_action_stabilized(self, step: int, action: np.ndarray) -> None:
+        for delegate in self._delegates:
+            delegate.on_action_stabilized(step, action)
+
+    def on_action_executed(self, step: int, action: np.ndarray) -> None:
+        for delegate in self._delegates:
+            delegate.on_action_executed(step, action)
+
+    def on_safety_rejected(self, step: int | None, action: np.ndarray | None, error: BaseException) -> None:
+        for delegate in self._delegates:
+            delegate.on_safety_rejected(step, action, error)
+
+    def on_policy_warmup_started(self, requests: int) -> None:
+        for delegate in self._delegates:
+            delegate.on_policy_warmup_started(requests)
+
+    def on_policy_warmup_finished(self, elapsed_s: float) -> None:
+        for delegate in self._delegates:
+            delegate.on_policy_warmup_finished(elapsed_s)
+
+    def on_policy_warmup_failed(self, error: BaseException) -> None:
+        for delegate in self._delegates:
+            delegate.on_policy_warmup_failed(error)
+
+    def on_policy_ready(self, initial_chunk: np.ndarray | None) -> None:
+        for delegate in self._delegates:
+            delegate.on_policy_ready(initial_chunk)
+
+    def on_loop_stopped(self, mode: str) -> None:
+        for delegate in self._delegates:
+            delegate.on_loop_stopped(mode)
+
+    def on_error(self, error: BaseException) -> None:
+        for delegate in self._delegates:
+            delegate.on_error(error)
 
 
 def _active_hooks(hooks: InferenceHooks | None) -> InferenceHooks:
@@ -105,26 +207,32 @@ def fetch_action_chunk(
     hooks: InferenceHooks,
     *,
     profile_stage: str = "inference",
+    event_stage: str = "live",
 ) -> FetchedActionChunk:
     observation_started_ns = time.monotonic_ns()
     observation = adapter.observe()
     adapter.profile("observation", (time.monotonic_ns() - observation_started_ns) / 1e9)
+    snapshot = getattr(adapter, "last_observation_snapshot", None)
+    if callable(snapshot):
+        snapshot = snapshot()
+    if isinstance(snapshot, ObservationSnapshot):
+        hooks.on_observation_captured(snapshot)
     hooks.on_observation(observation)
-    hooks.on_inference_started(observation)
+    hooks.on_inference_started_context(observation, event_stage)
     infer_started_ns = time.monotonic_ns()
     response = client.infer(observation)
     infer_elapsed_s = (time.monotonic_ns() - infer_started_ns) / 1e9
     adapter.profile(profile_stage, infer_elapsed_s)
     if not isinstance(response, dict):
         raise PolicyProtocolError(f"Expected a mapping policy response, got {type(response).__name__}")
-    hooks.on_inference_finished(response, infer_elapsed_s)
+    hooks.on_inference_finished_context(response, infer_elapsed_s, event_stage)
     try:
         chunk = adapter.decode_action_chunk(response, config.replan_steps)
     except ActionDecodeError:
         raise
     except BaseException as exc:
         raise ActionDecodeError(f"Failed to decode policy action chunk: {exc}") from exc
-    hooks.on_chunk_received(chunk.copy())
+    hooks.on_chunk_received_context(chunk.copy(), event_stage)
     return FetchedActionChunk(
         observation=observation,
         response=response,
@@ -222,7 +330,7 @@ def run_sync_loop(
     try:
         hooks.on_loop_started(mode, config)
         if plan:
-            hooks.on_chunk_received(np.asarray(plan, dtype=np.float32))
+            hooks.on_chunk_received_context(np.asarray(plan, dtype=np.float32), "prefetched")
         previous: np.ndarray | None = adapter.initial_action()
         logging.info("Starting %s synchronous inference loop", adapter.name)
         while (stop_event is None or not stop_event.is_set()) and (
@@ -234,10 +342,18 @@ def run_sync_loop(
                 plan.extend(chunk)
             selected = plan.popleft()
             hooks.on_action_selected(step, selected.copy())
-            action = adapter.stabilize_action(selected, previous)
+            try:
+                action = adapter.stabilize_action(selected, previous)
+            except BaseException as exc:
+                hooks.on_safety_rejected(step, selected.copy(), exc)
+                raise
             hooks.on_action_stabilized(step, action.copy())
             execute_started_ns = time.monotonic_ns()
-            previous = adapter.execute_transition(previous, action)
+            try:
+                previous = adapter.execute_transition(previous, action)
+            except BaseException as exc:
+                hooks.on_safety_rejected(step, action.copy(), exc)
+                raise
             adapter.profile("execution", (time.monotonic_ns() - execute_started_ns) / 1e9)
             hooks.on_action_executed(step, previous.copy())
             step += 1
@@ -322,7 +438,7 @@ def run_rtc_loop(
     try:
         hooks.on_loop_started(mode, config)
         if initial_chunk is not None:
-            hooks.on_chunk_received(np.asarray(initial_chunk, dtype=np.float32))
+            hooks.on_chunk_received_context(np.asarray(initial_chunk, dtype=np.float32), "prefetched")
         producer.start()
         producer_started = True
         previous: np.ndarray | None = adapter.initial_action()
@@ -334,7 +450,11 @@ def run_rtc_loop(
             action = buffer.get_action(step)
             if action is None:
                 if previous is not None and config.hold_last_action:
-                    previous = adapter.execute_transition(previous, previous)
+                    try:
+                        previous = adapter.execute_transition(previous, previous)
+                    except BaseException as exc:
+                        hooks.on_safety_rejected(step, previous.copy(), exc)
+                        raise
                     hooks.on_action_executed(step, previous.copy())
                 now = time.monotonic()
                 if now - last_wait_log > 1.0:
@@ -343,10 +463,18 @@ def run_rtc_loop(
                 sleep_remaining(loop_started, dt)
                 continue
             hooks.on_action_selected(step, action.copy())
-            action = adapter.stabilize_action(action, previous)
+            try:
+                action = adapter.stabilize_action(action, previous)
+            except BaseException as exc:
+                hooks.on_safety_rejected(step, action.copy(), exc)
+                raise
             hooks.on_action_stabilized(step, action.copy())
             execute_started_ns = time.monotonic_ns()
-            previous = adapter.execute_transition(previous, action)
+            try:
+                previous = adapter.execute_transition(previous, action)
+            except BaseException as exc:
+                hooks.on_safety_rejected(step, action.copy(), exc)
+                raise
             adapter.profile("execution", (time.monotonic_ns() - execute_started_ns) / 1e9)
             hooks.on_action_executed(step, previous.copy())
             step += 1

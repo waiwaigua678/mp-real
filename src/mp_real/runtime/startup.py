@@ -97,41 +97,53 @@ class PolicyStartupCoordinator:
     def prepare(self) -> PreparedPolicyStart:
         cold_inference_latency_ms: float | None = None
         warmup_started_ns: int | None = None
+        warming_up = False
+        try:
+            if self._startup_config.warmup_enabled:
+                self._notify_phase("WARMING_UP")
+                warming_up = True
+                warmup_started_ns = time.monotonic_ns()
+                self._hooks.on_policy_warmup_started(self._startup_config.warmup_requests)
+                _set_client_timeout(self._client, self._startup_config.warmup_timeout_s)
+                for _ in range(self._startup_config.warmup_requests):
+                    elapsed_s = self._request("warmup", self._startup_config.warmup_timeout_s)
+                    if cold_inference_latency_ms is None:
+                        cold_inference_latency_ms = elapsed_s * 1000.0
+                warmup_elapsed_s = (time.monotonic_ns() - warmup_started_ns) / 1e9
+                self._hooks.on_policy_warmup_finished(warmup_elapsed_s)
+                warming_up = False
+            warmup_latency_ms = (
+                (time.monotonic_ns() - warmup_started_ns) / 1e6 if warmup_started_ns is not None else None
+            )
 
-        if self._startup_config.warmup_enabled:
-            self._notify_phase("WARMING_UP")
-            warmup_started_ns = time.monotonic_ns()
-            _set_client_timeout(self._client, self._startup_config.warmup_timeout_s)
-            for _ in range(self._startup_config.warmup_requests):
-                elapsed_s = self._request("warmup", self._startup_config.warmup_timeout_s)
+            self._raise_if_stopped()
+            initial_chunk: np.ndarray | None = None
+            first_live_inference_latency_ms: float | None = None
+            if self._startup_config.prefetch_first_chunk and not self._loop_config.infer_only:
+                self._notify_phase("PREFETCHING_FIRST_CHUNK")
+                _set_client_timeout(self._client, self._startup_config.inference_timeout_s)
+                fetched, elapsed_s = self._request_with_chunk("first_live", self._startup_config.inference_timeout_s)
+                initial_chunk = fetched.chunk.copy()
+                first_live_inference_latency_ms = elapsed_s * 1000.0
                 if cold_inference_latency_ms is None:
-                    cold_inference_latency_ms = elapsed_s * 1000.0
-        warmup_latency_ms = (
-            (time.monotonic_ns() - warmup_started_ns) / 1e6 if warmup_started_ns is not None else None
-        )
+                    cold_inference_latency_ms = first_live_inference_latency_ms
 
-        self._raise_if_stopped()
-        initial_chunk: np.ndarray | None = None
-        first_live_inference_latency_ms: float | None = None
-        if self._startup_config.prefetch_first_chunk and not self._loop_config.infer_only:
-            self._notify_phase("PREFETCHING_FIRST_CHUNK")
             _set_client_timeout(self._client, self._startup_config.inference_timeout_s)
-            fetched, elapsed_s = self._request_with_chunk("first_live", self._startup_config.inference_timeout_s)
-            initial_chunk = fetched.chunk.copy()
-            first_live_inference_latency_ms = elapsed_s * 1000.0
-            if cold_inference_latency_ms is None:
-                cold_inference_latency_ms = first_live_inference_latency_ms
-
-        _set_client_timeout(self._client, self._startup_config.inference_timeout_s)
-        self._raise_if_stopped()
-        return PreparedPolicyStart(
-            initial_chunk=initial_chunk,
-            metrics=PolicyStartupMetrics(
-                cold_inference_latency_ms=cold_inference_latency_ms,
-                warmup_latency_ms=warmup_latency_ms,
-                first_live_inference_latency_ms=first_live_inference_latency_ms,
-            ),
-        )
+            self._raise_if_stopped()
+            prepared = PreparedPolicyStart(
+                initial_chunk=initial_chunk,
+                metrics=PolicyStartupMetrics(
+                    cold_inference_latency_ms=cold_inference_latency_ms,
+                    warmup_latency_ms=warmup_latency_ms,
+                    first_live_inference_latency_ms=first_live_inference_latency_ms,
+                ),
+            )
+            self._hooks.on_policy_ready(prepared.initial_chunk)
+            return prepared
+        except BaseException as exc:
+            if warming_up:
+                self._hooks.on_policy_warmup_failed(exc)
+            raise
 
     def _request(self, stage: str, timeout_s: float) -> float:
         _, elapsed_s = self._request_with_chunk(stage, timeout_s)
@@ -146,6 +158,7 @@ class PolicyStartupCoordinator:
                 self._loop_config,
                 self._hooks,
                 profile_stage=f"policy_{stage}",
+                event_stage=stage,
             )
         except TimeoutError as exc:
             self._raise_if_stopped()

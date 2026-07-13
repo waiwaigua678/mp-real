@@ -111,7 +111,33 @@ Exit criterion: fake slow-first policies prove the unprepared RTC failure,
 successful warmup, discarded warmup actions, fresh first-chunk execution,
 typed warmup errors and clean stop/disconnect.
 
-## Stage 3 — recording worker and versioned session format
+## Stage 3 — canonical time and in-memory runtime events
+
+Primary files: `runtime/models.py`, `runtime/observation.py`,
+`runtime/events.py`, focused camera/runtime changes, and fake-only tests. This
+stage does not write recording files.
+
+1. Preserve legacy float `timestamp_monotonic`, while adding canonical integer
+   `timestamp_monotonic_ns` to states and camera samples.
+2. Assign trusted per-camera `frame_id` values only when a backend receives a
+   new source frame; retain the id on cached ROS reads.
+3. Capture observation identity, capture start/finish, camera frame ids,
+   timestamps, camera skew and source age. Camera skew is latest-minus-earliest
+   camera timestamp; age is measured at capture completion against the oldest
+   included state or camera source.
+4. Translate compatible inference hooks to copied, typed events through a
+   bounded non-daemon in-memory dispatcher. Event sinks cannot block the robot
+   loop; a failing child of a composite sink is retained as sink-failure
+   telemetry and does not prevent other sinks from receiving the event.
+5. Keep raw chunks, selected actions, stabilized targets and executed actions
+   in separate event payload keys. Warmup events are staged separately from
+   normal control-loop events.
+
+Exit criterion: fake tests prove timestamp/frame ordering, ROS cache identity,
+skew calculation, warmup readiness ordering, sync/RTC action ordering,
+generation gating, sink isolation and float-field compatibility.
+
+## Stage 4 — recording worker and versioned session format
 
 Primary files: a focused recording module plus narrow runtime integration. Do
 not perform disk writes in HTTP handlers or the robot loop.
@@ -122,12 +148,13 @@ not perform disk writes in HTTP handlers or the robot loop.
    stop, join result and exception channel.
 3. Write to a .inprogress session directory, then atomically finalize where
    practical. Preserve incomplete/failure metadata if finalization fails.
-4. Reuse Stage-2 telemetry contracts and encode video off the control path.
+4. Reuse Stage-3 event and timing contracts and encode video off the control
+   path.
 
 Exit criterion: overloaded fake recording reports drops and writer failures; no
 control-loop call stack writes data to disk.
 
-## Stage 4 — evaluation orchestration and Web exposure
+## Stage 5 — evaluation orchestration and Web exposure
 
 Primary files: focused evaluation/session modules and narrow handler additions.
 
@@ -142,7 +169,7 @@ Primary files: focused evaluation/session modules and narrow handler additions.
 Exit criterion: fake end-to-end runs cover start, stop, stale-work rejection,
 recording finalization, errors and repeated lifecycle requests.
 
-## Stage 5 — hardware verification and rollout
+## Stage 6 — hardware verification and rollout
 
 Unit-test success is not real-hardware verification. With explicit approval for
 each motion-capable command, verify:

@@ -72,6 +72,11 @@ class _TrackedCamera(BlackCamera):
             raise RuntimeError(f"{self.name} camera failed")
         return super().read(timeout=timeout)
 
+    def read_frame(self, *, timeout: float = 2.0):
+        if self.fail_reads:
+            raise RuntimeError(f"{self.name} camera failed")
+        return super().read_frame(timeout=timeout)
+
     def close(self) -> None:
         self.closed = True
 

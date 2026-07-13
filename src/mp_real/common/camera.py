@@ -37,6 +37,15 @@ class CameraFrame:
     timestamp_monotonic: float
     camera_timestamp: float | None = None
     info: dict[str, Any] | None = None
+    frame_id: int = 0
+    timestamp_monotonic_ns: int = 0
+    source_sequence: int | None = None
+    capture_latency_ns: int | None = None
+
+    def __post_init__(self) -> None:
+        """Retain the legacy float timestamp while preferring canonical nanoseconds."""
+        if self.timestamp_monotonic_ns <= 0:
+            object.__setattr__(self, "timestamp_monotonic_ns", int(self.timestamp_monotonic * 1e9))
 
 
 class Camera(Protocol):
@@ -57,6 +66,8 @@ class BlackCamera:
         self.width = width
         self.height = height
         self._frame = np.zeros((height, width, 3), dtype=np.uint8)
+        self._frame_id = 0
+        self._frame_lock = threading.Lock()
         logging.info("Using black placeholder for %s", self.name)
 
     def read(self, *, timeout: float = 2.0) -> np.ndarray:
@@ -64,7 +75,17 @@ class BlackCamera:
 
     def read_frame(self, *, timeout: float = 2.0) -> CameraFrame:
         del timeout
-        return CameraFrame(image=self._frame.copy(), timestamp_monotonic=time.monotonic())
+        with self._frame_lock:
+            self._frame_id += 1
+            frame_id = self._frame_id
+        captured_ns = time.monotonic_ns()
+        return CameraFrame(
+            image=self._frame.copy(),
+            timestamp_monotonic=captured_ns / 1e9,
+            timestamp_monotonic_ns=captured_ns,
+            frame_id=frame_id,
+            source_sequence=frame_id,
+        )
 
     def camera_info(self) -> dict[str, Any] | None:
         return None
@@ -96,6 +117,7 @@ class RealSenseCamera:
         self.multiple_devices_hint = multiple_devices_hint
         self.rs = import_realsense(fallback_backends=fallback_backends)
         self.pipeline: Any | None = None
+        self._frame_id = 0
         self._open()
 
     def _open(self) -> None:
@@ -130,16 +152,29 @@ class RealSenseCamera:
         if self.pipeline is None:
             raise RuntimeError(f"{self.name} RealSense pipeline is not open")
 
+        capture_started_ns = time.monotonic_ns()
         frames = self.pipeline.wait_for_frames(round(timeout * 1000))
         color_frame = frames.get_color_frame()
         if not color_frame:
             raise RuntimeError(f"{self.name} failed to get a RealSense color frame")
         bgr = np.asanyarray(color_frame.get_data())
         camera_timestamp = float(color_frame.get_timestamp()) if hasattr(color_frame, "get_timestamp") else None
+        frame_number = color_frame.get_frame_number() if hasattr(color_frame, "get_frame_number") else None
+        if frame_number is None:
+            self._frame_id += 1
+            frame_id = self._frame_id
+        else:
+            frame_id = int(frame_number)
+            self._frame_id = max(self._frame_id, frame_id)
+        captured_ns = time.monotonic_ns()
         return CameraFrame(
             image=np.ascontiguousarray(bgr[:, :, ::-1]),
-            timestamp_monotonic=time.monotonic(),
+            timestamp_monotonic=captured_ns / 1e9,
             camera_timestamp=camera_timestamp,
+            frame_id=frame_id,
+            timestamp_monotonic_ns=captured_ns,
+            source_sequence=frame_id,
+            capture_latency_ns=captured_ns - capture_started_ns,
         )
 
     def camera_info(self) -> dict[str, Any] | None:
@@ -166,7 +201,14 @@ class V4L2MJPEGCamera:
         self.fd: int | None = None
         self.cap: Any | None = None
         self.buffers: list[mmap.mmap] = []
+        self._frame_id = 0
+        self._frame_lock = threading.Lock()
         self._open()
+
+    def _next_frame_id(self) -> int:
+        with self._frame_lock:
+            self._frame_id += 1
+            return self._frame_id
 
     def _open(self) -> None:
         if v4l2 is None:
@@ -232,8 +274,9 @@ class V4L2MJPEGCamera:
         return self.read_frame(timeout=timeout).image
 
     def read_frame(self, *, timeout: float = 2.0) -> CameraFrame:
+        capture_started_ns = time.monotonic_ns()
         if self.cap is not None:
-            return self._read_opencv_frame(timeout=timeout)
+            return self._read_opencv_frame(timeout=timeout, capture_started_ns=capture_started_ns)
 
         assert self.fd is not None
         assert cv2 is not None
@@ -253,9 +296,18 @@ class V4L2MJPEGCamera:
         bgr = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
         if bgr is None:
             raise RuntimeError(f"{self.name} returned an undecodable MJPEG frame")
-        return CameraFrame(image=np.ascontiguousarray(bgr[:, :, ::-1]), timestamp_monotonic=time.monotonic())
+        captured_ns = time.monotonic_ns()
+        frame_id = self._next_frame_id()
+        return CameraFrame(
+            image=np.ascontiguousarray(bgr[:, :, ::-1]),
+            timestamp_monotonic=captured_ns / 1e9,
+            frame_id=frame_id,
+            timestamp_monotonic_ns=captured_ns,
+            source_sequence=frame_id,
+            capture_latency_ns=captured_ns - capture_started_ns,
+        )
 
-    def _read_opencv_frame(self, *, timeout: float = 2.0) -> CameraFrame:
+    def _read_opencv_frame(self, *, timeout: float = 2.0, capture_started_ns: int | None = None) -> CameraFrame:
         assert self.cap is not None
         assert cv2 is not None
 
@@ -267,7 +319,16 @@ class V4L2MJPEGCamera:
                     image = cv2.cvtColor(bgr, cv2.COLOR_GRAY2RGB)
                 else:
                     image = np.ascontiguousarray(bgr[:, :, ::-1])
-                return CameraFrame(image=image, timestamp_monotonic=time.monotonic())
+                captured_ns = time.monotonic_ns()
+                frame_id = self._next_frame_id()
+                return CameraFrame(
+                    image=image,
+                    timestamp_monotonic=captured_ns / 1e9,
+                    frame_id=frame_id,
+                    timestamp_monotonic_ns=captured_ns,
+                    source_sequence=frame_id,
+                    capture_latency_ns=(captured_ns - capture_started_ns) if capture_started_ns is not None else None,
+                )
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"{self.name} timed out after {timeout:.1f}s")
             time.sleep(0.01)
@@ -306,6 +367,7 @@ class ROSImageCamera:
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._frame: CameraFrame | None = None
+        self._frame_id = 0
         self._info: dict[str, Any] | None = None
         self._sub_img = None
         self._sub_info = None
@@ -318,6 +380,7 @@ class ROSImageCamera:
         logging.info("Subscribed %s image=%s info=%s", self.name, self.image_topic, self.info_topic)
 
     def _image_cb(self, msg: Any) -> None:
+        capture_started_ns = time.monotonic_ns()
         frame = ros_image_to_rgb(msg)
         if frame is None:
             return
@@ -330,11 +393,18 @@ class ROSImageCamera:
             except Exception:
                 camera_timestamp = None
         with self._cond:
+            self._frame_id += 1
+            captured_ns = time.monotonic_ns()
+            source_sequence = getattr(getattr(msg, "header", None), "seq", None)
             self._frame = CameraFrame(
                 image=frame,
-                timestamp_monotonic=time.monotonic(),
+                timestamp_monotonic=captured_ns / 1e9,
                 camera_timestamp=camera_timestamp,
                 info=info,
+                frame_id=self._frame_id,
+                timestamp_monotonic_ns=captured_ns,
+                source_sequence=int(source_sequence) if source_sequence is not None else None,
+                capture_latency_ns=captured_ns - capture_started_ns,
             )
             self._cond.notify_all()
 

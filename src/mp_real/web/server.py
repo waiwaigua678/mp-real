@@ -39,6 +39,8 @@ from mp_real.robots.rm2 import infer as infer_rm2
 from mp_real.robots.registry import create_robot
 from mp_real.runtime.config import InferenceLoopConfig
 from mp_real.runtime.controller import ControllerAlreadyRunningError, RuntimeController
+from mp_real.runtime.events import RuntimeEventHooks, RuntimeEventIdentity
+from mp_real.runtime.inference import CompositeInferenceHooks
 from mp_real.runtime.startup import (
     PolicyStartupCancelled,
     PolicyStartupConfig,
@@ -190,6 +192,10 @@ class FrameSnapshot:
     sequence: int = 0
     updated_at: float = 0.0
     error: str | None = None
+    frame_id: int = 0
+    timestamp_monotonic_ns: int = 0
+    source_sequence: int | None = None
+    capture_latency_ns: int | None = None
 
 
 @dataclasses.dataclass
@@ -1027,12 +1033,20 @@ class PiperWebRuntime:
             self._loop_hooks.reset()
             with self._lock:
                 startup_config = self._policy_startup_config_locked()
+            startup_event_hooks = RuntimeEventHooks(
+                controller.event_sink,
+                RuntimeEventIdentity(
+                    runtime_id=controller.runtime_id,
+                    generation_id=controller.status().generation_id + 1,
+                    session_id=f"piper-web-connect-{generation_id}",
+                ),
+            )
             coordinator = PolicyStartupCoordinator(
                 controller.policy_client,
                 adapter,
                 loop_config,
                 startup_config,
-                hooks=self._loop_hooks,
+                hooks=CompositeInferenceHooks(self._loop_hooks, startup_event_hooks),
                 stop_requested=stop_event.is_set,
                 on_phase=lambda phase: self._set_policy_startup_phase(generation_id, phase),
             )
@@ -1264,8 +1278,8 @@ class PiperWebRuntime:
                 if self._camera_stop_event.is_set():
                     break
                 try:
-                    raw = camera.read(timeout=args.camera_timeout)
-                    image = preprocess_image(raw, args.resize_size)
+                    frame = camera.read_frame(timeout=args.camera_timeout)
+                    image = preprocess_image(frame.image, args.resize_size)
                     jpeg = _encode_jpeg_rgb(image)
                     with self._frame_condition:
                         old = self._frames.get(name, FrameSnapshot())
@@ -1273,8 +1287,12 @@ class PiperWebRuntime:
                             image=image,
                             jpeg=jpeg,
                             sequence=old.sequence + 1,
-                            updated_at=time.monotonic(),
+                            updated_at=frame.timestamp_monotonic,
                             error=None,
+                            frame_id=frame.frame_id,
+                            timestamp_monotonic_ns=frame.timestamp_monotonic_ns,
+                            source_sequence=frame.source_sequence,
+                            capture_latency_ns=frame.capture_latency_ns,
                         )
                         self._frame_condition.notify_all()
                 except Exception as exc:
@@ -1335,6 +1353,10 @@ class PiperWebRuntime:
             frames = {
                 name: {
                     "sequence": frame.sequence,
+                    "frame_id": frame.frame_id,
+                    "timestamp_monotonic_ns": frame.timestamp_monotonic_ns or None,
+                    "source_sequence": frame.source_sequence,
+                    "capture_latency_ns": frame.capture_latency_ns,
                     "age_ms": round((now - frame.updated_at) * 1000.0, 1) if frame.updated_at else None,
                     "error": frame.error,
                 }
@@ -1751,14 +1773,20 @@ class Rm2WebRuntime:
                 if camera is None:
                     continue
                 try:
-                    image = preprocess_image(camera.read(timeout=args.camera_timeout), args.resize_size)
+                    frame = camera.read_frame(timeout=args.camera_timeout)
+                    image = preprocess_image(frame.image, args.resize_size)
                     with self._frame_condition:
                         old = self._frames[stream_name]
                         self._frames[stream_name] = FrameSnapshot(
                             image,
                             _encode_jpeg_rgb(image),
                             old.sequence + 1,
-                            time.monotonic(),
+                            frame.timestamp_monotonic,
+                            None,
+                            frame.frame_id,
+                            frame.timestamp_monotonic_ns,
+                            frame.source_sequence,
+                            frame.capture_latency_ns,
                         )
                         self._frame_condition.notify_all()
                 except Exception as exc:
@@ -1799,7 +1827,15 @@ class Rm2WebRuntime:
                 "server_url": self._args.server_url, "server_metadata": {}, "last_error": self._last_error,
                 "metrics": {},
                 "frames": {
-                    name: {"sequence": frame.sequence, "age_ms": None, "error": frame.error}
+                    name: {
+                        "sequence": frame.sequence,
+                        "frame_id": frame.frame_id,
+                        "timestamp_monotonic_ns": frame.timestamp_monotonic_ns or None,
+                        "source_sequence": frame.source_sequence,
+                        "capture_latency_ns": frame.capture_latency_ns,
+                        "age_ms": None,
+                        "error": frame.error,
+                    }
                     for name, frame in self._frames.items()
                 },
                 "logs": list(self._logs),

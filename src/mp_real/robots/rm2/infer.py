@@ -30,7 +30,7 @@ from mp_real.runtime.config import InferenceLoopConfig
 from mp_real.runtime.inference import run_infer_only as run_generic_infer_only
 from mp_real.runtime.inference import run_rtc_loop as run_generic_rtc_loop
 from mp_real.runtime.inference import run_sync_loop as run_generic_sync_loop
-from mp_real.runtime.models import ActionSpec, RobotState
+from mp_real.runtime.models import ActionSpec, ObservationSnapshot, RobotState
 from mp_real.runtime.observation import capture_observation
 
 CameraBackend = Literal["ros", "realsense", "black"]
@@ -360,12 +360,15 @@ class Rm2Robot(Robot):
             joint_dof_per_arm=self.args.joint_dof,
             joint_unit=self.args.policy_joint_unit,
             camera_roles=("left_color", "right_color", "head_color"),
-        )
+    )
 
     def read_state(self) -> RobotState:
+        values = read_state(self.left, self.right, self.args, robot_lock=self.robot_lock)
+        timestamp_ns = time.monotonic_ns()
         return RobotState(
-            values=read_state(self.left, self.right, self.args, robot_lock=self.robot_lock),
-            timestamp_monotonic=time.monotonic(),
+            values=values,
+            timestamp_monotonic=timestamp_ns / 1e9,
+            timestamp_monotonic_ns=timestamp_ns,
         )
 
     def execute_transition(self, previous: np.ndarray | None, target: np.ndarray) -> np.ndarray:
@@ -562,7 +565,18 @@ def prepare_observation(
     *,
     robot_lock: threading.Lock | None = None,
 ) -> dict[str, Any]:
-    snapshot = capture_observation(
+    return capture_observation_snapshot(cameras, left, right, args, robot_lock=robot_lock).to_policy_observation()
+
+
+def capture_observation_snapshot(
+    cameras: dict[str, Camera],
+    left: RmArm,
+    right: RmArm,
+    args: Args,
+    *,
+    robot_lock: threading.Lock | None = None,
+) -> ObservationSnapshot:
+    return capture_observation(
         cameras,
         read_state=lambda: read_state(left, right, args, robot_lock=robot_lock),
         prompt=args.prompt,
@@ -571,7 +585,6 @@ def prepare_observation(
         image_masks={name: np.bool_(not isinstance(camera, BlackCamera)) for name, camera in cameras.items()},
         include_camera_params=True,
     )
-    return snapshot.to_policy_observation()
 
 
 def response_to_action_chunk(response: dict[str, Any], args: Args) -> np.ndarray:
@@ -726,15 +739,17 @@ class Rm2InferenceAdapter:
     cameras: dict[str, Camera]
     args: Args
     name: str = "rm2"
+    last_observation_snapshot: ObservationSnapshot | None = dataclasses.field(default=None, init=False, repr=False)
 
     def observe(self) -> dict[str, Any]:
-        return prepare_observation(
+        self.last_observation_snapshot = capture_observation_snapshot(
             self.cameras,
             self.robot.left,
             self.robot.right,
             self.args,
             robot_lock=self.robot.robot_lock,
         )
+        return self.last_observation_snapshot.to_policy_observation()
 
     def decode_action_chunk(self, response: dict[str, Any], replan_steps: int) -> np.ndarray:
         if replan_steps != self.args.replan_steps:

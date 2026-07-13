@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -10,7 +11,21 @@ import numpy as np
 
 from mp_real.robots.base import Robot
 from mp_real.runtime.config import InferenceLoopConfig
-from mp_real.runtime.inference import InferenceAdapter, InferenceHooks, PolicyClient, run_policy_loop
+from mp_real.runtime.events import (
+    InMemoryRuntimeEventSink,
+    RuntimeEventDispatcher,
+    RuntimeEventHooks,
+    RuntimeEventIdentity,
+    RuntimeEventSink,
+)
+from mp_real.runtime.inference import (
+    CompositeInferenceHooks,
+    InferenceAdapter,
+    InferenceHooks,
+    PolicyClient,
+    run_policy_loop,
+)
+from mp_real.runtime.models import ObservationSnapshot
 
 
 class ControllerAlreadyRunningError(RuntimeError):
@@ -51,17 +66,33 @@ class _GenerationHooks(InferenceHooks):
         if self._is_current():
             self._delegate.on_observation(observation)
 
+    def on_observation_captured(self, snapshot: ObservationSnapshot) -> None:
+        if self._is_current():
+            self._delegate.on_observation_captured(snapshot)
+
     def on_inference_started(self, observation: Mapping[str, Any]) -> None:
         if self._is_current():
             self._delegate.on_inference_started(observation)
+
+    def on_inference_started_context(self, observation: Mapping[str, Any], stage: str) -> None:
+        if self._is_current():
+            self._delegate.on_inference_started_context(observation, stage)
 
     def on_inference_finished(self, response: Mapping[str, Any], elapsed_s: float) -> None:
         if self._is_current():
             self._delegate.on_inference_finished(response, elapsed_s)
 
+    def on_inference_finished_context(self, response: Mapping[str, Any], elapsed_s: float, stage: str) -> None:
+        if self._is_current():
+            self._delegate.on_inference_finished_context(response, elapsed_s, stage)
+
     def on_chunk_received(self, chunk: np.ndarray) -> None:
         if self._is_current():
             self._delegate.on_chunk_received(chunk)
+
+    def on_chunk_received_context(self, chunk: np.ndarray, stage: str) -> None:
+        if self._is_current():
+            self._delegate.on_chunk_received_context(chunk, stage)
 
     def on_action_selected(self, step: int, action: np.ndarray) -> None:
         if self._is_current():
@@ -74,6 +105,26 @@ class _GenerationHooks(InferenceHooks):
     def on_action_executed(self, step: int, action: np.ndarray) -> None:
         if self._is_current():
             self._delegate.on_action_executed(step, action)
+
+    def on_safety_rejected(self, step: int | None, action: np.ndarray | None, error: BaseException) -> None:
+        if self._is_current():
+            self._delegate.on_safety_rejected(step, action, error)
+
+    def on_policy_warmup_started(self, requests: int) -> None:
+        if self._is_current():
+            self._delegate.on_policy_warmup_started(requests)
+
+    def on_policy_warmup_finished(self, elapsed_s: float) -> None:
+        if self._is_current():
+            self._delegate.on_policy_warmup_finished(elapsed_s)
+
+    def on_policy_warmup_failed(self, error: BaseException) -> None:
+        if self._is_current():
+            self._delegate.on_policy_warmup_failed(error)
+
+    def on_policy_ready(self, initial_chunk: np.ndarray | None) -> None:
+        if self._is_current():
+            self._delegate.on_policy_ready(initial_chunk)
 
     def on_loop_stopped(self, mode: str) -> None:
         if self._is_current():
@@ -99,6 +150,10 @@ class RuntimeController:
         thread_name: str | None = None,
         print_infer_only_chunks: bool = True,
         rtc_producer_daemon: bool = False,
+        event_sink: RuntimeEventSink | None = None,
+        runtime_id: str | None = None,
+        session_id: str | None = None,
+        episode_id: str | None = None,
     ) -> None:
         config.validate()
         self._robot = robot
@@ -111,6 +166,14 @@ class RuntimeController:
         self._thread_name = thread_name or f"{adapter.name}-runtime-controller"
         self._print_infer_only_chunks = print_infer_only_chunks
         self._rtc_producer_daemon = rtc_producer_daemon
+        self._event_sink = event_sink or InMemoryRuntimeEventSink()
+        self._event_dispatcher = RuntimeEventDispatcher(
+            self._event_sink,
+            thread_name=f"{self._thread_name}-events",
+        )
+        self._runtime_id = runtime_id or uuid.uuid4().hex
+        self._session_id = session_id
+        self._episode_id = episode_id
 
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
@@ -130,6 +193,14 @@ class RuntimeController:
     @property
     def policy_client(self) -> PolicyClient:
         return self._policy_client
+
+    @property
+    def runtime_id(self) -> str:
+        return self._runtime_id
+
+    @property
+    def event_sink(self) -> RuntimeEventSink:
+        return self._event_sink
 
     def configure(
         self,
@@ -166,6 +237,7 @@ class RuntimeController:
             self._error = None
             self._started_at_monotonic_ns = time.monotonic_ns()
             self._stopped_at_monotonic_ns = None
+            self._event_dispatcher.start()
             self._thread = threading.Thread(
                 target=self._run,
                 args=(generation_id, stop_event),
@@ -240,6 +312,8 @@ class RuntimeController:
                 close_client()
             except BaseException as exc:
                 errors.append(exc)
+        if not self._event_dispatcher.stop(timeout=timeout):
+            errors.append(TimeoutError("Runtime event dispatcher did not stop before close"))
         with self._lock:
             self._closed = True
         if errors:
@@ -265,7 +339,17 @@ class RuntimeController:
             hooks = self._hooks
             on_step = self._on_step
             initial_chunk = self._initial_chunk
-        guarded_hooks = _GenerationHooks(self, generation_id, hooks) if hooks is not None else None
+        event_hooks = RuntimeEventHooks(
+            self._event_dispatcher,
+            RuntimeEventIdentity(
+                runtime_id=self._runtime_id,
+                generation_id=generation_id,
+                session_id=self._session_id,
+                episode_id=self._episode_id,
+            ),
+        )
+        combined_hooks = event_hooks if hooks is None else CompositeInferenceHooks(hooks, event_hooks)
+        guarded_hooks = _GenerationHooks(self, generation_id, combined_hooks)
 
         def guarded_on_step(step: int, action_queue_len: int) -> None:
             if on_step is not None and self._is_current_generation(generation_id):

@@ -146,6 +146,29 @@ executed during warmup, and RTC starts with the prefetched chunk instead of an
 empty buffer. `检查服务` only confirms a WebSocket connection and metadata; it
 does not claim that the model is warmed up.
 
+### Canonical runtime time and in-memory events
+
+The legacy float `timestamp_monotonic` fields remain available for existing
+callers. New capture and runtime records also carry canonical
+`timestamp_monotonic_ns` values from `time.monotonic_ns()`; ordering decisions
+must use the integer nanosecond field. Wall-clock ISO timestamps belong only to
+event display and future filenames.
+
+Each `CameraFrame`/`CameraSample` has a trusted `frame_id`. Black and V4L2
+increment it only when they obtain a new frame, RealSense uses the SDK frame
+number when available, and ROS increments it only in an image callback. A
+repeat read of the ROS cache retains the prior id. Source-native sequence and
+capture-latency fields are optional metadata, not substitutions for the local
+frame id.
+
+`ObservationSnapshot.max_camera_skew_ns` is the difference between the latest
+and earliest included camera timestamps. `observation_age_ns` is measured at
+snapshot completion relative to the oldest included camera/state source. The
+shared runtime translates its existing hooks into bounded in-memory events;
+actions retain distinct raw-chunk, selected, stabilized, and executed payloads.
+Event ndarray payloads are copied before dispatch. This stage writes no
+recording files, video, NPZ, or JSONL.
+
 ## What runs elsewhere
 
 - The OpenPI websocket policy server and its model/checkpoint remain on the inference server.
