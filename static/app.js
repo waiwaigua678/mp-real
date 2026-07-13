@@ -192,7 +192,9 @@ function applyStatus(status) {
       `sequence ${frame.sequence || 0} · age ${fmt(frame.age_ms, " ms")}${frame.error ? ` · ${frame.error}` : ""}`;
   }
 
-  setRuntimeModeUi(status);
+  // Status polling must not overwrite a disconnected user's unsaved mode.
+  // The backend still reports its persisted mode until Save succeeds.
+  setRuntimeModeUi(dirty ? form.elements.runtime_mode.value : status);
   setFieldLocks(status);
   connectBtn.disabled = !status.can_connect;
   pingBtn.disabled = status.running || runtimeMode(status) !== "deployment";
