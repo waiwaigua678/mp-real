@@ -216,3 +216,29 @@ At the end of every task, report:
 
 For staged roadmap work, implement only the requested stage.
 Do not begin the next stage automatically.
+
+## Runtime modes and policy startup
+
+The Web runtime must distinguish resource modes:
+
+- deployment: robot, cameras, and policy server
+- camera_preview: cameras only
+- offline_replay: recorded files only
+
+Camera preview and offline replay must not create a Robot or PolicyClient.
+
+Policy cold-start is a startup lifecycle concern, not an RTC failure.
+
+Use separate configurable timeouts for:
+
+- websocket connection and metadata
+- policy warmup
+- steady-state inference
+
+No robot action may be executed during policy warmup.
+
+Discard warmup actions. A fresh first action chunk must be ready before the
+control loop is allowed to enter the running phase.
+
+Preserve the original exception type and message when an inference worker
+fails. Do not replace a policy timeout with only a generic RTC error.

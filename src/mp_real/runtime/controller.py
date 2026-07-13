@@ -107,6 +107,7 @@ class RuntimeController:
         self._config = config
         self._hooks = hooks
         self._on_step = on_step
+        self._initial_chunk: np.ndarray | None = None
         self._thread_name = thread_name or f"{adapter.name}-runtime-controller"
         self._print_infer_only_chunks = print_infer_only_chunks
         self._rtc_producer_daemon = rtc_producer_daemon
@@ -126,6 +127,10 @@ class RuntimeController:
     def robot(self) -> Robot:
         return self._robot
 
+    @property
+    def policy_client(self) -> PolicyClient:
+        return self._policy_client
+
     def configure(
         self,
         adapter: InferenceAdapter,
@@ -133,6 +138,7 @@ class RuntimeController:
         *,
         hooks: InferenceHooks | None = None,
         on_step: Callable[[int, int], None] | None = None,
+        initial_chunk: np.ndarray | None = None,
     ) -> None:
         config.validate()
         with self._lock:
@@ -143,6 +149,7 @@ class RuntimeController:
             self._config = config
             self._hooks = hooks
             self._on_step = on_step
+            self._initial_chunk = None if initial_chunk is None else np.asarray(initial_chunk, dtype=np.float32).copy()
 
     def start(self) -> int:
         with self._lock:
@@ -257,6 +264,7 @@ class RuntimeController:
             config = self._config
             hooks = self._hooks
             on_step = self._on_step
+            initial_chunk = self._initial_chunk
         guarded_hooks = _GenerationHooks(self, generation_id, hooks) if hooks is not None else None
 
         def guarded_on_step(step: int, action_queue_len: int) -> None:
@@ -274,6 +282,7 @@ class RuntimeController:
                 hooks=guarded_hooks,
                 print_infer_only_chunks=self._print_infer_only_chunks,
                 rtc_producer_daemon=self._rtc_producer_daemon,
+                initial_chunk=initial_chunk,
             )
         except BaseException as exc:
             error = exc

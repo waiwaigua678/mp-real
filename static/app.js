@@ -55,7 +55,30 @@ function setForm(config) {
       field.value = numberOrEmpty(value);
     }
   }
+  setRuntimeModeUi(config.runtime_mode || "deployment");
   dirty = false;
+}
+
+function runtimeMode(statusOrMode) {
+  if (typeof statusOrMode === "string") return statusOrMode;
+  return statusOrMode?.runtime_mode || form.elements.runtime_mode?.value || "deployment";
+}
+
+function setRuntimeModeUi(statusOrMode) {
+  const rm2 = statusOrMode?.robot === "rm2" || robotSelect.value === "rm2";
+  const mode = rm2 ? "deployment" : runtimeMode(statusOrMode);
+  form.elements.runtime_mode.value = mode;
+  form.elements.runtime_mode.disabled = rm2;
+  const deployment = mode === "deployment";
+  const preview = mode === "camera_preview";
+  const offline = mode === "offline_replay";
+  for (const node of document.querySelectorAll("[data-deployment-only='true']")) {
+    node.hidden = !deployment;
+  }
+  document.querySelector("#offlineReplayNotice").hidden = !offline;
+  connectBtn.textContent = preview ? "连接相机" : offline ? "进入回放" : "连接预览";
+  startBtn.textContent = preview ? "开始预览" : offline ? "回放（阶段 7）" : "开始";
+  stopBtn.textContent = preview ? "停止预览" : "停止";
 }
 
 async function selectRobot() {
@@ -134,7 +157,8 @@ function applyStatus(status) {
   const metrics = status.metrics || {};
 
   setBadge("#phaseBadge", status.phase, status.phase === "running" ? "ok" : status.phase === "error" ? "bad" : "");
-  setBadge("#policyBadge", status.policy_connected ? "policy on" : "policy off", status.policy_connected ? "ok" : "warn");
+  const policyText = status.policy_state ? `policy ${status.policy_state.toLowerCase()}` : status.policy_connected ? "policy on" : "policy off";
+  setBadge("#policyBadge", policyText, status.policy_connected ? "ok" : "warn");
   setBadge("#runBadge", status.running ? "running" : "stopped", status.running ? "ok" : "");
 
   document.querySelector("#serverLine").textContent = status.server_url || "";
@@ -148,6 +172,18 @@ function applyStatus(status) {
   document.querySelector("#uptime").textContent = fmt(metrics.uptime_s, " s");
   document.querySelector("#errorLine").textContent = status.last_error || "";
   document.querySelector("#metadata").textContent = JSON.stringify(status.server_metadata || {}, null, 2);
+  document.querySelector("#policyTiming").textContent = JSON.stringify(
+    {
+      connect_latency_ms: metrics.connect_latency_ms,
+      metadata_latency_ms: metrics.metadata_latency_ms,
+      cold_inference_latency_ms: metrics.cold_inference_latency_ms,
+      warmup_latency_ms: metrics.warmup_latency_ms,
+      first_live_inference_latency_ms: metrics.first_live_inference_latency_ms,
+      steady_inference_latency_ms: metrics.steady_inference_latency_ms,
+    },
+    null,
+    2,
+  );
   document.querySelector("#logBox").textContent = (status.logs || []).join("\n");
 
   for (const camera of CAMERA_NAMES) {
@@ -156,9 +192,10 @@ function applyStatus(status) {
       `sequence ${frame.sequence || 0} · age ${fmt(frame.age_ms, " ms")}${frame.error ? ` · ${frame.error}` : ""}`;
   }
 
+  setRuntimeModeUi(status);
   setFieldLocks(status);
   connectBtn.disabled = !status.can_connect;
-  pingBtn.disabled = status.running;
+  pingBtn.disabled = status.running || runtimeMode(status) !== "deployment";
   startBtn.disabled = !status.can_start;
   stopBtn.disabled = !status.can_stop;
   resetBtn.disabled = !status.can_reset;
@@ -195,10 +232,10 @@ async function startRuntime() {
     if (dirty) {
       throw new Error("参数页有未保存修改");
     }
-    setMessage("正在启动...", "");
+    setMessage(runtimeMode(currentStatus) === "deployment" ? "正在预热策略..." : "正在启动...", "");
     const data = await requestJson("/api/start", { method: "POST", body: "{}" });
     applyStatus(data.status);
-    setMessage("已开始", "ok");
+    setMessage(runtimeMode(data.status) === "deployment" ? "策略启动中" : "已开始", "ok");
   } catch (error) {
     setMessage(error.message, "bad");
     await refreshStatus();
@@ -286,6 +323,11 @@ accessKeyInput.addEventListener("input", () => {
   else sessionStorage.removeItem("motrixAccessKey");
 });
 robotSelect.addEventListener("change", selectRobot);
+form.elements.runtime_mode?.addEventListener("change", () => {
+  dirty = true;
+  setRuntimeModeUi(form.elements.runtime_mode.value);
+  if (currentStatus) setFieldLocks(currentStatus);
+});
 
 saveBtn.addEventListener("click", () => saveConfig().catch((error) => setMessage(error.message, "bad")));
 pingBtn.addEventListener("click", pingPolicy);

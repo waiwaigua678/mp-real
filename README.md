@@ -15,18 +15,27 @@ Install every required extra in one `uv sync` command. Running separate
 `uv sync --extra ...` commands selects a new exact environment each time, so a
 later command can remove extras selected by an earlier one.
 
-For Piper, the bootstrap script always includes the `piper` extra and installs
-the sibling `../pyAgxArm` checkout. Pass every additional extra to that same
-sync operation:
+For the standard Piper deployment, first select every needed extra in one
+sync, then install the deployed `pyAgxArm` checkout as an editable package:
 
 ```bash
 # Piper + RealSense + faster Web JPEG encoding + local lint tools
-./scripts/bootstrap-piper.sh --extra realsense --extra web --extra dev
+uv sync --extra piper --extra realsense --extra web --extra dev
+uv pip install -e /home/server/prj/pyAgxArm
+```
 
+If the controller also needs RM2 and V4L2 support, include those extras in
+the same `uv sync` invocation:
+
+```bash
 # Add RM2 support and V4L2 cameras when this controller needs them too.
 # The RM2 vendor SDK is configured separately; see configs/rm2.env.example.
-./scripts/bootstrap-piper.sh --extra rm2 --extra realsense --extra v4l2 --extra web --extra dev
+uv sync --extra piper --extra rm2 --extra realsense --extra v4l2 --extra web --extra dev
+uv pip install -e /home/server/prj/pyAgxArm
 ```
+
+`./scripts/bootstrap-piper.sh --extra ...` remains available when `pyAgxArm`
+is checked out as the sibling `../pyAgxArm` directory.
 
 For a non-Piper deployment, use the same repeated-flag pattern directly:
 
@@ -38,7 +47,7 @@ If this machine needs every optional Python dependency, use
 `./scripts/bootstrap-piper.sh --all-extras` for Piper, or `uv sync --all-extras`
 without Piper.
 
-Piper uses a fixed sibling layout, so deployment does not need a per-machine SDK path:
+The optional bootstrap script expects this sibling layout:
 
 ```bash
 parent/
@@ -46,7 +55,7 @@ parent/
   pyAgxArm/
 ```
 
-The ROS camera backend uses the system ROS installation (`rospy`, `sensor_msgs`) and is deliberately not listed as a PyPI dependency. For RM2, source a copy of `configs/rm2.env.example` with the vendor SDK path before starting inference.
+When `pyAgxArm` is deployed elsewhere, use its absolute path with `uv pip install -e` as shown above. The ROS camera backend uses the system ROS installation (`rospy`, `sensor_msgs`) and is deliberately not listed as a PyPI dependency. For RM2, source a copy of `configs/rm2.env.example` with the vendor SDK path before starting inference.
 
 ## Adding A Robot
 
@@ -111,6 +120,31 @@ uv run mp-piper-web \
 ```
 
 Open `http://<robot-computer-ip>:8765`. Connection parameters can also be set in the Settings page before clicking Connect.
+
+### Web runtime modes
+
+The Settings page has an explicit runtime mode. Choose it before connecting;
+changing it requires a disconnect.
+
+- `DEPLOYMENT` creates the robot, configured cameras and policy client. Sync,
+  RTC and infer-only are policy execution choices within this mode.
+- `CAMERA_PREVIEW` creates only the configured cameras. It never opens CAN,
+  creates a robot or policy client, resets/enables an arm, or reads robot
+  state. The camera page remains usable even when one configured camera has a
+  read error; that error is displayed on the affected stream.
+- `OFFLINE_REPLAY` intentionally creates no robot, camera or policy resource.
+  It shows the stage-7 replay placeholder until recorded-session playback is
+  implemented.
+
+### Policy warmup and first action
+
+Deployment exposes separate connection, metadata, warmup and steady-inference
+timeouts. By default it sends one real observation as a warmup request with a
+60-second warmup timeout, validates and discards its action chunk, then
+prefetches one fresh live action chunk before control begins. No action is
+executed during warmup, and RTC starts with the prefetched chunk instead of an
+empty buffer. `检查服务` only confirms a WebSocket connection and metadata; it
+does not claim that the model is warmed up.
 
 ## What runs elsewhere
 

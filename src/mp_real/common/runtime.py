@@ -3,8 +3,8 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from typing import Any
 import urllib.parse
+from typing import Any
 
 import numpy as np
 
@@ -120,4 +120,4 @@ def raise_rtc_producer_error(errors: queue.Queue[BaseException]) -> None:
         exc = errors.get_nowait()
     except queue.Empty:
         return
-    raise RuntimeError("RTC action producer failed") from exc
+    raise exc

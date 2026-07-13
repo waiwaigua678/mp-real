@@ -32,10 +32,11 @@
               <button id="connectBtn" type="button">连接预览</button>
               <button id="startBtn" type="button" class="primary">开始</button>
               <button id="stopBtn" type="button" class="danger">停止</button>
-              <button id="resetBtn" type="button">归位</button>
+              <button id="resetBtn" type="button" data-deployment-only="true">归位</button>
               <button id="disconnectBtn" type="button">断开</button>
             </div>
             <div class="message" id="message"></div>
+            <div class="message" id="offlineReplayNotice" hidden>数据回放将在阶段 7 使用录制数据。</div>
           </div>
           <div class="run-stats">
             <div><span>step</span><strong id="stepLine">0</strong></div>
@@ -81,6 +82,7 @@
               <div><span>动作队列</span><strong id="queueLen">0</strong></div>
             </div>
             <pre class="metadata" id="metadata">{}</pre>
+            <pre class="metadata" id="policyTiming">{}</pre>
           </section>
 
           <section class="panel logs">
@@ -101,14 +103,14 @@
           </div>
           <div class="button-row">
             <button id="saveBtn" type="button" class="primary">保存参数</button>
-            <button id="pingBtn" type="button">检查服务</button>
+            <button id="pingBtn" type="button" data-deployment-only="true">检查服务</button>
           </div>
         </section>
 
         <form id="configForm" class="settings-form">
           <section class="form-section">
             <h3>连接安全</h3>
-            <label>
+            <label data-deployment-only="true">
               <span>机器人</span>
               <select id="robotSelect">
                 <option value="piper">Piper</option>
@@ -116,29 +118,37 @@
               </select>
             </label>
             <label>
+              <span>运行模式</span>
+              <select name="runtime_mode">
+                <option value="deployment">DEPLOYMENT</option>
+                <option value="camera_preview">CAMERA_PREVIEW</option>
+                <option value="offline_replay">OFFLINE_REPLAY</option>
+              </select>
+            </label>
+            <label>
               <span>访问密钥</span>
               <input id="accessKey" type="password" autocomplete="off" />
             </label>
           </section>
-          <section class="form-section">
+          <section class="form-section" data-deployment-only="true">
             <h3>任务</h3>
             <label class="wide">
               <span>任务词</span>
               <input name="prompt" type="text" />
             </label>
-            <label>
+            <label data-deployment-only="true">
               <span>最大步数</span>
               <input name="max_steps" type="number" min="1" step="1" placeholder="无限" />
             </label>
-            <label>
+            <label data-deployment-only="true">
               <span>控制 FPS</span>
               <input name="fps" type="number" min="0.1" step="0.1" />
             </label>
-            <label>
+            <label data-deployment-only="true">
               <span>Replan Steps</span>
               <input name="replan_steps" type="number" min="1" step="1" />
             </label>
-            <label>
+            <label data-deployment-only="true">
               <span>速度 %</span>
               <input name="speed_percent" type="number" min="1" max="100" step="1" />
             </label>
@@ -162,19 +172,19 @@
 
           <section class="form-section">
             <h3>连接</h3>
-            <label>
+            <label data-deployment-only="true">
               <span>服务端</span>
               <input name="server_url" type="text" data-connection-field="true" />
             </label>
-            <label>
+            <label data-deployment-only="true">
               <span>API Key</span>
               <input name="api_key" type="password" autocomplete="off" data-connection-field="true" />
             </label>
-            <label>
+            <label data-deployment-only="true">
               <span>左臂 CAN</span>
               <input name="left_can" type="text" data-connection-field="true" />
             </label>
-            <label>
+            <label data-deployment-only="true">
               <span>右臂 CAN</span>
               <input name="right_can" type="text" data-connection-field="true" />
             </label>
@@ -202,15 +212,39 @@
               <span>相机超时</span>
               <input name="camera_timeout" type="number" min="0.1" step="0.1" data-connection-field="true" />
             </label>
-            <label>
+            <label data-deployment-only="true">
               <span>推理超时</span>
               <input name="policy_timeout" type="number" min="0.1" step="0.1" data-connection-field="true" />
             </label>
-            <label>
+            <label data-deployment-only="true">
+              <span>连接超时</span>
+              <input name="policy_connect_timeout_s" type="number" min="0.1" step="0.1" data-connection-field="true" />
+            </label>
+            <label data-deployment-only="true">
+              <span>Metadata 超时</span>
+              <input name="policy_metadata_timeout_s" type="number" min="0.1" step="0.1" data-connection-field="true" />
+            </label>
+            <label data-deployment-only="true">
+              <span>预热超时</span>
+              <input name="policy_warmup_timeout_s" type="number" min="0.1" step="0.1" data-connection-field="true" />
+            </label>
+            <label data-deployment-only="true">
+              <span>稳态推理超时</span>
+              <input name="policy_inference_timeout_s" type="number" min="0.1" step="0.1" data-connection-field="true" />
+            </label>
+            <label data-deployment-only="true">
+              <span>预热请求数</span>
+              <input name="policy_warmup_requests" type="number" min="1" step="1" data-connection-field="true" />
+            </label>
+            <div class="toggles wide" data-deployment-only="true">
+              <label><input name="policy_warmup_enabled" type="checkbox" data-connection-field="true" /> 启用预热</label>
+              <label><input name="policy_prefetch_first_chunk" type="checkbox" data-connection-field="true" /> 预取首 chunk</label>
+            </div>
+            <label data-deployment-only="true">
               <span>Enable 超时</span>
               <input name="enable_timeout_s" type="number" min="0" step="0.1" data-connection-field="true" />
             </label>
-            <label>
+            <label data-deployment-only="true">
               <span>Reset 超时</span>
               <input name="reset_timeout_s" type="number" min="0" step="0.1" data-connection-field="true" />
             </label>
@@ -256,7 +290,7 @@
             </label>
           </section>
 
-          <section class="form-section">
+          <section class="form-section" data-deployment-only="true">
             <h3>RM2</h3>
             <label><span>Camera Backend</span><select name="camera_backend"><option value="ros">ros</option><option value="realsense">realsense</option><option value="black">black</option></select></label>
             <label><span>RM Config</span><input name="rm_config" type="text" /></label>
@@ -271,7 +305,7 @@
             <label><span>Head Topic</span><input name="cam_head_topic" type="text" /></label>
           </section>
 
-          <section class="form-section">
+          <section class="form-section" data-deployment-only="true">
             <h3>RTC / 插值</h3>
             <label>
               <span>RTC Stride</span>
@@ -310,7 +344,7 @@
             </div>
           </section>
 
-          <section class="form-section">
+          <section class="form-section" data-deployment-only="true">
             <h3>夹爪 / Reset</h3>
             <label>
               <span>闭合角</span>

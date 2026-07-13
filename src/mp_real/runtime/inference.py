@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import dataclasses
 import logging
 import queue
 import threading
@@ -43,6 +44,22 @@ class InferenceAdapter(Protocol):
     def infer_only_interval_s(self) -> float: ...
 
 
+class PolicyProtocolError(RuntimeError):
+    """The policy response is not a mapping that can carry an action chunk."""
+
+
+class ActionDecodeError(RuntimeError):
+    """The robot-specific action decoder rejected a policy response."""
+
+
+@dataclasses.dataclass(frozen=True)
+class FetchedActionChunk:
+    observation: dict[str, Any]
+    response: dict[str, Any]
+    chunk: np.ndarray
+    inference_elapsed_s: float
+
+
 class InferenceHooks:
     """Non-blocking extension points for observing a policy loop in memory."""
 
@@ -81,12 +98,14 @@ def _active_hooks(hooks: InferenceHooks | None) -> InferenceHooks:
     return hooks if hooks is not None else InferenceHooks()
 
 
-def _fetch_chunk(
+def fetch_action_chunk(
     client: PolicyClient,
     adapter: InferenceAdapter,
     config: InferenceLoopConfig,
     hooks: InferenceHooks,
-) -> tuple[dict[str, Any], np.ndarray]:
+    *,
+    profile_stage: str = "inference",
+) -> FetchedActionChunk:
     observation_started_ns = time.monotonic_ns()
     observation = adapter.observe()
     adapter.profile("observation", (time.monotonic_ns() - observation_started_ns) / 1e9)
@@ -95,11 +114,33 @@ def _fetch_chunk(
     infer_started_ns = time.monotonic_ns()
     response = client.infer(observation)
     infer_elapsed_s = (time.monotonic_ns() - infer_started_ns) / 1e9
-    adapter.profile("inference", infer_elapsed_s)
+    adapter.profile(profile_stage, infer_elapsed_s)
+    if not isinstance(response, dict):
+        raise PolicyProtocolError(f"Expected a mapping policy response, got {type(response).__name__}")
     hooks.on_inference_finished(response, infer_elapsed_s)
-    chunk = adapter.decode_action_chunk(response, config.replan_steps)
+    try:
+        chunk = adapter.decode_action_chunk(response, config.replan_steps)
+    except ActionDecodeError:
+        raise
+    except BaseException as exc:
+        raise ActionDecodeError(f"Failed to decode policy action chunk: {exc}") from exc
     hooks.on_chunk_received(chunk.copy())
-    return observation, chunk
+    return FetchedActionChunk(
+        observation=observation,
+        response=response,
+        chunk=chunk,
+        inference_elapsed_s=infer_elapsed_s,
+    )
+
+
+def _fetch_chunk(
+    client: PolicyClient,
+    adapter: InferenceAdapter,
+    config: InferenceLoopConfig,
+    hooks: InferenceHooks,
+) -> tuple[dict[str, Any], np.ndarray]:
+    fetched = fetch_action_chunk(client, adapter, config, hooks)
+    return fetched.observation, fetched.chunk
 
 
 def run_infer_only(
@@ -166,14 +207,22 @@ def run_sync_loop(
     stop_event: threading.Event | None = None,
     on_step: Callable[[int, int], None] | None = None,
     hooks: InferenceHooks | None = None,
+    initial_chunk: np.ndarray | None = None,
 ) -> None:
     hooks = _active_hooks(hooks)
     plan: collections.deque[np.ndarray] = collections.deque()
+    if initial_chunk is not None:
+        prepared_chunk = np.asarray(initial_chunk, dtype=np.float32)
+        if prepared_chunk.ndim != 2 or len(prepared_chunk) == 0:
+            raise ValueError(f"initial_chunk must be a non-empty [T, action_dim] array, got {prepared_chunk.shape}")
+        plan.extend(prepared_chunk)
     dt = 1.0 / config.fps
     step = 0
     mode = "sync"
     try:
         hooks.on_loop_started(mode, config)
+        if plan:
+            hooks.on_chunk_received(np.asarray(plan, dtype=np.float32))
         previous: np.ndarray | None = adapter.initial_action()
         logging.info("Starting %s synchronous inference loop", adapter.name)
         while (stop_event is None or not stop_event.is_set()) and (
@@ -247,12 +296,18 @@ def run_rtc_loop(
     on_step: Callable[[int, int], None] | None = None,
     hooks: InferenceHooks | None = None,
     producer_daemon: bool = True,
+    initial_chunk: np.ndarray | None = None,
 ) -> None:
     hooks = _active_hooks(hooks)
     buffer = RealTimeChunkingBuffer(exp_weight=config.rtc_exp_weight)
     buffer.clear()
     stop_event = stop_event or threading.Event()
     errors: queue.Queue[BaseException] = queue.Queue()
+    if initial_chunk is not None:
+        prepared_chunk = np.asarray(initial_chunk, dtype=np.float32)
+        if prepared_chunk.ndim != 2 or len(prepared_chunk) == 0:
+            raise ValueError(f"initial_chunk must be a non-empty [T, action_dim] array, got {prepared_chunk.shape}")
+        buffer.enqueue(prepared_chunk, 0, buffer.get_generation())
     producer = threading.Thread(
         target=_rtc_producer,
         name=f"{adapter.name}-rtc-action-producer",
@@ -266,6 +321,8 @@ def run_rtc_loop(
     producer_started = False
     try:
         hooks.on_loop_started(mode, config)
+        if initial_chunk is not None:
+            hooks.on_chunk_received(np.asarray(initial_chunk, dtype=np.float32))
         producer.start()
         producer_started = True
         previous: np.ndarray | None = adapter.initial_action()
@@ -328,6 +385,7 @@ def run_policy_loop(
     hooks: InferenceHooks | None = None,
     print_infer_only_chunks: bool = True,
     rtc_producer_daemon: bool = True,
+    initial_chunk: np.ndarray | None = None,
 ) -> None:
     config.validate()
     if config.infer_only:
@@ -349,6 +407,15 @@ def run_policy_loop(
             on_step=on_step,
             hooks=hooks,
             producer_daemon=rtc_producer_daemon,
+            initial_chunk=initial_chunk,
         )
     else:
-        run_sync_loop(client, adapter, config, stop_event=stop_event, on_step=on_step, hooks=hooks)
+        run_sync_loop(
+            client,
+            adapter,
+            config,
+            stop_event=stop_event,
+            on_step=on_step,
+            hooks=hooks,
+            initial_chunk=initial_chunk,
+        )

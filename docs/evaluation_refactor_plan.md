@@ -62,22 +62,54 @@ Exit criterion: Piper CLI, Piper Web and RM2 Web select the same shared
 inference loop for each mode, while normal API response shapes and lifecycle
 behavior remain compatible.
 
-## Stage 2 — observation and action telemetry contracts
+## Stage 2 — Web resource modes and policy startup
 
-Primary files: runtime/models.py, runtime/observation.py, shared runtime and
-robot adapters.
+Primary files: focused shared policy-startup helpers, narrow Web lifecycle
+edits, the existing static page, and fake-only tests. This stage does not add
+recording, evaluation sessions or an offline data player.
 
-1. Retain ObservationSnapshot timestamps through the in-process evaluation
-   pipeline while leaving the policy wire schema unchanged.
-2. Record separate raw policy chunk, selected raw action, stabilized target and
-   robot-returned executed action. No shared field assumes Piper's shape.
-3. Add explicit event identities and monotonic timestamps to observations,
-   policy requests/results, chunk selection and execution.
-4. Extend Web frame snapshots to retain original camera time and frame identity,
-   not merely JPEG update time.
+### 2A — resource modes and camera-only preview
 
-Exit criterion: fake-robot tests prove timestamp retention and stale-result
-rejection across request, chunk and session changes.
+The Web runtime has three resource modes:
+
+- `DEPLOYMENT` creates robot, cameras and policy client and is the only mode
+  that can start a `RuntimeController`. Sync, RTC and infer-only remain
+  execution choices under this mode.
+- `CAMERA_PREVIEW` creates only configured cameras. It must not create a
+  Robot or PolicyClient, connect CAN, reset/enable an arm, or read robot
+  state. Camera errors are retained per stream so a failed camera does not
+  stop the other previews.
+- `OFFLINE_REPLAY` creates none of those resources. It provides the API/UI
+  isolation and stage-7 placeholder only; recorded-session playback is not
+  part of this stage.
+
+Preview workers are non-daemon, have an explicit stop event, bounded join and
+deterministic camera close. Fake tests cover factory isolation, repeated
+start/stop, one-camera failure, offline isolation and normal deployment
+resource creation.
+
+### 2B — warmup and first-chunk readiness
+
+Policy lifecycle distinguishes `DISCONNECTED`, `CONNECTING`, `CONNECTED`,
+`WARMING_UP`, `PREFETCHING_FIRST_CHUNK`, `READY`, `RUNNING`,
+`WARMUP_FAILED` and `ERROR`. It uses separately configurable connection,
+metadata, warmup and steady-inference timeouts.
+
+The shared startup coordinator obtains real observations, performs one or more
+warmup inferences, validates and discards every warmup action, then obtains a
+fresh first live chunk. Only then may the controller enter `RUNNING`. The
+shared sync and RTC loops receive this initial chunk; RTC seeds its buffer
+before its producer starts. Warmup failures preserve typed root causes rather
+than exposing only a generic RTC producer error. Stop/disconnect cancels the
+startup worker and closes its policy connection before resource teardown.
+
+Status exposes connection, metadata, cold-inference, warmup, first-live and
+steady-inference latency fields. A policy ping is metadata/connectivity only,
+not a warmed-model signal.
+
+Exit criterion: fake slow-first policies prove the unprepared RTC failure,
+successful warmup, discarded warmup actions, fresh first-chunk execution,
+typed warmup errors and clean stop/disconnect.
 
 ## Stage 3 — recording worker and versioned session format
 
@@ -143,4 +175,3 @@ uv run ruff check .
 
 Then review the diff for unrelated changes and state what still needs
 real-hardware verification.
-
