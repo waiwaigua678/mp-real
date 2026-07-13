@@ -1,0 +1,85 @@
+[project]
+name = "mp-real"
+version = "0.1.0"
+description = "Lightweight real-robot inference clients and web controls for Motrix robots."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+keywords = ["robotics", "real-robot", "inference", "openpi", "piper", "rm2"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "msgpack>=1.0.5,<2.0.0",
+    "numpy>=1.24.0,<2.0.0",
+    "pillow>=9.0.0,<12.0.0",
+    "typing-extensions>=4.12.2",
+    "tyro>=0.9.5",
+    "websockets>=11.0,<16.0",
+]
+
+[project.optional-dependencies]
+# Piper support expects a sibling checkout at ../pyAgxArm. Install it with
+# scripts/bootstrap-piper.sh so core/RM2/Web deployments do not need that SDK.
+piper = []
+# RM2 uses the vendor shared library and config supplied by the robot system.
+# Set RM_SDK_ROOT, or RM_CONFIG and RM_SDK_LIB, before invoking the command.
+rm2 = []
+# Head/wrist RealSense cameras. Linux only because pyrealsense2 publishes
+# platform-specific wheels and the deployment target is the robot controller.
+realsense = [
+    "pyrealsense2>=2.58.2.10647 ; sys_platform == 'linux'",
+]
+# V4L2 MJPEG capture uses OpenCV as the portable fallback when the optional
+# low-level Python v4l2 binding is unavailable.
+v4l2 = [
+    "opencv-python-headless>=4.10.0.84,<5.0.0",
+]
+# The web UI runs with core dependencies only. This extra enables OpenCV JPEG
+# encoding, which is faster than the built-in Pillow fallback.
+web = [
+    "opencv-python-headless>=4.10.0.84,<5.0.0",
+]
+dev = [
+    "ruff>=0.9.0",
+]
+
+[project.scripts]
+mp-piper-infer = "mp_real.robots.piper.infer:cli"
+mp-rm2-infer = "mp_real.robots.rm2.infer:cli"
+mp-piper-web = "mp_real.web.server:main"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mp_real"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"static" = "mp_real/web/static"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/README.md",
+    "/pyproject.toml",
+    "/src",
+    "/static",
+    "/scripts",
+    "/configs",
+    "/tests",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

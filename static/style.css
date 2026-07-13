@@ -1,0 +1,413 @@
+:root {
+  color-scheme: light;
+  --bg: #eef2f5;
+  --panel: #ffffff;
+  --ink: #20272f;
+  --muted: #66717e;
+  --line: #d7dde4;
+  --field: #f8fafc;
+  --primary: #0d6f7a;
+  --primary-dark: #0a5861;
+  --danger: #b53d3d;
+  --ok: #207548;
+  --warn: #9a681b;
+  --radius: 8px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--ink);
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.topbar {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) auto auto;
+  align-items: center;
+  gap: 16px;
+  min-height: 72px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--line);
+  background: #ffffff;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+h1 {
+  font-size: 22px;
+}
+
+h2 {
+  font-size: 15px;
+}
+
+h3 {
+  padding: 0 0 4px;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.subline {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.tabs,
+.status-strip,
+.button-row,
+.toggles {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.tab {
+  min-width: 76px;
+}
+
+.tab.active {
+  border-color: var(--primary);
+  background: #e8f5f7;
+  color: var(--primary-dark);
+}
+
+.badge {
+  min-width: 86px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #f9fbfc;
+  color: var(--muted);
+  text-align: center;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.badge.ok {
+  border-color: #b6dfc5;
+  background: #edf8f1;
+  color: var(--ok);
+}
+
+.badge.warn {
+  border-color: #efd49c;
+  background: #fff8e8;
+  color: var(--warn);
+}
+
+.badge.bad {
+  border-color: #e5b5b5;
+  background: #fff0f0;
+  color: var(--danger);
+}
+
+main {
+  padding: 14px;
+}
+
+.page {
+  display: none;
+}
+
+.page.active {
+  display: block;
+}
+
+.run-band,
+.settings-head,
+.panel,
+.camera-panel,
+.form-section {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+.run-band {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 0.7fr);
+  gap: 14px;
+  padding: 14px;
+}
+
+.prompt-line {
+  min-height: 40px;
+  margin-bottom: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--field);
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.run-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.run-stats div,
+.metric-grid div {
+  min-height: 64px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fbfcfd;
+}
+
+.run-stats span,
+.metric-grid span,
+label span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.run-stats strong,
+.metric-grid strong {
+  display: block;
+  margin-top: 8px;
+  font-size: 19px;
+  letter-spacing: 0;
+}
+
+.camera-grid {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr 1fr;
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.panel-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 46px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.panel-title span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.video-box {
+  display: grid;
+  place-items: center;
+  aspect-ratio: 4 / 3;
+  width: 100%;
+  background: #101418;
+  overflow: hidden;
+}
+
+.video-box img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.lower-grid {
+  display: grid;
+  grid-template-columns: minmax(360px, 0.8fr) minmax(360px, 1.2fr);
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  padding: 14px;
+}
+
+.metadata,
+#logBox {
+  margin: 0 14px 14px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #171b20;
+  color: #dce3ea;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.metadata {
+  max-height: 160px;
+}
+
+#logBox {
+  min-height: 220px;
+  max-height: 320px;
+}
+
+.settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px;
+}
+
+.settings-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(360px, 1fr));
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.form-section {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 14px;
+}
+
+.form-section h3,
+.wide {
+  grid-column: 1 / -1;
+}
+
+label {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+input,
+select,
+button {
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+  letter-spacing: 0;
+}
+
+input,
+select {
+  width: 100%;
+  padding: 7px 9px;
+  background: var(--field);
+  color: var(--ink);
+}
+
+input:disabled,
+select:disabled {
+  color: #8e98a3;
+  background: #eef1f4;
+}
+
+.toggles label {
+  display: inline-flex;
+  grid-template-columns: none;
+  align-items: center;
+  min-height: 34px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.toggles input {
+  width: 16px;
+  min-height: 16px;
+}
+
+button {
+  min-width: 82px;
+  padding: 7px 12px;
+  background: #f7f9fb;
+  color: var(--ink);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+button.primary {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: #ffffff;
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--primary-dark);
+}
+
+button.danger {
+  border-color: var(--danger);
+  background: var(--danger);
+  color: #ffffff;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.message {
+  min-height: 24px;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.message.bad,
+#errorLine {
+  color: var(--danger);
+}
+
+.message.ok {
+  color: var(--ok);
+}
+
+#errorLine {
+  font-weight: 700;
+}
+
+@media (max-width: 1120px) {
+  .topbar,
+  .run-band,
+  .camera-grid,
+  .lower-grid,
+  .settings-form {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  main,
+  .topbar {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+
+  .form-section,
+  .metric-grid,
+  .run-stats {
+    grid-template-columns: 1fr;
+  }
+
+  button {
+    flex: 1 1 112px;
+  }
+}

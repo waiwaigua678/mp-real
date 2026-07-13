@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Piper Control</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Piper Control</h1>
+        <div class="subline" id="serverLine">ws://127.0.0.1:8000</div>
+      </div>
+      <nav class="tabs">
+        <button class="tab active" type="button" data-page="runPage">运行</button>
+        <button class="tab" type="button" data-page="settingsPage">参数</button>
+      </nav>
+      <div class="status-strip">
+        <span class="badge" id="phaseBadge">idle</span>
+        <span class="badge" id="policyBadge">policy off</span>
+        <span class="badge" id="runBadge">stopped</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="page active" id="runPage">
+        <section class="run-band">
+          <div class="run-main">
+            <div class="prompt-line" id="promptLine">perform the task</div>
+            <div class="button-row">
+              <button id="connectBtn" type="button">连接预览</button>
+              <button id="startBtn" type="button" class="primary">开始</button>
+              <button id="stopBtn" type="button" class="danger">停止</button>
+              <button id="resetBtn" type="button">归位</button>
+              <button id="disconnectBtn" type="button">断开</button>
+            </div>
+            <div class="message" id="message"></div>
+          </div>
+          <div class="run-stats">
+            <div><span>step</span><strong id="stepLine">0</strong></div>
+            <div><span>infer</span><strong id="inferLatency">-</strong></div>
+            <div><span>loop</span><strong id="loopMs">-</strong></div>
+            <div><span>uptime</span><strong id="uptime">-</strong></div>
+          </div>
+        </section>
+
+        <section class="camera-grid">
+          <article class="camera-panel">
+            <div class="panel-title">
+              <h2>cam_head</h2>
+              <span id="meta-cam_head">sequence 0</span>
+            </div>
+            <div class="video-box"><img id="stream-cam_head" alt="cam_head" /></div>
+          </article>
+          <article class="camera-panel">
+            <div class="panel-title">
+              <h2>cam_left_wrist</h2>
+              <span id="meta-cam_left_wrist">sequence 0</span>
+            </div>
+            <div class="video-box"><img id="stream-cam_left_wrist" alt="cam_left_wrist" /></div>
+          </article>
+          <article class="camera-panel">
+            <div class="panel-title">
+              <h2>cam_right_wrist</h2>
+              <span id="meta-cam_right_wrist">sequence 0</span>
+            </div>
+            <div class="video-box"><img id="stream-cam_right_wrist" alt="cam_right_wrist" /></div>
+          </article>
+        </section>
+
+        <section class="lower-grid">
+          <section class="panel metrics">
+            <div class="panel-title">
+              <h2>状态</h2>
+              <span id="errorLine"></span>
+            </div>
+            <div class="metric-grid">
+              <div><span>推理速度</span><strong id="inferHz">-</strong></div>
+              <div><span>控制速度</span><strong id="controlHz">-</strong></div>
+              <div><span>动作队列</span><strong id="queueLen">0</strong></div>
+            </div>
+            <pre class="metadata" id="metadata">{}</pre>
+          </section>
+
+          <section class="panel logs">
+            <div class="panel-title">
+              <h2>日志</h2>
+              <span id="editState">参数可编辑</span>
+            </div>
+            <pre id="logBox"></pre>
+          </section>
+        </section>
+      </section>
+
+      <section class="page" id="settingsPage">
+        <section class="settings-head">
+          <div>
+            <h2>参数</h2>
+            <div class="subline" id="settingsLockLine">参数可编辑</div>
+          </div>
+          <div class="button-row">
+            <button id="saveBtn" type="button" class="primary">保存参数</button>
+            <button id="pingBtn" type="button">检查服务</button>
+          </div>
+        </section>
+
+        <form id="configForm" class="settings-form">
+          <section class="form-section">
+            <h3>连接安全</h3>
+            <label>
+              <span>机器人</span>
+              <select id="robotSelect">
+                <option value="piper">Piper</option>
+                <option value="rm2">RM2</option>
+              </select>
+            </label>
+            <label>
+              <span>访问密钥</span>
+              <input id="accessKey" type="password" autocomplete="off" />
+            </label>
+          </section>
+          <section class="form-section">
+            <h3>任务</h3>
+            <label class="wide">
+              <span>任务词</span>
+              <input name="prompt" type="text" />
+            </label>
+            <label>
+              <span>最大步数</span>
+              <input name="max_steps" type="number" min="1" step="1" placeholder="无限" />
+            </label>
+            <label>
+              <span>控制 FPS</span>
+              <input name="fps" type="number" min="0.1" step="0.1" />
+            </label>
+            <label>
+              <span>Replan Steps</span>
+              <input name="replan_steps" type="number" min="1" step="1" />
+            </label>
+            <label>
+              <span>速度 %</span>
+              <input name="speed_percent" type="number" min="1" max="100" step="1" />
+            </label>
+            <label>
+              <span>关节反馈限幅</span>
+              <input name="max_joint_step" type="number" step="0.01" />
+            </label>
+            <label>
+              <span>动作限幅</span>
+              <input name="max_action_step" type="number" step="0.01" />
+            </label>
+            <label>
+              <span>动作平滑</span>
+              <input name="action_smoothing" type="number" min="0" max="0.98" step="0.01" />
+            </label>
+            <label>
+              <span>关节死区</span>
+              <input name="joint_deadband" type="number" min="0" step="0.001" />
+            </label>
+          </section>
+
+          <section class="form-section">
+            <h3>连接</h3>
+            <label>
+              <span>服务端</span>
+              <input name="server_url" type="text" data-connection-field="true" />
+            </label>
+            <label>
+              <span>API Key</span>
+              <input name="api_key" type="password" autocomplete="off" data-connection-field="true" />
+            </label>
+            <label>
+              <span>左臂 CAN</span>
+              <input name="left_can" type="text" data-connection-field="true" />
+            </label>
+            <label>
+              <span>右臂 CAN</span>
+              <input name="right_can" type="text" data-connection-field="true" />
+            </label>
+            <label>
+              <span>相机宽</span>
+              <input name="camera_width" type="number" min="1" step="1" data-connection-field="true" />
+            </label>
+            <label>
+              <span>相机高</span>
+              <input name="camera_height" type="number" min="1" step="1" data-connection-field="true" />
+            </label>
+            <label>
+              <span>相机 FPS</span>
+              <input name="camera_fps" type="number" min="1" step="1" data-connection-field="true" />
+            </label>
+            <label>
+              <span>图像尺寸</span>
+              <input name="resize_size" type="number" min="32" step="1" data-connection-field="true" />
+            </label>
+            <label>
+              <span>相机流 FPS</span>
+              <input name="camera_stream_fps" type="number" min="0.1" step="0.1" data-connection-field="true" />
+            </label>
+            <label>
+              <span>相机超时</span>
+              <input name="camera_timeout" type="number" min="0.1" step="0.1" data-connection-field="true" />
+            </label>
+            <label>
+              <span>推理超时</span>
+              <input name="policy_timeout" type="number" min="0.1" step="0.1" data-connection-field="true" />
+            </label>
+            <label>
+              <span>Enable 超时</span>
+              <input name="enable_timeout_s" type="number" min="0" step="0.1" data-connection-field="true" />
+            </label>
+            <label>
+              <span>Reset 超时</span>
+              <input name="reset_timeout_s" type="number" min="0" step="0.1" data-connection-field="true" />
+            </label>
+          </section>
+
+          <section class="form-section">
+            <h3>相机</h3>
+            <label>
+              <span>Head Backend</span>
+              <select name="cam_head_backend" data-connection-field="true">
+                <option value="realsense">realsense</option>
+                <option value="v4l2">v4l2</option>
+                <option value="black">black</option>
+              </select>
+            </label>
+            <label>
+              <span>Head Selector</span>
+              <input name="cam_head" type="text" data-connection-field="true" />
+            </label>
+            <label>
+              <span>Left Backend</span>
+              <select name="cam_left_wrist_backend" data-connection-field="true">
+                <option value="realsense">realsense</option>
+                <option value="v4l2">v4l2</option>
+                <option value="black">black</option>
+              </select>
+            </label>
+            <label>
+              <span>Left Selector</span>
+              <input name="cam_left_wrist" type="text" data-connection-field="true" />
+            </label>
+            <label>
+              <span>Right Backend</span>
+              <select name="cam_right_wrist_backend" data-connection-field="true">
+                <option value="realsense">realsense</option>
+                <option value="v4l2">v4l2</option>
+                <option value="black">black</option>
+              </select>
+            </label>
+            <label>
+              <span>Right Selector</span>
+              <input name="cam_right_wrist" type="text" data-connection-field="true" />
+            </label>
+          </section>
+
+          <section class="form-section">
+            <h3>RM2</h3>
+            <label><span>Camera Backend</span><select name="camera_backend"><option value="ros">ros</option><option value="realsense">realsense</option><option value="black">black</option></select></label>
+            <label><span>RM Config</span><input name="rm_config" type="text" /></label>
+            <label><span>RM SDK Lib</span><input name="rm_sdk_lib" type="text" /></label>
+            <label><span>Left IP</span><input name="left_ip" type="text" /></label>
+            <label><span>Right IP</span><input name="right_ip" type="text" /></label>
+            <label><span>Arm Port</span><input name="arm_port" type="number" min="1" step="1" /></label>
+            <label><span>Joint DOF</span><input name="joint_dof" type="number" min="1" max="7" step="1" /></label>
+            <label><span>Policy Unit</span><select name="policy_joint_unit"><option value="rad">rad</option><option value="deg">deg</option></select></label>
+            <label><span>Left Topic</span><input name="cam_left_topic" type="text" /></label>
+            <label><span>Right Topic</span><input name="cam_right_topic" type="text" /></label>
+            <label><span>Head Topic</span><input name="cam_head_topic" type="text" /></label>
+          </section>
+
+          <section class="form-section">
+            <h3>RTC / 插值</h3>
+            <label>
+              <span>RTC Stride</span>
+              <input name="rtc_replan_stride" type="number" min="0" step="1" />
+            </label>
+            <label>
+              <span>RTC Prefetch</span>
+              <input name="rtc_prefetch_steps" type="number" min="0" step="1" />
+            </label>
+            <label>
+              <span>RTC 权重</span>
+              <input name="rtc_exp_weight" type="number" min="0" step="0.01" />
+            </label>
+            <label>
+              <span>下发频率</span>
+              <input name="command_rate_hz" type="number" min="1" step="1" />
+            </label>
+            <label>
+              <span>Arm Command</span>
+              <select name="arm_command">
+                <option value="move_j">move_j</option>
+                <option value="move_js">move_js</option>
+                <option value="auto">auto</option>
+              </select>
+            </label>
+            <label>
+              <span>夹爪平滑</span>
+              <input name="gripper_smoothing" type="number" min="0" max="0.98" step="0.01" />
+            </label>
+            <div class="toggles wide">
+              <label><input name="use_rtc" type="checkbox" /> RTC</label>
+              <label><input name="interpolate_actions" type="checkbox" /> 插值</label>
+              <label><input name="command_gripper_every_step" type="checkbox" /> 夹爪逐步下发</label>
+              <label><input name="hold_last_action" type="checkbox" /> 保持上一动作</label>
+              <label><input name="log_timing" type="checkbox" /> Timing 日志</label>
+            </div>
+          </section>
+
+          <section class="form-section">
+            <h3>夹爪 / Reset</h3>
+            <label>
+              <span>闭合角</span>
+              <input name="gripper_closed_deg" type="number" step="0.1" />
+            </label>
+            <label>
+              <span>张开角</span>
+              <input name="gripper_open_deg" type="number" step="0.1" />
+            </label>
+            <label>
+              <span>夹爪力</span>
+              <input name="gripper_force" type="number" step="0.1" />
+            </label>
+            <label>
+              <span>左臂初始</span>
+              <input name="init_left_joints" type="text" data-connection-field="true" />
+            </label>
+            <label>
+              <span>右臂初始</span>
+              <input name="init_right_joints" type="text" data-connection-field="true" />
+            </label>
+            <label>
+              <span>左夹爪初始</span>
+              <input name="init_left_gripper" type="number" step="0.01" data-connection-field="true" />
+            </label>
+            <label>
+              <span>右夹爪初始</span>
+              <input name="init_right_gripper" type="number" step="0.01" data-connection-field="true" />
+            </label>
+            <label>
+              <span>Infer Chunks</span>
+              <input name="infer_only_chunks" type="number" min="1" step="1" />
+            </label>
+            <div class="toggles wide">
+              <label><input name="reset_on_start" type="checkbox" data-connection-field="true" /> 启动归位</label>
+              <label><input name="enable_on_start" type="checkbox" data-connection-field="true" /> Enable</label>
+              <label><input name="dry_run" type="checkbox" /> Dry Run</label>
+              <label><input name="infer_only" type="checkbox" /> Infer Only</label>
+            </div>
+          </section>
+        </form>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
