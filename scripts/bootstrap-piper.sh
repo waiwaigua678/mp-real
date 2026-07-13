@@ -11,5 +11,7 @@ if [[ ! -f "${sdk_root}/pyproject.toml" && ! -f "${sdk_root}/setup.py" ]]; then
 fi
 
 cd "${project_root}"
-uv sync --extra piper
+# Forward additional uv sync arguments so Piper can be installed together with
+# camera, Web, or development extras in one exact synchronization.
+uv sync --extra piper "$@"
 uv pip install --python "${project_root}/.venv/bin/python" --editable "${sdk_root}"

@@ -11,16 +11,32 @@ cd mp-real
 uv sync
 ```
 
-Install the command profile and only the hardware dependencies used on the robot:
+Install every required extra in one `uv sync` command. Running separate
+`uv sync --extra ...` commands selects a new exact environment each time, so a
+later command can remove extras selected by an earlier one.
+
+For Piper, the bootstrap script always includes the `piper` extra and installs
+the sibling `../pyAgxArm` checkout. Pass every additional extra to that same
+sync operation:
 
 ```bash
-./scripts/bootstrap-piper.sh     # installs ../pyAgxArm as an editable Piper dependency
-uv sync --extra rm2              # vendor RM2 SDK is configured separately; see configs/rm2.env.example
-uv sync --extra realsense         # RealSense cameras
-uv sync --extra v4l2              # V4L2 MJPEG cameras
-uv sync --extra web               # faster OpenCV JPEG encoding for the Web UI
-uv sync --extra dev               # local lint tooling
+# Piper + RealSense + faster Web JPEG encoding + local lint tools
+./scripts/bootstrap-piper.sh --extra realsense --extra web --extra dev
+
+# Add RM2 support and V4L2 cameras when this controller needs them too.
+# The RM2 vendor SDK is configured separately; see configs/rm2.env.example.
+./scripts/bootstrap-piper.sh --extra rm2 --extra realsense --extra v4l2 --extra web --extra dev
 ```
+
+For a non-Piper deployment, use the same repeated-flag pattern directly:
+
+```bash
+uv sync --extra rm2 --extra realsense --extra web --extra dev
+```
+
+If this machine needs every optional Python dependency, use
+`./scripts/bootstrap-piper.sh --all-extras` for Piper, or `uv sync --all-extras`
+without Piper.
 
 Piper uses a fixed sibling layout, so deployment does not need a per-machine SDK path:
 
