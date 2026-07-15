@@ -340,6 +340,11 @@ def run_sync_loop(
             if not plan:
                 _, chunk = _fetch_chunk(client, adapter, config, hooks)
                 plan.extend(chunk)
+            # A stop request may arrive while a synchronous policy request is
+            # blocking.  Never turn the response that arrives afterwards into
+            # one more robot command.
+            if stop_event is not None and stop_event.is_set():
+                break
             selected = plan.popleft()
             hooks.on_action_selected(step, selected.copy())
             try:
@@ -448,6 +453,10 @@ def run_rtc_loop(
             raise_rtc_producer_error(errors)
             buffer.set_control_time(step)
             action = buffer.get_action(step)
+            # Match the synchronous-loop guarantee when a stop races with
+            # action selection or a producer result.
+            if stop_event.is_set():
+                break
             if action is None:
                 if previous is not None and config.hold_last_action:
                     try:

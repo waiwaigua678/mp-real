@@ -32,6 +32,7 @@ except ImportError:
 
 from mp_real.common.image import preprocess_image
 from mp_real.common.runtime import rtc_replan_stride
+from mp_real.evaluation.service import EvaluationConflict, EvaluationRuntimeLease, EvaluationService
 from mp_real.policy_client import msgpack_numpy
 from mp_real.robots.base import Robot
 from mp_real.robots.piper import infer as infer_piper
@@ -39,7 +40,12 @@ from mp_real.robots.rm2 import infer as infer_rm2
 from mp_real.robots.registry import create_robot
 from mp_real.runtime.config import InferenceLoopConfig
 from mp_real.runtime.controller import ControllerAlreadyRunningError, RuntimeController
-from mp_real.runtime.events import RuntimeEventHooks, RuntimeEventIdentity
+from mp_real.runtime.events import (
+    CompositeRuntimeEventSink,
+    InMemoryRuntimeEventSink,
+    RuntimeEventHooks,
+    RuntimeEventIdentity,
+)
 from mp_real.runtime.inference import CompositeInferenceHooks
 from mp_real.runtime.startup import (
     PolicyStartupCancelled,
@@ -406,6 +412,8 @@ class PiperWebRuntime:
         self._robot_factory = robot_factory
         self._policy_client_factory = policy_client_factory
         self._camera_factory = camera_factory or infer_piper.make_cameras
+        self._evaluation_owner: str | None = None
+        self._evaluation_service = EvaluationService(self)
 
         self._controller: RuntimeController | None = None
         self._loop_hooks = WebLoopHooks(
@@ -441,6 +449,58 @@ class PiperWebRuntime:
         self._phase = "idle"
         self._last_error: str | None = None
         self._server_metadata: dict[str, Any] | None = None
+
+    @property
+    def evaluation_service(self) -> EvaluationService:
+        return self._evaluation_service
+
+    def acquire_evaluation_control(self, evaluation_id: str) -> EvaluationRuntimeLease:
+        """Reserve this deployment's existing controller for one evaluation."""
+        with self._lock:
+            self._refresh_controller_state_locked()
+            if self._runtime_mode is not RuntimeMode.DEPLOYMENT:
+                raise EvaluationConflict(
+                    "Real-robot evaluation requires DEPLOYMENT mode; CAMERA_PREVIEW and OFFLINE_REPLAY cannot run it",
+                    legal_operations=("connect",),
+                )
+            if self._evaluation_owner is not None:
+                raise EvaluationConflict("Another evaluation already owns this deployment controller")
+            if not self._connected or self._controller is None:
+                raise EvaluationConflict("Connect the deployment runtime before creating an evaluation")
+            if self._running or self._startup_active_locked() or self._connection_active_locked():
+                raise EvaluationConflict("Stop normal deployment control before creating an evaluation")
+            if self._args.infer_only:
+                raise EvaluationConflict(
+                    "Evaluation requires a motion-capable (non-infer-only) deployment configuration"
+                )
+
+            controller = self._controller
+            args = copy.deepcopy(self._args)
+            runtime_snapshot = self.get_config()
+            action_spec_snapshot = dataclasses.asdict(controller.robot.action_spec)
+            startup_config = self._policy_startup_config_locked()
+            self._evaluation_owner = evaluation_id
+
+        def make_args(prompt: str) -> infer_piper.Args:
+            evaluation_args = copy.deepcopy(args)
+            evaluation_args.prompt = prompt
+            return evaluation_args
+
+        def release() -> None:
+            with self._lock:
+                if self._evaluation_owner == evaluation_id:
+                    self._evaluation_owner = None
+
+        return EvaluationRuntimeLease(
+            controller=controller,
+            runtime_config_snapshot=runtime_snapshot,
+            action_spec_snapshot=action_spec_snapshot,
+            robot_name="piper",
+            make_adapter=lambda prompt: self._make_inference_adapter(controller.robot, make_args(prompt)),
+            make_loop_config=lambda prompt: self._loop_config(make_args(prompt)),
+            make_startup_config=lambda: startup_config,
+            release=release,
+        )
 
     def log(self, message: str) -> None:
         line = f"{time.strftime('%H:%M:%S')} {message}"
@@ -484,6 +544,11 @@ class PiperWebRuntime:
     def update_config(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             self._refresh_controller_state_locked()
+            if self._evaluation_owner is not None:
+                raise ApiError(
+                    "Evaluation owns this deployment; abort or complete it before changing configuration",
+                    HTTPStatus.CONFLICT,
+                )
             if not self._can_edit_config_locked():
                 raise ApiError("Parameters can only be changed while the robot is not running")
             args = copy.deepcopy(self._args)
@@ -796,6 +861,8 @@ class PiperWebRuntime:
     def start(self) -> dict[str, Any]:
         with self._lock:
             self._refresh_controller_state_locked()
+            if self._evaluation_owner is not None:
+                raise ApiError("Evaluation owns robot control; use the evaluation API", HTTPStatus.CONFLICT)
             mode = self._runtime_mode
             if mode is RuntimeMode.CAMERA_PREVIEW:
                 if self._connected:
@@ -839,6 +906,11 @@ class PiperWebRuntime:
     def connect(self) -> dict[str, Any]:
         with self._lock:
             self._refresh_controller_state_locked()
+            if self._evaluation_owner is not None:
+                raise ApiError(
+                    "Evaluation owns this deployment; it must finish before reconnecting",
+                    HTTPStatus.CONFLICT,
+                )
             if self._running or self._stop_requested or self._startup_active_locked():
                 raise ApiError("Runtime is running or stopping", HTTPStatus.CONFLICT)
             if self._connected:
@@ -916,6 +988,7 @@ class PiperWebRuntime:
                 on_step=self._loop_hooks.on_step,
                 thread_name="piper-web-run",
                 print_infer_only_chunks=False,
+                event_sink=CompositeRuntimeEventSink(InMemoryRuntimeEventSink(), self._evaluation_service),
             )
         except BaseException as exc:
             if cameras:
@@ -1061,6 +1134,7 @@ class PiperWebRuntime:
                 self._policy_metrics.cold_inference_latency_ms = prepared.metrics.cold_inference_latency_ms
                 self._policy_metrics.warmup_latency_ms = prepared.metrics.warmup_latency_ms
                 self._policy_metrics.first_live_inference_latency_ms = prepared.metrics.first_live_inference_latency_ms
+                controller.configure_event_identity(session_id=None, episode_id=None)
                 controller.configure(
                     adapter,
                     loop_config,
@@ -1114,6 +1188,8 @@ class PiperWebRuntime:
     def stop(self, *, wait: bool = False) -> dict[str, Any]:
         with self._lock:
             self._refresh_controller_state_locked()
+            if self._evaluation_owner is not None:
+                raise ApiError("Evaluation owns robot control; use stop-episode or abort", HTTPStatus.CONFLICT)
             if self._runtime_mode is RuntimeMode.CAMERA_PREVIEW:
                 if self._phase == "previewing":
                     self._phase = "stopping"
@@ -1160,6 +1236,9 @@ class PiperWebRuntime:
         return self.status()
 
     def disconnect(self) -> dict[str, Any]:
+        with self._lock:
+            if self._evaluation_owner is not None:
+                raise ApiError("Evaluation owns this deployment; abort it before disconnecting", HTTPStatus.CONFLICT)
         self.stop(wait=True)
         with self._lock:
             if self._running or self._startup_active_locked() or self._connection_active_locked():
@@ -1202,6 +1281,11 @@ class PiperWebRuntime:
     def reset_arms(self) -> dict[str, Any]:
         with self._lock:
             self._refresh_controller_state_locked()
+            if self._evaluation_owner is not None:
+                raise ApiError(
+                    "Evaluation owns robot control; reset is an operator step in the evaluation flow",
+                    HTTPStatus.CONFLICT,
+                )
             if self._runtime_mode is not RuntimeMode.DEPLOYMENT:
                 raise ApiError("Robot reset is only available in deployment mode", HTTPStatus.CONFLICT)
             if self._startup_active_locked():
@@ -1342,6 +1426,7 @@ class PiperWebRuntime:
                 self._frame_condition.wait(min(0.2, remaining))
 
     def status(self) -> dict[str, Any]:
+        evaluation = self._evaluation_service.current()
         with self._lock:
             self._refresh_controller_state_locked()
             loop = self._loop_hooks.snapshot()
@@ -1447,6 +1532,7 @@ class PiperWebRuntime:
                     else None,
                 },
                 "frames": frames,
+                "evaluation": evaluation,
                 "logs": list(self._logs),
             }
 
@@ -1480,6 +1566,8 @@ class Rm2WebRuntime:
             lambda server_url, api_key, timeout: PolicyClient(server_url, api_key, timeout=timeout)
         )
         self._camera_factory = camera_factory or infer_rm2.make_cameras
+        self._evaluation_owner: str | None = None
+        self._evaluation_service = EvaluationService(self)
         self._controller: RuntimeController | None = None
         self._loop_hooks = WebLoopHooks(error_callback=self._record_loop_error)
         self._cameras: dict[str, infer_rm2.Camera] = {}
@@ -1497,6 +1585,55 @@ class Rm2WebRuntime:
         self._phase = "idle"
         self._last_error: str | None = None
         self._logs: deque[str] = deque(maxlen=200)
+
+    @property
+    def evaluation_service(self) -> EvaluationService:
+        return self._evaluation_service
+
+    def acquire_evaluation_control(self, evaluation_id: str) -> EvaluationRuntimeLease:
+        with self._lock:
+            self._refresh_controller_state_locked()
+            if self._evaluation_owner is not None:
+                raise EvaluationConflict("Another evaluation already owns this deployment controller")
+            if not self._connected or self._controller is None:
+                raise EvaluationConflict("Connect the deployment runtime before creating an evaluation")
+            if self._running:
+                raise EvaluationConflict("Stop normal deployment control before creating an evaluation")
+            if self._args.infer_only:
+                raise EvaluationConflict(
+                    "Evaluation requires a motion-capable (non-infer-only) deployment configuration"
+                )
+
+            controller = self._controller
+            args = copy.deepcopy(self._args)
+            runtime_snapshot = self.get_config()
+            action_spec_snapshot = dataclasses.asdict(controller.robot.action_spec)
+            startup_config = PolicyStartupConfig(
+                warmup_timeout_s=self._policy_timeout,
+                inference_timeout_s=self._policy_timeout,
+            )
+            self._evaluation_owner = evaluation_id
+
+        def make_args(prompt: str) -> infer_rm2.Args:
+            evaluation_args = copy.deepcopy(args)
+            evaluation_args.prompt = prompt
+            return evaluation_args
+
+        def release() -> None:
+            with self._lock:
+                if self._evaluation_owner == evaluation_id:
+                    self._evaluation_owner = None
+
+        return EvaluationRuntimeLease(
+            controller=controller,
+            runtime_config_snapshot=runtime_snapshot,
+            action_spec_snapshot=action_spec_snapshot,
+            robot_name="rm2",
+            make_adapter=lambda prompt: self._make_inference_adapter(controller.robot, make_args(prompt)),
+            make_loop_config=lambda prompt: InferenceLoopConfig.from_args(make_args(prompt)),
+            make_startup_config=lambda: startup_config,
+            release=release,
+        )
 
     def log(self, message: str) -> None:
         with self._lock:
@@ -1546,6 +1683,11 @@ class Rm2WebRuntime:
     def update_config(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             self._refresh_controller_state_locked()
+            if self._evaluation_owner is not None:
+                raise ApiError(
+                    "Evaluation owns this deployment; abort or complete it before changing configuration",
+                    HTTPStatus.CONFLICT,
+                )
             if self._connected or self._running:
                 raise ApiError("Disconnect RM2 before changing parameters", HTTPStatus.CONFLICT)
             if (
@@ -1661,6 +1803,7 @@ class Rm2WebRuntime:
                 on_step=self._loop_hooks.on_step,
                 thread_name="rm2-web-run",
                 print_infer_only_chunks=False,
+                event_sink=CompositeRuntimeEventSink(InMemoryRuntimeEventSink(), self._evaluation_service),
             )
         except Exception as exc:
             if cameras:
@@ -1684,11 +1827,14 @@ class Rm2WebRuntime:
             self.connect()
         with self._lock:
             self._refresh_controller_state_locked()
+            if self._evaluation_owner is not None:
+                raise ApiError("Evaluation owns robot control; use the evaluation API", HTTPStatus.CONFLICT)
             controller = self._controller
             if self._running or controller is None:
                 raise ApiError("RM2 runtime is not ready", HTTPStatus.CONFLICT)
             args = copy.deepcopy(self._args)
             self._loop_hooks.reset()
+            controller.configure_event_identity(session_id=None, episode_id=None)
             controller.configure(
                 self._make_inference_adapter(controller.robot, args),
                 InferenceLoopConfig.from_args(args),
@@ -1706,12 +1852,17 @@ class Rm2WebRuntime:
     def stop(self, *, wait: bool = False) -> dict[str, Any]:
         with self._lock:
             self._refresh_controller_state_locked()
+            if self._evaluation_owner is not None:
+                raise ApiError("Evaluation owns robot control; use stop-episode or abort", HTTPStatus.CONFLICT)
             controller = self._controller
         if controller is not None:
             controller.stop(wait=wait, timeout=5.0 if wait else None)
         return self.status()
 
     def disconnect(self) -> dict[str, Any]:
+        with self._lock:
+            if self._evaluation_owner is not None:
+                raise ApiError("Evaluation owns this deployment; abort it before disconnecting", HTTPStatus.CONFLICT)
         self.stop(wait=True)
         with self._lock:
             self._refresh_controller_state_locked()
@@ -1736,6 +1887,11 @@ class Rm2WebRuntime:
     def reset_arms(self) -> dict[str, Any]:
         with self._lock:
             self._refresh_controller_state_locked()
+            if self._evaluation_owner is not None:
+                raise ApiError(
+                    "Evaluation owns robot control; reset is an operator step in the evaluation flow",
+                    HTTPStatus.CONFLICT,
+                )
             controller = self._controller
         if controller is None:
             raise ApiError("RM2 is not connected", HTTPStatus.CONFLICT)
@@ -1813,6 +1969,7 @@ class Rm2WebRuntime:
             return self._frames[camera_name]
 
     def status(self) -> dict[str, Any]:
+        evaluation = self._evaluation_service.current()
         with self._lock:
             self._refresh_controller_state_locked()
             loop = self._loop_hooks.snapshot()
@@ -1838,6 +1995,7 @@ class Rm2WebRuntime:
                     }
                     for name, frame in self._frames.items()
                 },
+                "evaluation": evaluation,
                 "logs": list(self._logs),
             }
 
@@ -1860,6 +2018,8 @@ class PiperWebHandler(BaseHTTPRequestHandler):
                 self._send_json(self.server.runtime.status())
             elif path == "/api/config":
                 self._send_json(self.server.runtime.get_config())
+            elif path == "/api/evaluations/current":
+                self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.current()})
             elif path == "/api/replay/status":
                 self._send_json(
                     {
@@ -1891,7 +2051,23 @@ class PiperWebHandler(BaseHTTPRequestHandler):
         try:
             if not self.server.authorize(self.headers.get("X-Motrix-Key")):
                 raise ApiError("Invalid access key", HTTPStatus.UNAUTHORIZED)
-            if path == "/api/config":
+            if path == "/api/evaluations":
+                evaluation = self.server.runtime.evaluation_service.create(self._read_json())
+                self._send_json({"ok": True, "evaluation": evaluation})
+            elif path == "/api/evaluations/current/warmup":
+                self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.warmup()})
+            elif path == "/api/evaluations/current/reset-ready":
+                self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.reset_ready()})
+            elif path == "/api/evaluations/current/start-episode":
+                self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.start_episode()})
+            elif path == "/api/evaluations/current/stop-episode":
+                self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.stop_episode()})
+            elif path == "/api/evaluations/current/label":
+                evaluation = self.server.runtime.evaluation_service.label(self._read_json())
+                self._send_json({"ok": True, "evaluation": evaluation})
+            elif path == "/api/evaluations/current/abort":
+                self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.abort()})
+            elif path == "/api/config":
                 self._send_json({"ok": True, "config": self.server.runtime.update_config(self._read_json())})
             elif path == "/api/connect":
                 self._send_json({"ok": True, "status": self.server.runtime.connect()})
@@ -1910,8 +2086,15 @@ class PiperWebHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "config": self.server.select_robot(str(payload.get("robot", "")))})
             else:
                 self._send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
+        except EvaluationConflict as exc:
+            self._send_json(
+                {"ok": False, "error": str(exc), "legal_operations": list(exc.legal_operations)},
+                HTTPStatus.CONFLICT,
+            )
         except ApiError as exc:
             self._send_json({"ok": False, "error": str(exc)}, exc.status)
+        except ValueError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except Exception as exc:
             logging.exception("POST failed")
             self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -2067,7 +2250,14 @@ def main() -> None:
     except KeyboardInterrupt:
         logging.info("Stopping server")
     finally:
-        runtime.disconnect()
+        try:
+            runtime.evaluation_service.shutdown()
+        except Exception:
+            logging.exception("Failed to stop evaluation workers during shutdown")
+        try:
+            runtime.disconnect()
+        except Exception:
+            logging.exception("Failed to disconnect runtime during shutdown")
         server.server_close()
 
 

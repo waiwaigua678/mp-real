@@ -222,6 +222,20 @@ class RuntimeController:
             self._on_step = on_step
             self._initial_chunk = None if initial_chunk is None else np.asarray(initial_chunk, dtype=np.float32).copy()
 
+    def configure_event_identity(self, *, session_id: str | None, episode_id: str | None) -> None:
+        """Set the identity used by the next controller generation's events.
+
+        The controller deliberately knows only opaque identity strings.  This
+        lets orchestration layers associate a run with a session without
+        making the shared runtime depend on an evaluation implementation.
+        """
+        with self._lock:
+            self._require_open_locked()
+            if self._running or (self._thread is not None and self._thread.is_alive()):
+                raise ControllerAlreadyRunningError("Cannot change event identity while the controller is running")
+            self._session_id = session_id
+            self._episode_id = episode_id
+
     def start(self) -> int:
         with self._lock:
             self._require_open_locked()
