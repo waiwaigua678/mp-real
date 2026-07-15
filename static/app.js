@@ -1,5 +1,3 @@
-const CAMERA_NAMES = ["cam_head", "cam_left_wrist", "cam_right_wrist"];
-
 const form = document.querySelector("#configForm");
 const message = document.querySelector("#message");
 const saveBtn = document.querySelector("#saveBtn");
@@ -16,6 +14,7 @@ let currentStatus = null;
 let firstLoad = true;
 let dirty = false;
 let accessKey = sessionStorage.getItem("motrixAccessKey") || "";
+let cameraRoles = [];
 accessKeyInput.value = accessKey;
 
 function setMessage(text, kind = "") {
@@ -44,6 +43,7 @@ function numberOrEmpty(value) {
 
 function setForm(config) {
   if (config.robot) robotSelect.value = config.robot;
+  ensureCameraPanels(config.camera_roles || []);
   for (const [key, value] of Object.entries(config)) {
     const field = form.elements[key];
     if (!field) continue;
@@ -59,6 +59,27 @@ function setForm(config) {
   dirty = false;
 }
 
+function ensureCameraPanels(roles) {
+  const normalized = Array.from(roles || []);
+  if (normalized.length === cameraRoles.length && normalized.every((role, index) => role === cameraRoles[index])) return;
+  cameraRoles = normalized;
+  const grid = document.querySelector("#cameraGrid");
+  const template = document.querySelector("#cameraPanelTemplate");
+  grid.replaceChildren();
+  for (const role of cameraRoles) {
+    const panel = template.content.firstElementChild.cloneNode(true);
+    panel.dataset.cameraRole = role;
+    panel.querySelector("h2").textContent = role;
+    const meta = panel.querySelector(".panel-title span");
+    meta.id = `meta-${role}`;
+    const image = panel.querySelector("img");
+    image.id = `stream-${role}`;
+    image.alt = role;
+    image.src = `/stream/${encodeURIComponent(role)}.mjpg?t=${Date.now()}`;
+    grid.appendChild(panel);
+  }
+}
+
 function runtimeMode(statusOrMode) {
   if (typeof statusOrMode === "string") return statusOrMode;
   return statusOrMode?.runtime_mode || form.elements.runtime_mode?.value || "deployment";
@@ -66,14 +87,20 @@ function runtimeMode(statusOrMode) {
 
 function setRuntimeModeUi(statusOrMode) {
   const rm2 = statusOrMode?.robot === "rm2" || robotSelect.value === "rm2";
-  const mode = rm2 ? "deployment" : runtimeMode(statusOrMode);
+  const mode = runtimeMode(statusOrMode);
   form.elements.runtime_mode.value = mode;
-  form.elements.runtime_mode.disabled = rm2;
+  form.elements.runtime_mode.disabled = false;
   const deployment = mode === "deployment";
   const preview = mode === "camera_preview";
   const offline = mode === "offline_replay";
   for (const node of document.querySelectorAll("[data-deployment-only='true']")) {
     node.hidden = !deployment;
+  }
+  for (const node of document.querySelectorAll("[data-piper-only='true']")) {
+    node.hidden = rm2;
+  }
+  for (const node of document.querySelectorAll("[data-rm2-only='true']")) {
+    node.hidden = !rm2;
   }
   document.querySelector("#offlineReplayNotice").hidden = !offline;
   connectBtn.textContent = preview ? "连接相机" : offline ? "进入回放" : "连接预览";
@@ -154,6 +181,7 @@ function setFieldLocks(status) {
 
 function applyStatus(status) {
   currentStatus = status;
+  ensureCameraPanels(status.camera_roles || []);
   const metrics = status.metrics || {};
 
   setBadge("#phaseBadge", status.phase, status.phase === "running" ? "ok" : status.phase === "error" ? "bad" : "");
@@ -186,10 +214,13 @@ function applyStatus(status) {
   );
   document.querySelector("#logBox").textContent = (status.logs || []).join("\n");
 
-  for (const camera of CAMERA_NAMES) {
+  for (const camera of cameraRoles) {
     const frame = (status.frames || {})[camera] || {};
-    document.querySelector(`#meta-${camera}`).textContent =
-      `sequence ${frame.sequence || 0} · age ${fmt(frame.age_ms, " ms")}${frame.error ? ` · ${frame.error}` : ""}`;
+    const meta = document.querySelector(`#meta-${camera}`);
+    if (meta) {
+      meta.textContent =
+        `sequence ${frame.sequence || 0} · age ${fmt(frame.age_ms, " ms")}${frame.error ? ` · ${frame.error}` : ""}`;
+    }
   }
 
   // Status polling must not overwrite a disconnected user's unsaved mode.
@@ -296,8 +327,9 @@ async function pingPolicy() {
 }
 
 function initStreams() {
-  for (const camera of CAMERA_NAMES) {
-    document.querySelector(`#stream-${camera}`).src = `/stream/${camera}.mjpg?t=${Date.now()}`;
+  for (const camera of cameraRoles) {
+    const image = document.querySelector(`#stream-${camera}`);
+    if (image) image.src = `/stream/${encodeURIComponent(camera)}.mjpg?t=${Date.now()}`;
   }
 }
 

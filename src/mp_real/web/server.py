@@ -53,6 +53,21 @@ from mp_real.runtime.startup import (
     PolicyStartupCoordinator,
 )
 from mp_real.web.runtime import CachedFrameObservationSource, WebInferenceAdapter, WebLoopHooks
+from mp_real.web.profiles import (
+    PIPER_WEB_PROFILE,
+    RM2_WEB_PROFILE,
+    RobotWebProfile,
+    clone_default_args,
+    close_profile_cameras,
+    get_web_profile,
+)
+from mp_real.web.resources import (
+    ResourceLease,
+    ResourceLeaseConflict,
+    ResourceLeaseManager,
+    ResourceRequest,
+    ResourceType,
+)
 
 
 CAMERA_NAMES = ("cam_head", "cam_left_wrist", "cam_right_wrist")
@@ -274,7 +289,7 @@ def _black_frame(size: int) -> np.ndarray:
 
 
 def _config_to_dict(
-    args: infer_piper.Args,
+    args: Any,
     *,
     camera_stream_fps: float,
     policy_timeout: float,
@@ -287,6 +302,61 @@ def _config_to_dict(
     policy_warmup_requests: int = 1,
     policy_prefetch_first_chunk: bool = True,
 ) -> dict[str, Any]:
+    if isinstance(args, infer_rm2.Args):
+        return {
+            "robot": "rm2",
+            "runtime_mode": runtime_mode.value,
+            "server_url": args.server_url,
+            "api_key": args.api_key or "",
+            "prompt": args.prompt,
+            "fps": args.fps,
+            "replan_steps": args.replan_steps,
+            "max_steps": args.max_steps,
+            "dry_run": args.dry_run,
+            "infer_only": args.infer_only,
+            "infer_only_chunks": args.infer_only_chunks,
+            "use_rtc": args.use_rtc,
+            "rtc_replan_stride": args.rtc_replan_stride,
+            "rtc_prefetch_steps": args.rtc_prefetch_steps,
+            "rtc_exp_weight": args.rtc_exp_weight,
+            "hold_last_action": args.hold_last_action,
+            "log_timing": args.log_timing,
+            "reset_on_start": args.reset_on_start,
+            "camera_backend": args.camera_backend,
+            "camera_width": args.camera_width,
+            "camera_height": args.camera_height,
+            "camera_fps": args.camera_fps,
+            "camera_timeout": args.camera_timeout,
+            "camera_stream_fps": camera_stream_fps,
+            "resize_size": args.resize_size,
+            "rm_config": args.rm_config,
+            "rm_sdk_lib": args.rm_sdk_lib,
+            "left_ip": args.left_ip or "",
+            "right_ip": args.right_ip or "",
+            "arm_port": args.arm_port,
+            "joint_dof": args.joint_dof,
+            "policy_joint_unit": args.policy_joint_unit,
+            "cam_left_topic": args.cam_left_topic,
+            "cam_right_topic": args.cam_right_topic,
+            "cam_head_topic": args.cam_head_topic,
+            "cam_left_serial": args.cam_left_serial,
+            "cam_right_serial": args.cam_right_serial,
+            "cam_head_serial": args.cam_head_serial,
+            "policy_timeout": policy_timeout,
+            "policy_connect_timeout_s": policy_connect_timeout_s
+            if policy_connect_timeout_s is not None
+            else policy_timeout,
+            "policy_metadata_timeout_s": policy_metadata_timeout_s
+            if policy_metadata_timeout_s is not None
+            else policy_timeout,
+            "policy_warmup_timeout_s": policy_warmup_timeout_s,
+            "policy_inference_timeout_s": policy_inference_timeout_s
+            if policy_inference_timeout_s is not None
+            else policy_timeout,
+            "policy_warmup_enabled": policy_warmup_enabled,
+            "policy_warmup_requests": policy_warmup_requests,
+            "policy_prefetch_first_chunk": policy_prefetch_first_chunk,
+        }
     return {
         "robot": "piper",
         "runtime_mode": runtime_mode.value,
@@ -387,19 +457,22 @@ def _coerce_float_tuple(value: Any, *, length: int, field: str) -> tuple[float, 
     return tuple(float(part) for part in parts)
 
 
-class PiperWebRuntime:
+class RobotWebRuntime:
     def __init__(
         self,
-        initial_args: infer_piper.Args | None = None,
+        initial_args: Any | None = None,
         *,
+        profile: RobotWebProfile = PIPER_WEB_PROFILE,
         policy_timeout: float = 3.0,
         robot_factory: Callable[[str, Any], Robot] = create_robot,
         policy_client_factory: Callable[[str, str | None, float], PolicyClient] | None = None,
-        camera_factory: Callable[[infer_piper.Args], dict[str, infer_piper.Camera]] | None = None,
+        camera_factory: Callable[[Any], dict[str, infer_piper.Camera]] | None = None,
+        resource_manager: ResourceLeaseManager | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._frame_condition = threading.Condition(self._lock)
-        self._args = copy.deepcopy(initial_args) if initial_args is not None else _default_args()
+        self._profile = profile
+        self._args = copy.deepcopy(initial_args) if initial_args is not None else clone_default_args(profile)
         self._camera_stream_fps = 10.0
         self._policy_timeout = policy_timeout
         self._policy_connect_timeout_s = policy_timeout
@@ -411,7 +484,10 @@ class PiperWebRuntime:
         self._policy_prefetch_first_chunk = True
         self._robot_factory = robot_factory
         self._policy_client_factory = policy_client_factory
-        self._camera_factory = camera_factory or infer_piper.make_cameras
+        self._camera_factory = camera_factory or profile.create_cameras
+        self._resource_manager = resource_manager or ResourceLeaseManager()
+        self._resource_owner_id = f"web-{profile.robot_name}-{secrets.token_hex(8)}"
+        self._resource_lease: ResourceLease | None = None
         self._evaluation_owner: str | None = None
         self._evaluation_service = EvaluationService(self)
 
@@ -425,7 +501,7 @@ class PiperWebRuntime:
             name: FrameSnapshot(
                 image=_black_frame(self._args.resize_size), jpeg=_encode_jpeg_rgb(_black_frame(self._args.resize_size))
             )
-            for name in CAMERA_NAMES
+            for name in self._profile.camera_roles_for_args(self._args)
         }
 
         self._camera_thread: threading.Thread | None = None
@@ -454,6 +530,10 @@ class PiperWebRuntime:
     def evaluation_service(self) -> EvaluationService:
         return self._evaluation_service
 
+    @property
+    def resource_manager(self) -> ResourceLeaseManager:
+        return self._resource_manager
+
     def acquire_evaluation_control(self, evaluation_id: str) -> EvaluationRuntimeLease:
         """Reserve this deployment's existing controller for one evaluation."""
         with self._lock:
@@ -481,7 +561,7 @@ class PiperWebRuntime:
             startup_config = self._policy_startup_config_locked()
             self._evaluation_owner = evaluation_id
 
-        def make_args(prompt: str) -> infer_piper.Args:
+        def make_args(prompt: str) -> Any:
             evaluation_args = copy.deepcopy(args)
             evaluation_args.prompt = prompt
             return evaluation_args
@@ -495,7 +575,7 @@ class PiperWebRuntime:
             controller=controller,
             runtime_config_snapshot=runtime_snapshot,
             action_spec_snapshot=action_spec_snapshot,
-            robot_name="piper",
+            robot_name=self._profile.robot_name,
             make_adapter=lambda prompt: self._make_inference_adapter(controller.robot, make_args(prompt)),
             make_loop_config=lambda prompt: self._loop_config(make_args(prompt)),
             make_startup_config=lambda: startup_config,
@@ -527,7 +607,7 @@ class PiperWebRuntime:
 
     def get_config(self) -> dict[str, Any]:
         with self._lock:
-            return _config_to_dict(
+            config = _config_to_dict(
                 copy.deepcopy(self._args),
                 camera_stream_fps=self._camera_stream_fps,
                 policy_timeout=self._policy_timeout,
@@ -540,8 +620,19 @@ class PiperWebRuntime:
                 policy_warmup_requests=self._policy_warmup_requests,
                 policy_prefetch_first_chunk=self._policy_prefetch_first_chunk,
             )
+            config.update(
+                {
+                    "robot": self._profile.robot_name,
+                    "camera_roles": list(self._profile.camera_roles_for_args(self._args)),
+                    "action_spec": dataclasses.asdict(self._profile.action_spec_for_args(self._args)),
+                    "capabilities": dataclasses.asdict(self._profile.capabilities),
+                }
+            )
+            return config
 
     def update_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self._profile.robot_name == "rm2":
+            return self._update_rm2_config(payload)
         with self._lock:
             self._refresh_controller_state_locked()
             if self._evaluation_owner is not None:
@@ -760,13 +851,119 @@ class PiperWebRuntime:
             self.log("Updated runtime parameters")
             return self.get_config()
 
+    def _update_rm2_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Apply RM2's existing CLI-shaped settings without Piper field assumptions."""
+        with self._lock:
+            self._refresh_controller_state_locked()
+            if self._evaluation_owner is not None:
+                raise ApiError(
+                    "Evaluation owns this deployment; abort or complete it before changing configuration",
+                    HTTPStatus.CONFLICT,
+                )
+            if not self._can_edit_connection_config_locked():
+                raise ApiError("Disconnect RM2 before changing parameters", HTTPStatus.CONFLICT)
+            args = copy.deepcopy(self._args)
+            for field in (
+                "server_url",
+                "api_key",
+                "prompt",
+                "left_ip",
+                "right_ip",
+                "cam_left_topic",
+                "cam_right_topic",
+                "cam_head_topic",
+                "cam_left_serial",
+                "cam_right_serial",
+                "cam_head_serial",
+            ):
+                if field in payload:
+                    value = str(payload[field])
+                    setattr(args, field, value if field != "api_key" or value else None)
+            for field in ("rm_config", "rm_sdk_lib"):
+                if field in payload:
+                    value = str(payload[field]).strip()
+                    setattr(args, field, pathlib.Path(value).expanduser() if value else None)
+            for field in ("fps", "camera_timeout", "action_smoothing", "gripper_smoothing"):
+                if field in payload:
+                    value = float(payload[field])
+                    if field in {"fps", "camera_timeout"} and value <= 0:
+                        raise ApiError(f"{field} must be positive")
+                    setattr(args, field, value)
+            for field in (
+                "replan_steps",
+                "camera_width",
+                "camera_height",
+                "camera_fps",
+                "resize_size",
+                "joint_dof",
+                "rtc_replan_stride",
+                "rtc_prefetch_steps",
+            ):
+                if field in payload:
+                    value = int(payload[field])
+                    if value < 0 or (field not in {"rtc_replan_stride", "rtc_prefetch_steps"} and value == 0):
+                        raise ApiError(f"{field} must be positive")
+                    setattr(args, field, value)
+            if "max_steps" in payload:
+                args.max_steps = _coerce_optional_int(payload["max_steps"])
+            if "camera_backend" in payload:
+                args.camera_backend = str(payload["camera_backend"])
+            if "policy_joint_unit" in payload:
+                args.policy_joint_unit = str(payload["policy_joint_unit"])
+            if "arm_port" in payload:
+                args.arm_port = int(payload["arm_port"]) if payload["arm_port"] not in (None, "") else None
+            for field in ("dry_run", "infer_only", "use_rtc", "reset_on_start", "hold_last_action", "log_timing"):
+                if field in payload:
+                    setattr(args, field, _coerce_bool(payload[field]))
+            for field in (
+                "policy_connect_timeout_s",
+                "policy_metadata_timeout_s",
+                "policy_warmup_timeout_s",
+                "policy_inference_timeout_s",
+                "policy_timeout",
+                "camera_stream_fps",
+            ):
+                if field in payload:
+                    value = float(payload[field])
+                    if value <= 0:
+                        raise ApiError(f"{field} must be positive")
+                    if field == "policy_connect_timeout_s":
+                        self._policy_connect_timeout_s = value
+                    elif field == "policy_metadata_timeout_s":
+                        self._policy_metadata_timeout_s = value
+                    elif field == "policy_warmup_timeout_s":
+                        self._policy_warmup_timeout_s = value
+                    elif field in {"policy_inference_timeout_s", "policy_timeout"}:
+                        self._policy_inference_timeout_s = value
+                        self._policy_timeout = value
+                    else:
+                        self._camera_stream_fps = value
+            if "runtime_mode" in payload:
+                self._runtime_mode = _runtime_mode(payload["runtime_mode"])
+            if "policy_warmup_enabled" in payload:
+                self._policy_warmup_enabled = _coerce_bool(payload["policy_warmup_enabled"])
+            if "policy_warmup_requests" in payload:
+                self._policy_warmup_requests = int(payload["policy_warmup_requests"])
+                if self._policy_warmup_requests <= 0:
+                    raise ApiError("policy_warmup_requests must be positive")
+            if "policy_prefetch_first_chunk" in payload:
+                self._policy_prefetch_first_chunk = _coerce_bool(payload["policy_prefetch_first_chunk"])
+            try:
+                self._profile.validate_args(args)
+            except ValueError as exc:
+                raise ApiError(str(exc)) from exc
+            self._args = args
+            self._reset_placeholder_frames_locked(args.resize_size)
+            self.log("Updated RM2 runtime parameters")
+            return self.get_config()
+
     def _reset_placeholder_frames_locked(self, resize_size: int) -> None:
         placeholder = _black_frame(resize_size)
         jpeg = _encode_jpeg_rgb(placeholder)
         now = time.monotonic()
         self._frames = {
             name: FrameSnapshot(image=placeholder.copy(), jpeg=jpeg, sequence=0, updated_at=now)
-            for name in CAMERA_NAMES
+            for name in self._profile.camera_roles_for_args(self._args)
         }
         self._frame_condition.notify_all()
 
@@ -782,35 +979,16 @@ class PiperWebRuntime:
     def _can_edit_connection_config_locked(self) -> bool:
         return self._can_edit_config_locked() and not self._connected
 
-    def _make_inference_adapter(self, robot: Robot, args: infer_piper.Args) -> WebInferenceAdapter:
-        source = CachedFrameObservationSource(
-            robot=robot,
-            read_images=lambda: (self._latest_images_for_inference(args), None),
-            image_masks=_camera_masks(args),
-            prompt=args.prompt,
+    def _make_inference_adapter(self, robot: Robot, args: Any) -> WebInferenceAdapter:
+        return self._profile.make_adapter(
+            robot,
+            args,
+            lambda: self._latest_images_for_inference(args),
+            self._record_inference_profile,
         )
 
-        def decode(response: dict[str, Any], replan_steps: int) -> np.ndarray:
-            if replan_steps != args.replan_steps:
-                raise ValueError("Piper replan_steps must match the Web runtime configuration")
-            return infer_piper.response_to_action_chunk(response, args)
-
-        return WebInferenceAdapter(
-            name="piper",
-            robot=robot,
-            observation_source=source,
-            decode_chunk=decode,
-            stabilize=lambda action, previous: infer_piper.stabilize_action(action, previous, args),
-            infer_interval_s=1.0 / args.fps,
-            profile_callback=self._record_inference_profile,
-        )
-
-    @staticmethod
-    def _loop_config(args: infer_piper.Args) -> InferenceLoopConfig:
-        config = InferenceLoopConfig.from_args(args)
-        if args.infer_only and args.max_steps is not None:
-            config = dataclasses.replace(config, infer_only_chunks=args.max_steps)
-        return config
+    def _loop_config(self, args: Any) -> InferenceLoopConfig:
+        return self._profile.make_loop_config(args)
 
     def _refresh_controller_state_locked(self) -> None:
         if self._controller is None:
@@ -839,7 +1017,7 @@ class PiperWebRuntime:
         with self._lock:
             self._policy_metrics.steady_inference_latency_ms = elapsed_s * 1000.0
 
-    def _create_policy_client(self, args: infer_piper.Args) -> PolicyClient:
+    def _create_policy_client(self, args: Any) -> PolicyClient:
         if self._policy_client_factory is not None:
             return self._policy_client_factory(args.server_url, args.api_key, self._policy_connect_timeout_s)
         return PolicyClient(
@@ -930,10 +1108,40 @@ class PiperWebRuntime:
                 self._begin_deployment_connect_locked(args, start_after_connect=False)
         return self.status()
 
-    def _begin_deployment_connect_locked(self, args: infer_piper.Args, *, start_after_connect: bool) -> None:
+    def _resource_requests(self, mode: RuntimeMode, args: Any) -> tuple[ResourceRequest, ...]:
+        robot_scope = self._profile.robot_name
+        camera_scope = f"{robot_scope}:{','.join(self._profile.camera_roles_for_args(args))}"
+        if mode is RuntimeMode.DEPLOYMENT:
+            return (
+                ResourceRequest(ResourceType.ROBOT_CONTROL, robot_scope),
+                ResourceRequest(ResourceType.CAMERAS, camera_scope),
+                ResourceRequest(ResourceType.POLICY_CLIENT, str(args.server_url)),
+            )
+        if mode is RuntimeMode.CAMERA_PREVIEW:
+            return (ResourceRequest(ResourceType.CAMERAS, camera_scope),)
+        return (ResourceRequest(ResourceType.RECORDED_DATA, robot_scope),)
+
+    def _acquire_resources_locked(self, mode: RuntimeMode, args: Any) -> None:
+        if self._resource_lease is not None and not self._resource_lease.released:
+            return
+        try:
+            self._resource_lease = self._resource_manager.acquire(
+                self._resource_owner_id,
+                self._resource_requests(mode, args),
+            )
+        except ResourceLeaseConflict as exc:
+            raise ApiError(str(exc), HTTPStatus.CONFLICT) from exc
+
+    def _release_resources_locked(self) -> None:
+        if self._resource_lease is not None:
+            self._resource_lease.release()
+            self._resource_lease = None
+
+    def _begin_deployment_connect_locked(self, args: Any, *, start_after_connect: bool) -> None:
         if self._connection_active_locked():
             self._start_after_connect = self._start_after_connect or start_after_connect
             return
+        self._acquire_resources_locked(RuntimeMode.DEPLOYMENT, args)
         self._connect_generation_id += 1
         generation_id = self._connect_generation_id
         self._connect_stop_event = threading.Event()
@@ -944,7 +1152,7 @@ class PiperWebRuntime:
         self._connect_thread = threading.Thread(
             target=self._run_deployment_connect,
             args=(generation_id, self._connect_stop_event, copy.deepcopy(args)),
-            name=f"piper-web-connect-g{generation_id}",
+            name=f"{self._profile.robot_name}-web-connect-g{generation_id}",
             daemon=False,
         )
         self._connect_thread.start()
@@ -953,16 +1161,16 @@ class PiperWebRuntime:
         self,
         generation_id: int,
         stop_event: threading.Event,
-        args: infer_piper.Args,
+        args: Any,
     ) -> None:
-        self.log("Connecting Piper arms")
+        self.log(f"Connecting {self._profile.robot_name} robot")
 
         client: PolicyClient | None = None
         robot: Robot | None = None
         cameras: dict[str, infer_piper.Camera] = {}
         controller: RuntimeController | None = None
         try:
-            robot = self._robot_factory("piper", args)
+            robot = self._robot_factory(self._profile.robot_name, args)
             if stop_event.is_set():
                 raise PolicyStartupCancelled("Deployment connection was cancelled")
             if not args.infer_only:
@@ -986,13 +1194,13 @@ class PiperWebRuntime:
                 self._loop_config(args),
                 hooks=self._loop_hooks,
                 on_step=self._loop_hooks.on_step,
-                thread_name="piper-web-run",
+                thread_name=f"{self._profile.robot_name}-web-run",
                 print_infer_only_chunks=False,
                 event_sink=CompositeRuntimeEventSink(InMemoryRuntimeEventSink(), self._evaluation_service),
             )
         except BaseException as exc:
             if cameras:
-                infer_piper.close_cameras(cameras)
+                close_profile_cameras(cameras)
             if controller is not None:
                 controller.close()
             else:
@@ -1015,6 +1223,7 @@ class PiperWebRuntime:
                     self._policy_state = "ERROR"
                     self._phase = "error"
                     self._last_error = f"{type(exc).__name__}: {exc}"
+                self._release_resources_locked()
             self.log(f"Connect failed: {type(exc).__name__}: {exc}")
             return
 
@@ -1043,13 +1252,14 @@ class PiperWebRuntime:
                     self._start_policy_worker_locked(controller, args)
         if should_close:
             if cameras:
-                infer_piper.close_cameras(cameras)
+                close_profile_cameras(cameras)
             controller.close()
             return
-        self.log("Connected Piper runtime")
+        self.log(f"Connected {self._profile.robot_name} runtime")
 
-    def _connect_camera_preview(self, args: infer_piper.Args) -> None:
+    def _connect_camera_preview(self, args: Any) -> None:
         with self._lock:
+            self._acquire_resources_locked(RuntimeMode.CAMERA_PREVIEW, args)
             self._phase = "connecting_cameras"
             self._last_error = None
             self._policy_state = "DISCONNECTED"
@@ -1058,10 +1268,11 @@ class PiperWebRuntime:
             cameras = self._camera_factory(args)
         except Exception as exc:
             if cameras:
-                infer_piper.close_cameras(cameras)
+                close_profile_cameras(cameras)
             with self._lock:
                 self._phase = "error"
                 self._last_error = f"{type(exc).__name__}: {exc}"
+                self._release_resources_locked()
             raise ApiError(str(exc), HTTPStatus.BAD_GATEWAY) from exc
         with self._lock:
             self._cameras = cameras
@@ -1072,6 +1283,7 @@ class PiperWebRuntime:
         self.log("Started camera-only preview")
 
     def _connect_offline_replay_locked(self) -> None:
+        self._acquire_resources_locked(RuntimeMode.OFFLINE_REPLAY, self._args)
         self._connected = True
         self._policy_connected = False
         self._policy_state = "DISCONNECTED"
@@ -1079,7 +1291,7 @@ class PiperWebRuntime:
         self._last_error = None
         self.log("Offline replay mode is ready; playback is scheduled for stage 7")
 
-    def _start_policy_worker_locked(self, controller: RuntimeController, args: infer_piper.Args) -> None:
+    def _start_policy_worker_locked(self, controller: RuntimeController, args: Any) -> None:
         self._startup_generation_id += 1
         generation_id = self._startup_generation_id
         stop_event = threading.Event()
@@ -1087,7 +1299,7 @@ class PiperWebRuntime:
         self._startup_thread = threading.Thread(
             target=self._run_policy_startup,
             args=(generation_id, stop_event, controller, copy.deepcopy(args)),
-            name=f"piper-web-policy-startup-g{generation_id}",
+            name=f"{self._profile.robot_name}-web-policy-startup-g{generation_id}",
             daemon=False,
         )
         self._startup_thread.start()
@@ -1097,7 +1309,7 @@ class PiperWebRuntime:
         generation_id: int,
         stop_event: threading.Event,
         controller: RuntimeController,
-        args: infer_piper.Args,
+        args: Any,
     ) -> None:
         try:
             controller.configure_robot(args)
@@ -1111,7 +1323,7 @@ class PiperWebRuntime:
                 RuntimeEventIdentity(
                     runtime_id=controller.runtime_id,
                     generation_id=controller.status().generation_id + 1,
-                    session_id=f"piper-web-connect-{generation_id}",
+                    session_id=f"{self._profile.robot_name}-web-connect-{generation_id}",
                 ),
             )
             coordinator = PolicyStartupCoordinator(
@@ -1173,7 +1385,7 @@ class PiperWebRuntime:
             self._policy_state = phase
             self._phase = phase.lower()
 
-    def _ensure_camera_thread_locked(self, args: infer_piper.Args, camera_stream_fps: float) -> None:
+    def _ensure_camera_thread_locked(self, args: Any, camera_stream_fps: float) -> None:
         if self._camera_thread is not None and self._camera_thread.is_alive():
             return
         self._camera_stop_event.clear()
@@ -1181,7 +1393,7 @@ class PiperWebRuntime:
             target=self._camera_loop,
             args=(copy.deepcopy(args), camera_stream_fps),
             daemon=False,
-            name="piper-web-camera",
+            name=f"{self._profile.robot_name}-web-camera",
         )
         self._camera_thread.start()
 
@@ -1272,9 +1484,11 @@ class PiperWebRuntime:
             self._reset_placeholder_frames_locked(self._args.resize_size)
 
         if cameras:
-            infer_piper.close_cameras(cameras)
+            close_profile_cameras(cameras)
         if controller is not None:
             controller.close()
+        with self._lock:
+            self._release_resources_locked()
         self.log("Disconnected runtime")
         return self.status()
 
@@ -1300,19 +1514,15 @@ class PiperWebRuntime:
         if controller is None:
             raise ApiError("Arms are not connected", HTTPStatus.CONFLICT)
 
-        args.reset_on_start = True
-        args.init_left_joints = RESET_LEFT_JOINTS
-        args.init_right_joints = RESET_RIGHT_JOINTS
-        args.init_left_gripper = RESET_LEFT_GRIPPER
-        args.init_right_gripper = RESET_RIGHT_GRIPPER
-        robot = controller.robot
-        if isinstance(robot, infer_piper.PiperRobot):
-            robot.args = args
+        if not self._profile.capabilities.supports_reset:
+            raise ApiError(f"{self._profile.robot_name} does not support reset", HTTPStatus.CONFLICT)
+        args = self._profile.configure_reset(args)
+        controller.configure_robot(args)
         try:
             controller.reset_robot()
         except ControllerAlreadyRunningError as exc:
             raise ApiError(str(exc), HTTPStatus.CONFLICT) from exc
-        self.log("Reset arms to zero joints and open grippers")
+        self.log(f"Reset {self._profile.robot_name} through the robot boundary")
         return self.status()
 
     def ping_policy(self) -> dict[str, Any]:
@@ -1320,7 +1530,7 @@ class PiperWebRuntime:
             self._refresh_controller_state_locked()
             if self._runtime_mode is not RuntimeMode.DEPLOYMENT:
                 return {
-                    "robot": "piper",
+                    "robot": self._profile.robot_name,
                     "ok": False,
                     "connected": False,
                     "error": "Policy is unavailable outside deployment mode",
@@ -1339,7 +1549,7 @@ class PiperWebRuntime:
             client = self._create_policy_client(args)
             latency_ms = (time.monotonic() - started) * 1000.0
             return {
-                "robot": "piper",
+                "robot": self._profile.robot_name,
                 "ok": True,
                 "connected": True,
                 "latency_ms": round(latency_ms, 2),
@@ -1351,7 +1561,7 @@ class PiperWebRuntime:
             if client is not None:
                 client.close()
 
-    def _camera_loop(self, args: infer_piper.Args, camera_stream_fps: float) -> None:
+    def _camera_loop(self, args: Any, camera_stream_fps: float) -> None:
         period = 1.0 / camera_stream_fps
         while not self._camera_stop_event.is_set():
             loop_t0 = time.monotonic()
@@ -1390,17 +1600,24 @@ class PiperWebRuntime:
             if sleep_s > 0:
                 self._camera_stop_event.wait(sleep_s)
 
-    def _latest_images_for_inference(self, args: infer_piper.Args) -> dict[str, np.ndarray]:
+    def _latest_images_for_inference(self, args: Any) -> tuple[dict[str, np.ndarray], dict[str, Any] | None]:
         deadline = time.monotonic() + args.camera_timeout
+        roles = self._profile.camera_roles_for_args(args)
         with self._frame_condition:
             while True:
                 missing = [
                     name
-                    for name in CAMERA_NAMES
+                    for name in roles
                     if self._frames.get(name) is None or self._frames[name].image is None or self._frames[name].error
                 ]
                 if not missing:
-                    return {name: np.asarray(self._frames[name].image).copy() for name in CAMERA_NAMES}
+                    images = {name: np.asarray(self._frames[name].image).copy() for name in roles}
+                    camera_params = (
+                        {name: camera.camera_info() for name, camera in self._cameras.items()}
+                        if self._profile.include_camera_params
+                        else None
+                    )
+                    return images, camera_params
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     errors = {
@@ -1412,7 +1629,7 @@ class PiperWebRuntime:
                 self._frame_condition.wait(min(0.05, remaining))
 
     def wait_frame(self, camera_name: str, last_sequence: int, *, timeout: float = 5.0) -> FrameSnapshot:
-        if camera_name not in CAMERA_NAMES:
+        if camera_name not in self._profile.camera_roles_for_args(self._args):
             raise ApiError(f"Unknown camera {camera_name}", HTTPStatus.NOT_FOUND)
         deadline = time.monotonic() + timeout
         with self._frame_condition:
@@ -1456,7 +1673,10 @@ class PiperWebRuntime:
                 and (not self._running or not self._policy_connected)
             )
             return {
-                "robot": "piper",
+                "robot": self._profile.robot_name,
+                "camera_roles": list(self._profile.camera_roles_for_args(self._args)),
+                "action_spec": dataclasses.asdict(self._profile.action_spec_for_args(self._args)),
+                "capabilities": dataclasses.asdict(self._profile.capabilities),
                 "runtime_mode": self._runtime_mode.value,
                 "phase": self._phase,
                 "policy_state": self._policy_state,
@@ -1534,7 +1754,16 @@ class PiperWebRuntime:
                 "frames": frames,
                 "evaluation": evaluation,
                 "logs": list(self._logs),
+                "resource_leases": self._resource_manager.snapshot(),
             }
+
+
+class PiperWebRuntime(RobotWebRuntime):
+    """Backward-compatible Piper constructor for the profile-based runtime."""
+
+    def __init__(self, initial_args: infer_piper.Args | None = None, **kwargs: Any) -> None:
+        kwargs.setdefault("profile", PIPER_WEB_PROFILE)
+        super().__init__(initial_args, **kwargs)
 
 
 _RM_STREAM_TO_POLICY = {
@@ -1544,7 +1773,7 @@ _RM_STREAM_TO_POLICY = {
 }
 
 
-class Rm2WebRuntime:
+class _LegacyRm2WebRuntime:
     """RM2 implementation of the same Web lifecycle exposed by PiperWebRuntime."""
 
     def __init__(
@@ -2000,6 +2229,14 @@ class Rm2WebRuntime:
             }
 
 
+class Rm2WebRuntime(RobotWebRuntime):
+    """Backward-compatible RM2 constructor using the shared Web lifecycle."""
+
+    def __init__(self, initial_args: infer_rm2.Args | None = None, **kwargs: Any) -> None:
+        kwargs.setdefault("profile", RM2_WEB_PROFILE)
+        super().__init__(initial_args, **kwargs)
+
+
 class PiperWebHandler(BaseHTTPRequestHandler):
     server: PiperWebServer
 
@@ -2138,7 +2375,7 @@ class PiperWebHandler(BaseHTTPRequestHandler):
         self._send_bytes(resolved.read_bytes(), content_type)
 
     def _stream_camera(self, camera_name: str) -> None:
-        if camera_name not in CAMERA_NAMES:
+        if camera_name not in self.server.runtime.get_config().get("camera_roles", []):
             raise ApiError(f"Unknown camera {camera_name}", HTTPStatus.NOT_FOUND)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
@@ -2185,12 +2422,13 @@ class PiperWebServer(ThreadingHTTPServer):
             raise ApiError("robot must be piper or rm2")
         if self.runtime.status()["connected"] or self.runtime.status()["running"]:
             raise ApiError("Disconnect before changing robot", HTTPStatus.CONFLICT)
-        self.runtime = Rm2WebRuntime() if name == "rm2" else PiperWebRuntime()
+        profile = get_web_profile(name)
+        self.runtime = RobotWebRuntime(profile=profile, resource_manager=self.runtime.resource_manager)
         return self.runtime.get_config()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Piper web control panel")
+    parser = argparse.ArgumentParser(description="Robot web control panel")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--log-level", default="INFO")
@@ -2220,31 +2458,37 @@ def main() -> None:
     if cli_args.policy_timeout <= 0:
         parser.error("--policy-timeout must be positive")
 
-    runtime_args = _default_args(camera_profile=cli_args.camera_profile)
-    for field in ("server_url", "api_key", "prompt", "left_can", "right_can", "enable_on_start", "reset_on_start"):
+    profile = get_web_profile(cli_args.robot)
+    runtime_args = (
+        _default_args(camera_profile=cli_args.camera_profile)
+        if cli_args.robot == "piper"
+        else clone_default_args(profile)
+    )
+    for field in ("server_url", "api_key", "prompt", "enable_on_start", "reset_on_start"):
         value = getattr(cli_args, field)
-        if value is not None:
+        if value is not None and hasattr(runtime_args, field):
             setattr(runtime_args, field, value)
-    for name in CAMERA_NAMES:
-        backend = getattr(cli_args, f"{name}_backend") or getattr(runtime_args, f"{name}_backend")
-        setattr(runtime_args, f"{name}_backend", backend)
-        selector = getattr(cli_args, name)
-        if selector is not None:
-            setattr(runtime_args, name, selector)
+    if cli_args.robot == "piper":
+        for field in ("left_can", "right_can"):
+            value = getattr(cli_args, field)
+            if value is not None:
+                setattr(runtime_args, field, value)
+        for name in CAMERA_NAMES:
+            backend = getattr(cli_args, f"{name}_backend") or getattr(runtime_args, f"{name}_backend")
+            setattr(runtime_args, f"{name}_backend", backend)
+            selector = getattr(cli_args, name)
+            if selector is not None:
+                setattr(runtime_args, name, selector)
     runtime_args.dry_run = cli_args.dry_run
 
     logging.basicConfig(
         level=getattr(logging, cli_args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    runtime: Any = (
-        PiperWebRuntime(runtime_args, policy_timeout=cli_args.policy_timeout)
-        if cli_args.robot == "piper"
-        else Rm2WebRuntime(policy_timeout=cli_args.policy_timeout)
-    )
+    runtime: Any = RobotWebRuntime(runtime_args, profile=profile, policy_timeout=cli_args.policy_timeout)
     access_key = cli_args.access_key or os.environ.get("MOTRIX_WEB_ACCESS_KEY")
     server = PiperWebServer((cli_args.host, cli_args.port), PiperWebHandler, runtime, access_key=access_key)
-    logging.info("Piper web UI: http://%s:%s", cli_args.host, cli_args.port)
+    logging.info("Robot web UI (%s): http://%s:%s", profile.robot_name, cli_args.host, cli_args.port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

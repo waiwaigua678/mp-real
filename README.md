@@ -92,13 +92,16 @@ uv run mp-piper-infer \
 
 This still reads the connected robot state. `--infer-only` also reads joint feedback, so it is not an offline simulator mode.
 
-## Piper Web
+## Robot Web
 
 The normal web process retains the existing hardware-camera defaults:
 
 ```bash
 uv run mp-piper-web --host 0.0.0.0 --port 8765
 ```
+
+`mp-real-web` is the robot-neutral alias for the same entry point; existing
+`mp-piper-web` deployment scripts remain supported.
 
 The Web server supports Piper and RM2. Select the robot before connecting, or set the initial runtime from the command line. To protect control requests, set a key with `--access-key` or `MOTRIX_WEB_ACCESS_KEY`; the browser stores the entered key only for its current session and sends it as `X-Motrix-Key`.
 
@@ -135,6 +138,21 @@ changing it requires a disconnect.
 - `OFFLINE_REPLAY` intentionally creates no robot, camera or policy resource.
   It shows the stage-7 replay placeholder until recorded-session playback is
   implemented.
+
+## Camera-only preview
+
+Use the standalone command to open configured cameras without creating a
+Robot, connecting CAN, or creating a policy client:
+
+```bash
+uv run mp-camera-preview --robot piper --no-web --camera-backend cam_head=black
+uv run mp-camera-preview --robot rm2 --no-web --camera-backend left_color=black
+```
+
+Use repeated `--camera-backend ROLE=BACKEND` and
+`--camera-selector ROLE=SELECTOR` options for real cameras. Omit `--no-web`
+to serve the same camera-only Web preview lifecycle; `--duration` and
+`--save-preview DIR` are optional.
 
 ### Policy warmup and first action
 

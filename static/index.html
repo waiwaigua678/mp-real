@@ -3,13 +3,13 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Piper Control</title>
+    <title>Robot Control</title>
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
     <header class="topbar">
       <div>
-        <h1>Piper Control</h1>
+        <h1>Robot Control</h1>
         <div class="subline" id="serverLine">ws://127.0.0.1:8000</div>
       </div>
       <nav class="tabs">
@@ -46,29 +46,16 @@
           </div>
         </section>
 
-        <section class="camera-grid">
+        <section class="camera-grid" id="cameraGrid"></section>
+        <template id="cameraPanelTemplate">
           <article class="camera-panel">
             <div class="panel-title">
-              <h2>cam_head</h2>
-              <span id="meta-cam_head">sequence 0</span>
+              <h2></h2>
+              <span>sequence 0</span>
             </div>
-            <div class="video-box"><img id="stream-cam_head" alt="cam_head" /></div>
+            <div class="video-box"><img /></div>
           </article>
-          <article class="camera-panel">
-            <div class="panel-title">
-              <h2>cam_left_wrist</h2>
-              <span id="meta-cam_left_wrist">sequence 0</span>
-            </div>
-            <div class="video-box"><img id="stream-cam_left_wrist" alt="cam_left_wrist" /></div>
-          </article>
-          <article class="camera-panel">
-            <div class="panel-title">
-              <h2>cam_right_wrist</h2>
-              <span id="meta-cam_right_wrist">sequence 0</span>
-            </div>
-            <div class="video-box"><img id="stream-cam_right_wrist" alt="cam_right_wrist" /></div>
-          </article>
-        </section>
+        </template>
 
         <section class="lower-grid">
           <section class="panel metrics">
@@ -180,11 +167,11 @@
               <span>API Key</span>
               <input name="api_key" type="password" autocomplete="off" data-connection-field="true" />
             </label>
-            <label data-deployment-only="true">
+            <label data-deployment-only="true" data-piper-only="true">
               <span>左臂 CAN</span>
               <input name="left_can" type="text" data-connection-field="true" />
             </label>
-            <label data-deployment-only="true">
+            <label data-deployment-only="true" data-piper-only="true">
               <span>右臂 CAN</span>
               <input name="right_can" type="text" data-connection-field="true" />
             </label>
@@ -250,8 +237,8 @@
             </label>
           </section>
 
-          <section class="form-section">
-            <h3>相机</h3>
+          <section class="form-section" data-piper-only="true">
+            <h3>Piper 相机</h3>
             <label>
               <span>Head Backend</span>
               <select name="cam_head_backend" data-connection-field="true">
@@ -290,7 +277,7 @@
             </label>
           </section>
 
-          <section class="form-section" data-deployment-only="true">
+          <section class="form-section" data-deployment-only="true" data-rm2-only="true">
             <h3>RM2</h3>
             <label><span>Camera Backend</span><select name="camera_backend"><option value="ros">ros</option><option value="realsense">realsense</option><option value="black">black</option></select></label>
             <label><span>RM Config</span><input name="rm_config" type="text" /></label>
@@ -305,7 +292,7 @@
             <label><span>Head Topic</span><input name="cam_head_topic" type="text" /></label>
           </section>
 
-          <section class="form-section" data-deployment-only="true">
+          <section class="form-section" data-deployment-only="true" data-piper-only="true">
             <h3>RTC / 插值</h3>
             <label>
               <span>RTC Stride</span>
@@ -344,7 +331,7 @@
             </div>
           </section>
 
-          <section class="form-section" data-deployment-only="true">
+          <section class="form-section" data-deployment-only="true" data-piper-only="true">
             <h3>夹爪 / Reset</h3>
             <label>
               <span>闭合角</span>

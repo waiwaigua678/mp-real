@@ -55,6 +55,8 @@ dev = [
 mp-piper-infer = "mp_real.robots.piper.infer:cli"
 mp-rm2-infer = "mp_real.robots.rm2.infer:cli"
 mp-piper-web = "mp_real.web.server:main"
+mp-real-web = "mp_real.web.server:main"
+mp-camera-preview = "mp_real.web.camera_preview:main"
 
 [build-system]
 requires = ["hatchling>=1.25"]
