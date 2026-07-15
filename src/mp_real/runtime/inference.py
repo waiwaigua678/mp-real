@@ -18,7 +18,7 @@ from mp_real.common.runtime import (
     sleep_remaining,
 )
 from mp_real.runtime.config import InferenceLoopConfig
-from mp_real.runtime.models import ObservationSnapshot
+from mp_real.runtime.models import ActionProvenance, ObservationSnapshot
 
 
 class PolicyClient(Protocol):
@@ -59,6 +59,13 @@ class FetchedActionChunk:
     response: dict[str, Any]
     chunk: np.ndarray
     inference_elapsed_s: float
+    provenance: ActionProvenance
+
+
+@dataclasses.dataclass(frozen=True)
+class ScheduledAction:
+    action: np.ndarray
+    provenance: ActionProvenance
 
 
 class InferenceHooks:
@@ -97,11 +104,23 @@ class InferenceHooks:
     def on_action_selected(self, step: int, action: np.ndarray) -> None:
         del step, action
 
+    def on_action_selected_context(self, step: int, action: np.ndarray, provenance: ActionProvenance | None) -> None:
+        del provenance
+        self.on_action_selected(step, action)
+
     def on_action_stabilized(self, step: int, action: np.ndarray) -> None:
         del step, action
 
+    def on_action_stabilized_context(self, step: int, action: np.ndarray, provenance: ActionProvenance | None) -> None:
+        del provenance
+        self.on_action_stabilized(step, action)
+
     def on_action_executed(self, step: int, action: np.ndarray) -> None:
         del step, action
+
+    def on_action_executed_context(self, step: int, action: np.ndarray, provenance: ActionProvenance | None) -> None:
+        del provenance
+        self.on_action_executed(step, action)
 
     def on_safety_rejected(self, step: int | None, action: np.ndarray | None, error: BaseException) -> None:
         del step, action, error
@@ -159,13 +178,25 @@ class CompositeInferenceHooks(InferenceHooks):
         for delegate in self._delegates:
             delegate.on_action_selected(step, action)
 
+    def on_action_selected_context(self, step: int, action: np.ndarray, provenance: ActionProvenance | None) -> None:
+        for delegate in self._delegates:
+            delegate.on_action_selected_context(step, action, provenance)
+
     def on_action_stabilized(self, step: int, action: np.ndarray) -> None:
         for delegate in self._delegates:
             delegate.on_action_stabilized(step, action)
 
+    def on_action_stabilized_context(self, step: int, action: np.ndarray, provenance: ActionProvenance | None) -> None:
+        for delegate in self._delegates:
+            delegate.on_action_stabilized_context(step, action, provenance)
+
     def on_action_executed(self, step: int, action: np.ndarray) -> None:
         for delegate in self._delegates:
             delegate.on_action_executed(step, action)
+
+    def on_action_executed_context(self, step: int, action: np.ndarray, provenance: ActionProvenance | None) -> None:
+        for delegate in self._delegates:
+            delegate.on_action_executed_context(step, action, provenance)
 
     def on_safety_rejected(self, step: int | None, action: np.ndarray | None, error: BaseException) -> None:
         for delegate in self._delegates:
@@ -217,6 +248,9 @@ def fetch_action_chunk(
         snapshot = snapshot()
     if isinstance(snapshot, ObservationSnapshot):
         hooks.on_observation_captured(snapshot)
+        provenance = ActionProvenance(observation_id=snapshot.observation_id)
+    else:
+        provenance = ActionProvenance()
     hooks.on_observation(observation)
     hooks.on_inference_started_context(observation, event_stage)
     infer_started_ns = time.monotonic_ns()
@@ -238,6 +272,7 @@ def fetch_action_chunk(
         response=response,
         chunk=chunk,
         inference_elapsed_s=infer_elapsed_s,
+        provenance=provenance,
     )
 
 
@@ -316,21 +351,23 @@ def run_sync_loop(
     on_step: Callable[[int, int], None] | None = None,
     hooks: InferenceHooks | None = None,
     initial_chunk: np.ndarray | None = None,
+    initial_provenance: ActionProvenance | None = None,
 ) -> None:
     hooks = _active_hooks(hooks)
-    plan: collections.deque[np.ndarray] = collections.deque()
+    plan: collections.deque[ScheduledAction] = collections.deque()
     if initial_chunk is not None:
         prepared_chunk = np.asarray(initial_chunk, dtype=np.float32)
         if prepared_chunk.ndim != 2 or len(prepared_chunk) == 0:
             raise ValueError(f"initial_chunk must be a non-empty [T, action_dim] array, got {prepared_chunk.shape}")
-        plan.extend(prepared_chunk)
+        provenance = initial_provenance or ActionProvenance()
+        plan.extend(ScheduledAction(action.copy(), provenance) for action in prepared_chunk)
     dt = 1.0 / config.fps
     step = 0
     mode = "sync"
     try:
         hooks.on_loop_started(mode, config)
         if plan:
-            hooks.on_chunk_received_context(np.asarray(plan, dtype=np.float32), "prefetched")
+            hooks.on_chunk_received_context(np.asarray([item.action for item in plan], dtype=np.float32), "prefetched")
         previous: np.ndarray | None = adapter.initial_action()
         logging.info("Starting %s synchronous inference loop", adapter.name)
         while (stop_event is None or not stop_event.is_set()) and (
@@ -338,21 +375,28 @@ def run_sync_loop(
         ):
             loop_started = time.monotonic()
             if not plan:
-                _, chunk = _fetch_chunk(client, adapter, config, hooks)
-                plan.extend(chunk)
+                fetched = fetch_action_chunk(client, adapter, config, hooks)
+                plan.extend(
+                    ScheduledAction(
+                        action.copy(), dataclasses.replace(fetched.provenance, chunk_cursor=cursor)
+                    )
+                    for cursor, action in enumerate(fetched.chunk)
+                )
             # A stop request may arrive while a synchronous policy request is
             # blocking.  Never turn the response that arrives afterwards into
             # one more robot command.
             if stop_event is not None and stop_event.is_set():
                 break
-            selected = plan.popleft()
-            hooks.on_action_selected(step, selected.copy())
+            scheduled = plan.popleft()
+            selected = scheduled.action
+            cycle_started_ns = time.monotonic_ns()
+            hooks.on_action_selected_context(step, selected.copy(), scheduled.provenance)
             try:
                 action = adapter.stabilize_action(selected, previous)
             except BaseException as exc:
                 hooks.on_safety_rejected(step, selected.copy(), exc)
                 raise
-            hooks.on_action_stabilized(step, action.copy())
+            hooks.on_action_stabilized_context(step, action.copy(), scheduled.provenance)
             execute_started_ns = time.monotonic_ns()
             try:
                 previous = adapter.execute_transition(previous, action)
@@ -360,7 +404,11 @@ def run_sync_loop(
                 hooks.on_safety_rejected(step, action.copy(), exc)
                 raise
             adapter.profile("execution", (time.monotonic_ns() - execute_started_ns) / 1e9)
-            hooks.on_action_executed(step, previous.copy())
+            hooks.on_action_executed_context(
+                step,
+                previous.copy(),
+                dataclasses.replace(scheduled.provenance, control_cycle_ns=time.monotonic_ns() - cycle_started_ns),
+            )
             step += 1
             if on_step is not None:
                 on_step(step, len(plan))
@@ -391,21 +439,45 @@ def _rtc_producer(
         generation = buffer.get_generation()
         try:
             started = time.monotonic()
-            _, chunk = _fetch_chunk(client, adapter, config, hooks)
-            accepted = buffer.enqueue(chunk, cursor, generation)
+            fetched = fetch_action_chunk(client, adapter, config, hooks)
+            accepted = buffer.enqueue(fetched.chunk, cursor, generation, fetched.provenance)
             if config.log_timing:
                 logging.info(
                     "RTC producer robot=%s cursor=%d accepted=%s chunk=%s elapsed=%.3fs",
                     adapter.name,
                     cursor,
                     accepted,
-                    chunk.shape,
+                    fetched.chunk.shape,
                     time.monotonic() - started,
                 )
         except Exception as exc:
             errors.put(exc)
             stop_event.set()
             return
+
+
+def _fuse_provenance(
+    sources: tuple[tuple[int, object | None], ...], current_step: int
+) -> ActionProvenance | None:
+    provenance_sources = [source for _, source in sources if isinstance(source, ActionProvenance)]
+    if not provenance_sources:
+        return None
+    primary_cursor, primary = next(
+        (cursor, source) for cursor, source in reversed(sources) if isinstance(source, ActionProvenance)
+    )
+    assert isinstance(primary, ActionProvenance)
+    ids = tuple(
+        dict.fromkeys(
+            observation_id
+            for source in provenance_sources
+            for observation_id in (
+                (source.observation_id,)
+                if source.observation_id is not None
+                else source.source_observation_ids
+            )
+        )
+    )
+    return dataclasses.replace(primary, chunk_cursor=current_step - primary_cursor, source_observation_ids=ids)
 
 
 def run_rtc_loop(
@@ -418,6 +490,7 @@ def run_rtc_loop(
     hooks: InferenceHooks | None = None,
     producer_daemon: bool = True,
     initial_chunk: np.ndarray | None = None,
+    initial_provenance: ActionProvenance | None = None,
 ) -> None:
     hooks = _active_hooks(hooks)
     buffer = RealTimeChunkingBuffer(exp_weight=config.rtc_exp_weight)
@@ -428,7 +501,7 @@ def run_rtc_loop(
         prepared_chunk = np.asarray(initial_chunk, dtype=np.float32)
         if prepared_chunk.ndim != 2 or len(prepared_chunk) == 0:
             raise ValueError(f"initial_chunk must be a non-empty [T, action_dim] array, got {prepared_chunk.shape}")
-        buffer.enqueue(prepared_chunk, 0, buffer.get_generation())
+        buffer.enqueue(prepared_chunk, 0, buffer.get_generation(), initial_provenance or ActionProvenance())
     producer = threading.Thread(
         target=_rtc_producer,
         name=f"{adapter.name}-rtc-action-producer",
@@ -447,12 +520,14 @@ def run_rtc_loop(
         producer.start()
         producer_started = True
         previous: np.ndarray | None = adapter.initial_action()
+        previous_provenance: ActionProvenance | None = None
         logging.info("Starting %s RTC inference loop", adapter.name)
         while not stop_event.is_set() and (config.max_steps is None or step < config.max_steps):
             loop_started = time.monotonic()
             raise_rtc_producer_error(errors)
             buffer.set_control_time(step)
-            action = buffer.get_action(step)
+            action_with_provenance = buffer.get_action_with_provenance(step)
+            action = action_with_provenance[0] if action_with_provenance is not None else None
             # Match the synchronous-loop guarantee when a stop races with
             # action selection or a producer result.
             if stop_event.is_set():
@@ -464,20 +539,26 @@ def run_rtc_loop(
                     except BaseException as exc:
                         hooks.on_safety_rejected(step, previous.copy(), exc)
                         raise
-                    hooks.on_action_executed(step, previous.copy())
+                    hooks.on_action_executed_context(step, previous.copy(), previous_provenance)
                 now = time.monotonic()
                 if now - last_wait_log > 1.0:
                     logging.warning("Waiting for RTC action at control step %d", step)
                     last_wait_log = now
                 sleep_remaining(loop_started, dt)
                 continue
-            hooks.on_action_selected(step, action.copy())
+            provenance = (
+                _fuse_provenance(action_with_provenance[1], step)
+                if action_with_provenance is not None
+                else None
+            )
+            cycle_started_ns = time.monotonic_ns()
+            hooks.on_action_selected_context(step, action.copy(), provenance)
             try:
                 action = adapter.stabilize_action(action, previous)
             except BaseException as exc:
                 hooks.on_safety_rejected(step, action.copy(), exc)
                 raise
-            hooks.on_action_stabilized(step, action.copy())
+            hooks.on_action_stabilized_context(step, action.copy(), provenance)
             execute_started_ns = time.monotonic_ns()
             try:
                 previous = adapter.execute_transition(previous, action)
@@ -485,7 +566,10 @@ def run_rtc_loop(
                 hooks.on_safety_rejected(step, action.copy(), exc)
                 raise
             adapter.profile("execution", (time.monotonic_ns() - execute_started_ns) / 1e9)
-            hooks.on_action_executed(step, previous.copy())
+            previous_provenance = dataclasses.replace(
+                provenance or ActionProvenance(), control_cycle_ns=time.monotonic_ns() - cycle_started_ns
+            )
+            hooks.on_action_executed_context(step, previous.copy(), previous_provenance)
             step += 1
             if on_step is not None:
                 on_step(step, 0)
@@ -523,6 +607,7 @@ def run_policy_loop(
     print_infer_only_chunks: bool = True,
     rtc_producer_daemon: bool = True,
     initial_chunk: np.ndarray | None = None,
+    initial_provenance: ActionProvenance | None = None,
 ) -> None:
     config.validate()
     if config.infer_only:
@@ -545,6 +630,7 @@ def run_policy_loop(
             hooks=hooks,
             producer_daemon=rtc_producer_daemon,
             initial_chunk=initial_chunk,
+            initial_provenance=initial_provenance,
         )
     else:
         run_sync_loop(
@@ -555,4 +641,5 @@ def run_policy_loop(
             on_step=on_step,
             hooks=hooks,
             initial_chunk=initial_chunk,
+            initial_provenance=initial_provenance,
         )

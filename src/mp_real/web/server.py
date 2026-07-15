@@ -1353,6 +1353,7 @@ class RobotWebRuntime:
                     hooks=self._loop_hooks,
                     on_step=self._loop_hooks.on_step,
                     initial_chunk=prepared.initial_chunk,
+                    initial_provenance=prepared.initial_provenance,
                 )
                 self._running = True
                 self._phase = "running"
@@ -1600,7 +1601,9 @@ class RobotWebRuntime:
             if sleep_s > 0:
                 self._camera_stop_event.wait(sleep_s)
 
-    def _latest_images_for_inference(self, args: Any) -> tuple[dict[str, np.ndarray], dict[str, Any] | None]:
+    def _latest_images_for_inference(
+        self, args: Any
+    ) -> tuple[dict[str, np.ndarray], dict[str, Any] | None, dict[str, FrameSnapshot]]:
         deadline = time.monotonic() + args.camera_timeout
         roles = self._profile.camera_roles_for_args(args)
         with self._frame_condition:
@@ -1617,7 +1620,7 @@ class RobotWebRuntime:
                         if self._profile.include_camera_params
                         else None
                     )
-                    return images, camera_params
+                    return images, camera_params, {name: self._frames[name] for name in roles}
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     errors = {
@@ -2179,7 +2182,7 @@ class _LegacyRm2WebRuntime:
                         self._frames[stream_name] = dataclasses.replace(self._frames[stream_name], error=str(exc))
             self._camera_stop_event.wait(1.0 / self._camera_stream_fps)
 
-    def _latest_policy_images(self) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    def _latest_policy_images(self) -> tuple[dict[str, np.ndarray], dict[str, Any], dict[str, FrameSnapshot]]:
         deadline = time.monotonic() + self._args.camera_timeout
         with self._frame_condition:
             while any(self._frames[name].image is None or self._frames[name].error for name in CAMERA_NAMES):
@@ -2188,7 +2191,8 @@ class _LegacyRm2WebRuntime:
                     raise RuntimeError("RM2 camera frames are unavailable")
                 self._frame_condition.wait(min(0.05, remaining))
             images = {policy: self._frames[stream].image.copy() for stream, policy in _RM_STREAM_TO_POLICY.items()}
-        return images, {name: camera.camera_info() for name, camera in self._cameras.items()}
+            frame_metadata = {policy: self._frames[stream] for stream, policy in _RM_STREAM_TO_POLICY.items()}
+        return images, {name: camera.camera_info() for name, camera in self._cameras.items()}, frame_metadata
 
     def wait_frame(self, camera_name: str, last_sequence: int, *, timeout: float = 5.0) -> FrameSnapshot:
         deadline = time.monotonic() + timeout

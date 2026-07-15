@@ -25,7 +25,7 @@ from mp_real.runtime.inference import (
     PolicyClient,
     run_policy_loop,
 )
-from mp_real.runtime.models import ObservationSnapshot
+from mp_real.runtime.models import ActionProvenance, ObservationSnapshot
 
 
 class ControllerAlreadyRunningError(RuntimeError):
@@ -98,13 +98,25 @@ class _GenerationHooks(InferenceHooks):
         if self._is_current():
             self._delegate.on_action_selected(step, action)
 
+    def on_action_selected_context(self, step: int, action: np.ndarray, provenance: ActionProvenance | None) -> None:
+        if self._is_current():
+            self._delegate.on_action_selected_context(step, action, provenance)
+
     def on_action_stabilized(self, step: int, action: np.ndarray) -> None:
         if self._is_current():
             self._delegate.on_action_stabilized(step, action)
 
+    def on_action_stabilized_context(self, step: int, action: np.ndarray, provenance: ActionProvenance | None) -> None:
+        if self._is_current():
+            self._delegate.on_action_stabilized_context(step, action, provenance)
+
     def on_action_executed(self, step: int, action: np.ndarray) -> None:
         if self._is_current():
             self._delegate.on_action_executed(step, action)
+
+    def on_action_executed_context(self, step: int, action: np.ndarray, provenance: ActionProvenance | None) -> None:
+        if self._is_current():
+            self._delegate.on_action_executed_context(step, action, provenance)
 
     def on_safety_rejected(self, step: int | None, action: np.ndarray | None, error: BaseException) -> None:
         if self._is_current():
@@ -163,6 +175,7 @@ class RuntimeController:
         self._hooks = hooks
         self._on_step = on_step
         self._initial_chunk: np.ndarray | None = None
+        self._initial_provenance: ActionProvenance | None = None
         self._thread_name = thread_name or f"{adapter.name}-runtime-controller"
         self._print_infer_only_chunks = print_infer_only_chunks
         self._rtc_producer_daemon = rtc_producer_daemon
@@ -210,6 +223,7 @@ class RuntimeController:
         hooks: InferenceHooks | None = None,
         on_step: Callable[[int, int], None] | None = None,
         initial_chunk: np.ndarray | None = None,
+        initial_provenance: ActionProvenance | None = None,
     ) -> None:
         config.validate()
         with self._lock:
@@ -221,6 +235,7 @@ class RuntimeController:
             self._hooks = hooks
             self._on_step = on_step
             self._initial_chunk = None if initial_chunk is None else np.asarray(initial_chunk, dtype=np.float32).copy()
+            self._initial_provenance = initial_provenance
 
     def configure_event_identity(self, *, session_id: str | None, episode_id: str | None) -> None:
         """Set the identity used by the next controller generation's events.
@@ -353,6 +368,7 @@ class RuntimeController:
             hooks = self._hooks
             on_step = self._on_step
             initial_chunk = self._initial_chunk
+            initial_provenance = self._initial_provenance
         event_hooks = RuntimeEventHooks(
             self._event_dispatcher,
             RuntimeEventIdentity(
@@ -381,6 +397,7 @@ class RuntimeController:
                 print_infer_only_chunks=self._print_infer_only_chunks,
                 rtc_producer_daemon=self._rtc_producer_daemon,
                 initial_chunk=initial_chunk,
+                initial_provenance=initial_provenance,
             )
         except BaseException as exc:
             error = exc

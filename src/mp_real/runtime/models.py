@@ -19,6 +19,31 @@ def _next_observation_id() -> int:
 
 
 @dataclasses.dataclass(frozen=True)
+class VectorField:
+    """One ordered element in a robot state or action vector.
+
+    The policy/runtime continues to use dense numpy arrays.  This descriptor is
+    deliberately metadata only: it makes the order and units explicit when an
+    array crosses the recording boundary without imposing a shared robot
+    layout.
+    """
+
+    name: str
+    unit: str
+    semantics: str
+
+
+@dataclasses.dataclass(frozen=True)
+class ActionProvenance:
+    """Identity of the policy observation/chunk that produced an action."""
+
+    observation_id: int | None = None
+    chunk_cursor: int | None = None
+    source_observation_ids: tuple[int, ...] = ()
+    control_cycle_ns: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
 class ActionSpec:
     """Policy-facing action/state contract for a concrete robot."""
 
@@ -29,6 +54,26 @@ class ActionSpec:
     camera_roles: tuple[str, ...]
     supports_rtc: bool = True
     supports_interpolation: bool = True
+    state_fields: tuple[VectorField, ...] = ()
+    action_fields: tuple[VectorField, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.action_dim <= 0 or self.state_dim <= 0:
+            raise ValueError("ActionSpec dimensions must be positive")
+        if self.joint_dof_per_arm < 0:
+            raise ValueError("joint_dof_per_arm must be non-negative")
+        if self.state_fields and len(self.state_fields) != self.state_dim:
+            raise ValueError("state_fields length must match state_dim")
+        if self.action_fields and len(self.action_fields) != self.action_dim:
+            raise ValueError("action_fields length must match action_dim")
+
+    @property
+    def state_field_names(self) -> tuple[str, ...]:
+        return tuple(field.name for field in self.state_fields)
+
+    @property
+    def action_field_names(self) -> tuple[str, ...]:
+        return tuple(field.name for field in self.action_fields)
 
     def validate_chunk(self, actions: np.ndarray) -> np.ndarray:
         actions = np.asarray(actions, dtype=np.float32)

@@ -15,7 +15,7 @@ class RealTimeChunkingBuffer:
     def __init__(self, *, exp_weight: float = 0.0) -> None:
         self._exp_weight = exp_weight
         self._control_t = 0
-        self._chunks: dict[int, np.ndarray] = {}
+        self._chunks: dict[int, tuple[np.ndarray, object | None]] = {}
         self._generation = 0
         self._lock = threading.Lock()
 
@@ -41,22 +41,28 @@ class RealTimeChunkingBuffer:
         with self._lock:
             return cursor in self._chunks
 
-    def enqueue(self, chunk: np.ndarray, cursor: int, generation: int) -> bool:
+    def enqueue(self, chunk: np.ndarray, cursor: int, generation: int, provenance: object | None = None) -> bool:
         chunk = np.asarray(chunk, dtype=np.float32)
         with self._lock:
             if generation != self._generation:
                 return False
-            self._chunks[cursor] = chunk
+            self._chunks[cursor] = (chunk, provenance)
             return True
 
     def get_action(self, current_time: int) -> np.ndarray | None:
+        result = self.get_action_with_provenance(current_time)
+        return result[0] if result is not None else None
+
+    def get_action_with_provenance(
+        self, current_time: int
+    ) -> tuple[np.ndarray, tuple[tuple[int, object | None], ...]] | None:
         with self._lock:
-            relevant: list[tuple[int, np.ndarray]] = []
+            relevant: list[tuple[int, np.ndarray, object | None]] = []
             expired: list[int] = []
-            for cursor, chunk in self._chunks.items():
+            for cursor, (chunk, provenance) in self._chunks.items():
                 end = cursor + len(chunk)
                 if cursor <= current_time < end:
-                    relevant.append((cursor, chunk[current_time - cursor]))
+                    relevant.append((cursor, chunk[current_time - cursor], provenance))
                 elif end <= current_time:
                     expired.append(cursor)
 
@@ -67,11 +73,12 @@ class RealTimeChunkingBuffer:
                 return None
 
             relevant.sort(key=lambda item: item[0])
-            candidate_actions = np.asarray([action for _, action in relevant], dtype=np.float32)
+            candidate_actions = np.asarray([action for _, action, _ in relevant], dtype=np.float32)
+            provenances = tuple((cursor, provenance) for cursor, _, provenance in relevant)
 
         weights = np.exp(self._exp_weight * np.arange(len(candidate_actions), dtype=np.float32))
         weights = (weights / weights.sum())[:, None]
-        return np.sum(candidate_actions * weights, axis=0).astype(np.float32)
+        return np.sum(candidate_actions * weights, axis=0).astype(np.float32), provenances
 
 
 def parse_server_url(url: str) -> tuple[str, int | None]:

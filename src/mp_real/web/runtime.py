@@ -11,6 +11,7 @@ import numpy as np
 from mp_real.robots.base import Robot
 from mp_real.runtime.config import InferenceLoopConfig
 from mp_real.runtime.inference import InferenceHooks
+from mp_real.runtime.models import CameraSample, ObservationSnapshot, RobotState
 
 
 class ObservationSource(Protocol):
@@ -25,13 +26,46 @@ class CachedFrameObservationSource:
     read_images: Callable[[], tuple[Mapping[str, np.ndarray], Mapping[str, Any] | None]]
     image_masks: Mapping[str, np.bool_]
     prompt: str
+    last_observation_snapshot: ObservationSnapshot | None = dataclasses.field(default=None, init=False)
 
     def observe(self) -> dict[str, Any]:
-        images, camera_params = self.read_images()
+        result = self.read_images()
+        images, camera_params = result[0], result[1]
+        frame_metadata = result[2] if len(result) > 2 else {}
+        now_ns = time.monotonic_ns()
+        state = self.robot.read_state()
+        if not isinstance(state, RobotState):
+            state = RobotState(np.asarray(state, dtype=np.float32), now_ns / 1e9, now_ns)
+        samples: dict[str, CameraSample] = {}
+        for name, image in images.items():
+            metadata = frame_metadata.get(name) if isinstance(frame_metadata, Mapping) else None
+            timestamp_ns = int(getattr(metadata, "timestamp_monotonic_ns", 0) or now_ns)
+            frame_id = int(getattr(metadata, "frame_id", 0) or 0)
+            samples[name] = CameraSample(
+                image=np.asarray(image).copy(),
+                timestamp_monotonic=timestamp_ns / 1e9,
+                frame_id=frame_id,
+                timestamp_monotonic_ns=timestamp_ns,
+                source_sequence=getattr(metadata, "source_sequence", None),
+                capture_latency_ns=getattr(metadata, "capture_latency_ns", None),
+            )
+        self.last_observation_snapshot = ObservationSnapshot(
+            images=samples,
+            image_masks=dict(self.image_masks),
+            state=state,
+            prompt=self.prompt,
+            camera_params=camera_params,
+            captured_at_monotonic=now_ns / 1e9,
+            capture_started_ns=now_ns,
+            capture_finished_ns=now_ns,
+            state_timestamp_ns=state.timestamp_monotonic_ns,
+            camera_frame_ids={name: sample.frame_id for name, sample in samples.items()},
+            camera_timestamps_ns={name: sample.timestamp_monotonic_ns for name, sample in samples.items()},
+        )
         observation: dict[str, Any] = {
-            "images": {name: np.asarray(image).copy() for name, image in images.items()},
+            "images": {name: sample.image for name, sample in samples.items()},
             "image_masks": dict(self.image_masks),
-            "state": self.robot.read_state().values,
+            "state": state.values,
             "prompt": self.prompt,
         }
         if camera_params is not None:
@@ -52,6 +86,10 @@ class WebInferenceAdapter:
 
     def observe(self) -> dict[str, Any]:
         return self.observation_source.observe()
+
+    @property
+    def last_observation_snapshot(self) -> ObservationSnapshot | None:
+        return getattr(self.observation_source, "last_observation_snapshot", None)
 
     def decode_action_chunk(self, response: dict[str, Any], replan_steps: int) -> np.ndarray:
         return self.decode_chunk(response, replan_steps)

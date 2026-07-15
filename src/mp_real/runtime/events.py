@@ -15,7 +15,7 @@ import numpy as np
 
 from mp_real.runtime.config import InferenceLoopConfig
 from mp_real.runtime.inference import InferenceHooks
-from mp_real.runtime.models import ObservationSnapshot
+from mp_real.runtime.models import ActionProvenance, ObservationSnapshot
 
 
 def _wall_timestamp_iso() -> str:
@@ -158,6 +158,10 @@ class CompositeRuntimeEventSink:
         with self._lock:
             return tuple(self._failures)
 
+    @property
+    def requires_observation_images(self) -> bool:
+        return any(bool(getattr(sink, "requires_observation_images", False)) for sink in self._sinks)
+
     def emit(self, event: RuntimeEvent) -> None:
         for index, sink in enumerate(self._sinks):
             try:
@@ -238,6 +242,10 @@ class RuntimeEventDispatcher:
         with self._lock:
             return tuple(self._failures)
 
+    @property
+    def requires_observation_images(self) -> bool:
+        return bool(getattr(self._sink, "requires_observation_images", False))
+
     def start(self) -> None:
         with self._lock:
             if self._stopping:
@@ -306,7 +314,13 @@ class RuntimeEventIdentity:
 class RuntimeEventHooks(InferenceHooks):
     """Translate the stable InferenceHooks API into copied, typed runtime events."""
 
-    def __init__(self, sink: RuntimeEventSink, identity: RuntimeEventIdentity) -> None:
+    def __init__(
+        self,
+        sink: RuntimeEventSink,
+        identity: RuntimeEventIdentity,
+        *,
+        include_observation_images: bool | None = None,
+    ) -> None:
         self._sink = sink
         self._identity = identity
         self._lock = threading.Lock()
@@ -314,31 +328,42 @@ class RuntimeEventHooks(InferenceHooks):
         self._request_id = 0
         self._chunk_id = 0
         self._local = threading.local()
+        self._observation_context: dict[int, tuple[int | None, int | None]] = {}
+        self._include_observation_images = (
+            bool(getattr(sink, "requires_observation_images", False))
+            if include_observation_images is None
+            else include_observation_images
+        )
 
     def on_loop_started(self, mode: str, config: InferenceLoopConfig) -> None:
         self._emit(RuntimeStarted, payload={"mode": mode, "config": dataclasses.asdict(config)})
 
     def on_observation_captured(self, snapshot: ObservationSnapshot) -> None:
         self._local.snapshot_captured = True
+        self._local.observation_id = snapshot.observation_id
+        payload: dict[str, Any] = {
+            "observation_id": snapshot.observation_id,
+            "capture_started_ns": snapshot.capture_started_ns,
+            "capture_finished_ns": snapshot.capture_finished_ns,
+            "state_timestamp_ns": snapshot.state_timestamp_ns,
+            "camera_frame_ids": snapshot.camera_frame_ids,
+            "camera_timestamps_ns": snapshot.camera_timestamps_ns,
+            "max_camera_skew_ns": snapshot.max_camera_skew_ns,
+            "observation_age_ns": snapshot.observation_age_ns,
+            "state": snapshot.state.values,
+        }
+        if self._include_observation_images:
+            payload["images"] = {name: sample.image for name, sample in snapshot.images.items()}
         self._emit(
             ObservationCaptured,
-            payload={
-                "observation_id": snapshot.observation_id,
-                "capture_started_ns": snapshot.capture_started_ns,
-                "capture_finished_ns": snapshot.capture_finished_ns,
-                "state_timestamp_ns": snapshot.state_timestamp_ns,
-                "camera_frame_ids": snapshot.camera_frame_ids,
-                "camera_timestamps_ns": snapshot.camera_timestamps_ns,
-                "max_camera_skew_ns": snapshot.max_camera_skew_ns,
-                "observation_age_ns": snapshot.observation_age_ns,
-                "state": snapshot.state.values,
-            },
+            payload=payload,
         )
 
     def on_observation(self, observation: Mapping[str, Any]) -> None:
         if getattr(self._local, "snapshot_captured", False):
             self._local.snapshot_captured = False
             return
+        self._local.observation_id = None
         self._emit(
             ObservationCaptured,
             payload={
@@ -362,7 +387,11 @@ class RuntimeEventHooks(InferenceHooks):
         self._emit(
             InferenceFinished,
             request_id=getattr(self._local, "request_id", None),
-            payload={"stage": stage, "inference_latency_ns": round(elapsed_s * 1e9)},
+            payload={
+                "stage": stage,
+                "inference_latency_ns": round(elapsed_s * 1e9),
+                "observation_id": getattr(self._local, "observation_id", None),
+            },
         )
 
     def on_chunk_received_context(self, chunk: np.ndarray, stage: str) -> None:
@@ -370,35 +399,54 @@ class RuntimeEventHooks(InferenceHooks):
             self._chunk_id += 1
             chunk_id = self._chunk_id
         self._local.chunk_id = chunk_id
+        observation_id = getattr(self._local, "observation_id", None)
+        with self._lock:
+            if observation_id is not None:
+                self._observation_context[int(observation_id)] = (getattr(self._local, "request_id", None), chunk_id)
         self._emit(
             ChunkReceived,
             request_id=getattr(self._local, "request_id", None),
             chunk_id=chunk_id,
-            payload={"stage": stage, "raw_action_chunk": chunk},
+            payload={"stage": stage, "raw_action_chunk": chunk, "observation_id": observation_id},
         )
 
     def on_action_selected(self, step: int, action: np.ndarray) -> None:
+        self.on_action_selected_context(step, action, None)
+
+    def on_action_selected_context(self, step: int, action: np.ndarray, provenance: ActionProvenance | None) -> None:
+        request_id, chunk_id, payload = self._provenance_context(provenance)
         self._emit(
             ActionSelected,
-            chunk_id=getattr(self._local, "chunk_id", None),
+            request_id=request_id,
+            chunk_id=chunk_id,
             step=step,
-            payload={"selected_raw_action": action},
+            payload={"selected_raw_action": action, **payload},
         )
 
     def on_action_stabilized(self, step: int, action: np.ndarray) -> None:
+        self.on_action_stabilized_context(step, action, None)
+
+    def on_action_stabilized_context(self, step: int, action: np.ndarray, provenance: ActionProvenance | None) -> None:
+        request_id, chunk_id, payload = self._provenance_context(provenance)
         self._emit(
             ActionStabilized,
-            chunk_id=getattr(self._local, "chunk_id", None),
+            request_id=request_id,
+            chunk_id=chunk_id,
             step=step,
-            payload={"stabilized_target_action": action},
+            payload={"stabilized_target_action": action, **payload},
         )
 
     def on_action_executed(self, step: int, action: np.ndarray) -> None:
+        self.on_action_executed_context(step, action, None)
+
+    def on_action_executed_context(self, step: int, action: np.ndarray, provenance: ActionProvenance | None) -> None:
+        request_id, chunk_id, payload = self._provenance_context(provenance)
         self._emit(
             ActionExecuted,
-            chunk_id=getattr(self._local, "chunk_id", None),
+            request_id=request_id,
+            chunk_id=chunk_id,
             step=step,
-            payload={"executed_action": action},
+            payload={"executed_action": action, **payload},
         )
 
     def on_safety_rejected(self, step: int | None, action: np.ndarray | None, error: BaseException) -> None:
@@ -435,6 +483,24 @@ class RuntimeEventHooks(InferenceHooks):
 
     def on_error(self, error: BaseException) -> None:
         self._emit(RuntimeFailed, payload={"error_type": type(error).__name__, "message": str(error)})
+
+    def _provenance_context(
+        self, provenance: ActionProvenance | None
+    ) -> tuple[int | None, int | None, dict[str, object]]:
+        if provenance is None:
+            return None, None, {"observation_id": None, "chunk_cursor": None, "source_observation_ids": []}
+        with self._lock:
+            request_id, chunk_id = self._observation_context.get(provenance.observation_id or -1, (None, None))
+        return (
+            request_id,
+            chunk_id,
+            {
+                "observation_id": provenance.observation_id,
+                "chunk_cursor": provenance.chunk_cursor,
+                "source_observation_ids": list(provenance.source_observation_ids),
+                "control_cycle_ns": provenance.control_cycle_ns,
+            },
+        )
 
     def _emit(
         self,

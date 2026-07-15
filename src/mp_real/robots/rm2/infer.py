@@ -13,15 +13,14 @@ from typing import Any, Literal
 import numpy as np
 import tyro
 
-def env_path(name: str) -> pathlib.Path | None:
-    value = os.environ.get(name)
-    if not value:
-        return None
-    return pathlib.Path(value).expanduser()
-
-
-from mp_real.common.camera import BlackCamera, Camera, ROSImageCamera, close_cameras, init_ros_node
-from mp_real.common.camera import make_realsense_cameras
+from mp_real.common.camera import (
+    BlackCamera,
+    Camera,
+    ROSImageCamera,
+    close_cameras,
+    init_ros_node,
+    make_realsense_cameras,
+)
 from mp_real.common.runtime import parse_server_url, sleep_until
 from mp_real.policy_client import websocket_client_policy
 from mp_real.robots.base import Robot
@@ -30,8 +29,15 @@ from mp_real.runtime.config import InferenceLoopConfig
 from mp_real.runtime.inference import run_infer_only as run_generic_infer_only
 from mp_real.runtime.inference import run_rtc_loop as run_generic_rtc_loop
 from mp_real.runtime.inference import run_sync_loop as run_generic_sync_loop
-from mp_real.runtime.models import ActionSpec, ObservationSnapshot, RobotState
+from mp_real.runtime.models import ActionSpec, ObservationSnapshot, RobotState, VectorField
 from mp_real.runtime.observation import capture_observation
+
+
+def env_path(name: str) -> pathlib.Path | None:
+    value = os.environ.get(name)
+    if not value:
+        return None
+    return pathlib.Path(value).expanduser()
 
 CameraBackend = Literal["ros", "realsense", "black"]
 ArmCommandMode = Literal["canfd", "follow", "movej"]
@@ -360,6 +366,8 @@ class Rm2Robot(Robot):
             joint_dof_per_arm=self.args.joint_dof,
             joint_unit=self.args.policy_joint_unit,
             camera_roles=("left_color", "right_color", "head_color"),
+            state_fields=_vector_fields(self.args),
+            action_fields=_vector_fields(self.args),
     )
 
     def read_state(self) -> RobotState:
@@ -518,6 +526,22 @@ def close_arm(arm: Any | None) -> None:
 
 def action_dim(args: Args) -> int:
     return 2 * (args.joint_dof + 1)
+
+
+def _vector_fields(args: Args) -> tuple[VectorField, ...]:
+    fields: list[VectorField] = []
+    for arm in ("left", "right"):
+        fields.extend(
+            VectorField(f"{arm}_joint_{index}", args.policy_joint_unit, "joint_position")
+            for index in range(1, args.joint_dof + 1)
+        )
+    fields.extend(
+        (
+            VectorField("left_gripper", "normalized_0_closed_1_open", "gripper_open_fraction"),
+            VectorField("right_gripper", "normalized_0_closed_1_open", "gripper_open_fraction"),
+        )
+    )
+    return tuple(fields)
 
 
 def robot_joints_to_policy(joints_deg: np.ndarray, args: Args) -> np.ndarray:
@@ -790,7 +814,11 @@ def run_infer_only(
     args: Args,
     robot_lock: threading.Lock,
 ) -> None:
-    run_generic_infer_only(client, _adapter(cameras, left, right, args, robot_lock), InferenceLoopConfig.from_args(args))
+    run_generic_infer_only(
+        client,
+        _adapter(cameras, left, right, args, robot_lock),
+        InferenceLoopConfig.from_args(args),
+    )
 
 
 def run_sync_loop(

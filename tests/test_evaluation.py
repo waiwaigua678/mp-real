@@ -3,17 +3,20 @@ from __future__ import annotations
 import dataclasses
 import http.client
 import json
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from mp_real.data.lerobot_v21 import validate_lerobot_v21_dataset
 from mp_real.evaluation.service import EvaluationConflict, EvaluationRuntimeLease, EvaluationService
 from mp_real.runtime.config import InferenceLoopConfig
 from mp_real.runtime.controller import RuntimeController
-from mp_real.runtime.models import ActionSpec, RobotState
+from mp_real.runtime.models import ActionSpec, ObservationSnapshot, RobotState
 from mp_real.runtime.startup import PolicyStartupConfig
 from mp_real.web.server import PiperWebHandler, PiperWebServer
 
@@ -46,9 +49,14 @@ class _Adapter:
 
     def __init__(self, robot: _Robot) -> None:
         self._robot = robot
+        self.last_observation_snapshot: ObservationSnapshot | None = None
 
     def observe(self) -> dict[str, Any]:
-        return {"images": {}, "state": self._robot.read_state().values, "prompt": "evaluation"}
+        state = self._robot.read_state()
+        self.last_observation_snapshot = ObservationSnapshot(
+            images={}, image_masks={}, state=state, prompt="evaluation"
+        )
+        return self.last_observation_snapshot.to_policy_observation()
 
     def decode_action_chunk(self, response: dict[str, Any], replan_steps: int) -> np.ndarray:
         return self._robot.action_spec.validate_chunk(response["actions"])[:replan_steps]
@@ -281,6 +289,69 @@ class EvaluationServiceTests(unittest.TestCase):
         with self.assertRaises(EvaluationConflict) as raised:
             service.label({"result": "SUCCESS"})
         self.assertEqual(raised.exception.legal_operations, ("reset-ready", "abort"))
+
+    def test_save_data_finalizes_lerobot_dataset_off_the_control_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            broker = _Broker(_Policy())
+            service = EvaluationService(broker, recording_root=directory)
+            broker.service = service
+            self.addCleanup(broker.close)
+            self.addCleanup(service.shutdown)
+            service.create(
+                {
+                    "name": "recorded evaluation",
+                    "task_name": "pick-place",
+                    "planned_episodes": 1,
+                    "max_episode_seconds": 1.0,
+                    "save_data": True,
+                    "save_video": False,
+                }
+            )
+            self._warm_and_reset(service)
+            self._run_and_stop(service)
+            status = service.label({"result": "SUCCESS"})
+            self.assertEqual(status["state"], "COMPLETED")
+            deadline = time.monotonic() + 5.0
+            datasets = []
+            while time.monotonic() < deadline:
+                datasets = [path for path in Path(directory).iterdir() if not path.name.endswith(".inprogress")]
+                if datasets:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(
+                len(datasets),
+                1,
+                {"status": service.current(), "entries": [path.name for path in Path(directory).iterdir()]},
+            )
+            report = validate_lerobot_v21_dataset(datasets[0], check_videos=False)
+            self.assertTrue(report.valid, report.errors)
+
+    def test_save_data_abort_without_episode_keeps_recovery_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            broker = _Broker(_Policy())
+            service = EvaluationService(broker, recording_root=directory)
+            broker.service = service
+            self.addCleanup(broker.close)
+            self.addCleanup(service.shutdown)
+            service.create(
+                {
+                    "name": "aborted recording",
+                    "task_name": "pick-place",
+                    "planned_episodes": 1,
+                    "max_episode_seconds": 1.0,
+                    "save_data": True,
+                }
+            )
+            self.assertEqual(service.abort()["state"], "ABORTED")
+            deadline = time.monotonic() + 2.0
+            recovery_files: list[Path] = []
+            while time.monotonic() < deadline:
+                recovery_files = list(Path(directory).glob("*.inprogress/meta/mp_real/recovery.json"))
+                if recovery_files:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(len(recovery_files), 1)
+            self.assertEqual(json.loads(recovery_files[0].read_text())["status"], "INCOMPLETE")
 
     def test_illegal_transition_reports_current_legal_operations(self) -> None:
         service, _ = self._service()

@@ -15,6 +15,7 @@ from mp_real.runtime.inference import (
     PolicyProtocolError,
     fetch_action_chunk,
 )
+from mp_real.runtime.models import ActionProvenance
 
 
 class PolicyStartupError(RuntimeError):
@@ -60,6 +61,7 @@ class PolicyStartupMetrics:
 @dataclasses.dataclass(frozen=True)
 class PreparedPolicyStart:
     initial_chunk: np.ndarray | None
+    initial_provenance: ActionProvenance | None
     metrics: PolicyStartupMetrics
 
 
@@ -118,12 +120,14 @@ class PolicyStartupCoordinator:
 
             self._raise_if_stopped()
             initial_chunk: np.ndarray | None = None
+            initial_provenance: ActionProvenance | None = None
             first_live_inference_latency_ms: float | None = None
             if self._startup_config.prefetch_first_chunk and not self._loop_config.infer_only:
                 self._notify_phase("PREFETCHING_FIRST_CHUNK")
                 _set_client_timeout(self._client, self._startup_config.inference_timeout_s)
                 fetched, elapsed_s = self._request_with_chunk("first_live", self._startup_config.inference_timeout_s)
                 initial_chunk = fetched.chunk.copy()
+                initial_provenance = fetched.provenance
                 first_live_inference_latency_ms = elapsed_s * 1000.0
                 if cold_inference_latency_ms is None:
                     cold_inference_latency_ms = first_live_inference_latency_ms
@@ -132,6 +136,7 @@ class PolicyStartupCoordinator:
             self._raise_if_stopped()
             prepared = PreparedPolicyStart(
                 initial_chunk=initial_chunk,
+                initial_provenance=initial_provenance,
                 metrics=PolicyStartupMetrics(
                     cold_inference_latency_ms=cold_inference_latency_ms,
                     warmup_latency_ms=warmup_latency_ms,

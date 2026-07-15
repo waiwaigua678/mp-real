@@ -21,9 +21,8 @@ from mp_real.runtime.config import InferenceLoopConfig
 from mp_real.runtime.inference import run_infer_only as run_generic_infer_only
 from mp_real.runtime.inference import run_rtc_loop as run_generic_rtc_loop
 from mp_real.runtime.inference import run_sync_loop as run_generic_sync_loop
-from mp_real.runtime.models import ActionSpec, ObservationSnapshot, RobotState
+from mp_real.runtime.models import ActionSpec, ObservationSnapshot, RobotState, VectorField
 from mp_real.runtime.observation import capture_observation
-
 
 CameraBackend = Literal["realsense", "v4l2", "black"]
 ArmCommandMode = Literal["move_j", "move_js", "auto"]
@@ -33,6 +32,14 @@ _JOINT_ACTION_MASK = np.asarray(
     dtype=bool,
 )
 _GRIPPER_ACTION_MASK = np.logical_not(_JOINT_ACTION_MASK)
+
+
+def _vector_fields() -> tuple[VectorField, ...]:
+    fields: list[VectorField] = []
+    for arm in ("left", "right"):
+        fields.extend(VectorField(f"{arm}_joint_{index}", "rad", "joint_position") for index in range(1, 7))
+        fields.append(VectorField(f"{arm}_gripper", "normalized_0_open_1", "gripper_open_fraction"))
+    return tuple(fields)
 
 
 @dataclasses.dataclass
@@ -163,6 +170,8 @@ class PiperRobot(Robot):
             joint_dof_per_arm=6,
             joint_unit="rad",
             camera_roles=("cam_head", "cam_left_wrist", "cam_right_wrist"),
+            state_fields=_vector_fields(),
+            action_fields=_vector_fields(),
         )
     )
 

@@ -13,7 +13,7 @@ from mp_real.robots.piper import infer as infer_piper
 from mp_real.robots.registry import create_robot
 from mp_real.robots.rm2 import infer as infer_rm2
 from mp_real.runtime.config import InferenceLoopConfig
-from mp_real.runtime.models import ActionSpec
+from mp_real.runtime.models import ActionSpec, VectorField
 from mp_real.web.runtime import CachedFrameObservationSource, WebInferenceAdapter
 
 
@@ -72,12 +72,22 @@ def _piper_default_args() -> infer_piper.Args:
 
 def _piper_action_spec(args: infer_piper.Args) -> ActionSpec:
     del args
+    fields = tuple(
+        field
+        for arm in ("left", "right")
+        for field in (
+            *(VectorField(f"{arm}_joint_{index}", "rad", "joint_position") for index in range(1, 7)),
+            VectorField(f"{arm}_gripper", "normalized_0_open_1", "gripper_open_fraction"),
+        )
+    )
     return ActionSpec(
         action_dim=14,
         state_dim=14,
         joint_dof_per_arm=6,
         joint_unit="rad",
         camera_roles=("cam_head", "cam_left_wrist", "cam_right_wrist"),
+        state_fields=fields,
+        action_fields=fields,
     )
 
 
@@ -144,12 +154,28 @@ def _piper_reset_args(args: infer_piper.Args) -> infer_piper.Args:
 
 def _rm2_action_spec(args: infer_rm2.Args) -> ActionSpec:
     dimension = infer_rm2.action_dim(args)
+    fields = tuple(
+        [
+            *(
+                VectorField(f"left_joint_{index}", args.policy_joint_unit, "joint_position")
+                for index in range(1, args.joint_dof + 1)
+            ),
+            *(
+                VectorField(f"right_joint_{index}", args.policy_joint_unit, "joint_position")
+                for index in range(1, args.joint_dof + 1)
+            ),
+            VectorField("left_gripper", "normalized_0_closed_1_open", "gripper_open_fraction"),
+            VectorField("right_gripper", "normalized_0_closed_1_open", "gripper_open_fraction"),
+        ]
+    )
     return ActionSpec(
         action_dim=dimension,
         state_dim=dimension,
         joint_dof_per_arm=args.joint_dof,
         joint_unit=args.policy_joint_unit,
         camera_roles=("left_color", "right_color", "head_color"),
+        state_fields=fields,
+        action_fields=fields,
     )
 
 

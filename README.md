@@ -154,6 +154,26 @@ Use repeated `--camera-backend ROLE=BACKEND` and
 to serve the same camera-only Web preview lifecycle; `--duration` and
 `--save-preview DIR` are optional.
 
+## Recorded LeRobot v2.1 data
+
+Evaluation sessions with `save_data=true` write a self-contained LeRobot v2.1
+dataset under `recordings/` by default. The recording worker writes Parquet,
+MP4 and telemetry off the control thread, records executed actions as the
+standard `action`, and finalizes the session atomically after its final label.
+
+Inspect or validate a local dataset without creating a robot, camera or policy
+client:
+
+```bash
+uv run mp-data-inspect recordings/<dataset>
+uv run mp-data-validate recordings/<dataset>
+```
+
+`mp-data-inspect` also accepts ordinary LeRobot v2.1 datasets that do not have
+the optional `meta/mp_real/` or `telemetry/` extensions. `mp-data-validate`
+returns a non-zero status for schema, timestamp, Parquet, metadata or video
+alignment errors.
+
 ### Policy warmup and first action
 
 Deployment exposes separate connection, metadata, warmup and steady-inference
@@ -184,8 +204,9 @@ and earliest included camera timestamps. `observation_age_ns` is measured at
 snapshot completion relative to the oldest included camera/state source. The
 shared runtime translates its existing hooks into bounded in-memory events;
 actions retain distinct raw-chunk, selected, stabilized, and executed payloads.
-Event ndarray payloads are copied before dispatch. This stage writes no
-recording files, video, NPZ, or JSONL.
+Event ndarray payloads are copied before dispatch. When an evaluation enables
+`save_data`, the dedicated Stage 6 recorder consumes these copied events and
+writes its files asynchronously.
 
 ## What runs elsewhere
 
