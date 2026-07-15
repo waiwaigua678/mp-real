@@ -9,12 +9,27 @@ const resetBtn = document.querySelector("#resetBtn");
 const disconnectBtn = document.querySelector("#disconnectBtn");
 const robotSelect = document.querySelector("#robotSelect");
 const accessKeyInput = document.querySelector("#accessKey");
+const evaluationForm = document.querySelector("#evaluationForm");
+const createEvaluationBtn = document.querySelector("#createEvaluationBtn");
+const abortEvaluationBtn = document.querySelector("#abortEvaluationBtn");
+const completeEvaluationBtn = document.querySelector("#completeEvaluationBtn");
+const warmupEvaluationBtn = document.querySelector("#warmupEvaluationBtn");
+const resetReadyBtn = document.querySelector("#resetReadyBtn");
+const startEpisodeBtn = document.querySelector("#startEpisodeBtn");
+const stopEpisodeBtn = document.querySelector("#stopEpisodeBtn");
+const labelSuccessBtn = document.querySelector("#labelSuccessBtn");
+const labelFailureBtn = document.querySelector("#labelFailureBtn");
+const labelInvalidBtn = document.querySelector("#labelInvalidBtn");
+const failureReason = document.querySelector("#failureReason");
+const operatorNote = document.querySelector("#operatorNote");
 
 let currentStatus = null;
 let firstLoad = true;
 let dirty = false;
 let accessKey = sessionStorage.getItem("motrixAccessKey") || "";
 let cameraRoles = [];
+let evaluation = null;
+let evaluationRequestInFlight = false;
 accessKeyInput.value = accessKey;
 
 function setMessage(text, kind = "") {
@@ -56,7 +71,119 @@ function setForm(config) {
     }
   }
   setRuntimeModeUi(config.runtime_mode || "deployment");
+  evaluationForm.elements.robot_name.value = config.robot || robotSelect.value;
+  if (!evaluation) evaluationForm.elements.prompt.value = config.prompt || "";
   dirty = false;
+}
+
+function collectEvaluationForm() {
+  const data = { robot_name: robotSelect.value };
+  for (const field of evaluationForm.elements) {
+    if (!field.name || field.name === "robot_name") continue;
+    if (field.type === "checkbox") {
+      data[field.name] = field.checked;
+    } else if (field.type === "number") {
+      data[field.name] = Number(field.value);
+    } else {
+      data[field.name] = field.value.trim();
+    }
+  }
+  data.save_video = data.save_data && data.save_video;
+  return data;
+}
+
+function evaluationOperationAllowed(operation) {
+  return !evaluationRequestInFlight && Boolean(evaluation?.legal_operations?.includes(operation));
+}
+
+function setEvaluationDisabled(disabled) {
+  for (const field of evaluationForm.elements) {
+    if (field.name !== "robot_name") field.disabled = disabled;
+  }
+}
+
+function applyEvaluation(next) {
+  evaluation = next;
+  const state = next?.state || "无活动评测";
+  const summary = next?.summary || {};
+  const recording = next?.recording || {};
+  const currentEpisode = next?.current_episode;
+  const resultCounts = summary.result_counts || {};
+  const startup = next?.policy_startup || {};
+
+  document.querySelector("#evaluationState").textContent = state;
+  document.querySelector("#evaluationPolicy").textContent = startup.warmed_up ? "READY" : startup.phase || "-";
+  document.querySelector("#evaluationRound").textContent = next
+    ? `${currentEpisode?.episode_index || summary.completed_episodes || 0}/${summary.planned_episodes || "-"}`
+    : "-";
+  document.querySelector("#evaluationElapsed").textContent = fmt(next?.current_episode_elapsed_s?.toFixed?.(1), " s");
+  document.querySelector("#evaluationCompleted").textContent = summary.completed_episodes || 0;
+  document.querySelector("#evaluationValid").textContent = summary.success_rate_denominator || 0;
+  document.querySelector("#evaluationResults").textContent = `${resultCounts.SUCCESS || 0} / ${resultCounts.FAILURE || 0} / ${resultCounts.INVALID || 0}`;
+  document.querySelector("#evaluationRate").textContent = `${summary.successes || 0}/${summary.success_rate_denominator || 0}`;
+  document.querySelector("#evaluationStops").textContent = `${summary.timeout_count || 0} / ${summary.safety_abort_count || 0}`;
+  document.querySelector("#evaluationRecorderQueue").textContent = recording.enabled
+    ? `${recording.queue_depth || 0}/${recording.queue_capacity || "-"}`
+    : "off";
+  document.querySelector("#evaluationDrops").textContent = `${recording.dropped_event_count || 0} / ${recording.dropped_frame_count || 0}`;
+  document.querySelector("#evaluationDataset").textContent = recording.dataset_root || "-";
+  document.querySelector("#evaluationStopTrigger").textContent = currentEpisode?.stop_trigger || next?.episodes?.at?.(-1)?.stop_trigger || "-";
+  document.querySelector("#evaluationError").textContent = next?.last_error || recording.failure || "-";
+  document.querySelector("#evaluationLegalActions").textContent = (next?.legal_operations || []).join(" · ") || "-";
+
+  const terminal = ["COMPLETED", "ABORTED", "ERROR"].includes(next?.state);
+  const canCreate =
+    (!next || terminal) && currentStatus?.runtime_mode === "deployment" && currentStatus?.connected && !currentStatus?.running;
+  createEvaluationBtn.disabled = evaluationRequestInFlight || !canCreate;
+  abortEvaluationBtn.disabled = !evaluationOperationAllowed("abort");
+  completeEvaluationBtn.disabled = evaluationRequestInFlight || next?.state !== "COMPLETED";
+  warmupEvaluationBtn.disabled = !evaluationOperationAllowed("warmup");
+  resetReadyBtn.disabled = !evaluationOperationAllowed("reset-ready");
+  startEpisodeBtn.disabled = !evaluationOperationAllowed("start-episode");
+  stopEpisodeBtn.disabled = !evaluationOperationAllowed("stop-episode");
+  labelSuccessBtn.disabled = !evaluationOperationAllowed("label");
+  labelFailureBtn.disabled = !evaluationOperationAllowed("label");
+  labelInvalidBtn.disabled = !evaluationOperationAllowed("label");
+  failureReason.disabled = !evaluationOperationAllowed("label");
+  operatorNote.disabled = !evaluationOperationAllowed("label");
+  setEvaluationDisabled(Boolean(next) && !terminal);
+}
+
+async function evaluationRequest(url, payload = {}) {
+  if (evaluationRequestInFlight) return;
+  evaluationRequestInFlight = true;
+  applyEvaluation(evaluation);
+  try {
+    const data = await requestJson(url, { method: "POST", body: JSON.stringify(payload) });
+    applyEvaluation(data.evaluation);
+    setMessage("评测状态已更新", "ok");
+  } catch (error) {
+    setMessage(error.message, "bad");
+    await refreshStatus();
+  } finally {
+    evaluationRequestInFlight = false;
+    applyEvaluation(evaluation);
+  }
+}
+
+function createEvaluation() {
+  if (dirty) {
+    setMessage("请先保存参数，再创建评测", "bad");
+    return;
+  }
+  evaluationRequest("/api/evaluations", collectEvaluationForm());
+}
+
+function labelEvaluation(result) {
+  const payload = { result, notes: operatorNote.value.trim() };
+  if (result === "FAILURE") {
+    if (!failureReason.value) {
+      setMessage("标记失败时必须选择失败原因", "bad");
+      return;
+    }
+    payload.failure_reason = failureReason.value;
+  }
+  evaluationRequest("/api/evaluations/current/label", payload);
 }
 
 function ensureCameraPanels(roles) {
@@ -233,6 +360,7 @@ function applyStatus(status) {
   stopBtn.disabled = !status.can_stop;
   resetBtn.disabled = !status.can_reset;
   disconnectBtn.disabled = !status.can_disconnect;
+  applyEvaluation(status.evaluation || null);
 }
 
 async function refreshStatus() {
@@ -370,6 +498,16 @@ startBtn.addEventListener("click", startRuntime);
 stopBtn.addEventListener("click", stopRuntime);
 resetBtn.addEventListener("click", resetRuntime);
 disconnectBtn.addEventListener("click", disconnectRuntime);
+createEvaluationBtn.addEventListener("click", createEvaluation);
+abortEvaluationBtn.addEventListener("click", () => evaluationRequest("/api/evaluations/current/abort"));
+completeEvaluationBtn.addEventListener("click", () => evaluationRequest("/api/evaluations/current/complete"));
+warmupEvaluationBtn.addEventListener("click", () => evaluationRequest("/api/evaluations/current/warmup"));
+resetReadyBtn.addEventListener("click", () => evaluationRequest("/api/evaluations/current/reset-ready"));
+startEpisodeBtn.addEventListener("click", () => evaluationRequest("/api/evaluations/current/start-episode"));
+stopEpisodeBtn.addEventListener("click", () => evaluationRequest("/api/evaluations/current/stop-episode"));
+labelSuccessBtn.addEventListener("click", () => labelEvaluation("SUCCESS"));
+labelFailureBtn.addEventListener("click", () => labelEvaluation("FAILURE"));
+labelInvalidBtn.addEventListener("click", () => labelEvaluation("INVALID"));
 
 loadConfig()
   .then(() => refreshStatus())

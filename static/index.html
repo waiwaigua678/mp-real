@@ -14,6 +14,7 @@
       </div>
       <nav class="tabs">
         <button class="tab active" type="button" data-page="runPage">运行</button>
+        <button class="tab" type="button" data-page="evaluationPage">评测</button>
         <button class="tab" type="button" data-page="settingsPage">参数</button>
       </nav>
       <div class="status-strip">
@@ -79,6 +80,114 @@
             </div>
             <pre id="logBox"></pre>
           </section>
+        </section>
+      </section>
+
+      <section class="page" id="evaluationPage">
+        <section class="settings-head">
+          <div>
+            <h2>人工评测</h2>
+            <div class="subline" id="evaluationHint">先连接 DEPLOYMENT runtime，且不得启动普通控制。</div>
+          </div>
+          <div class="button-row">
+            <button id="createEvaluationBtn" type="button" class="primary">创建评测</button>
+            <button id="abortEvaluationBtn" type="button" class="danger">中止评测</button>
+            <button id="completeEvaluationBtn" type="button">完成评测</button>
+          </div>
+        </section>
+
+        <div class="evaluation-grid">
+          <form id="evaluationForm" class="form-section">
+            <h3>评测配置（创建后锁定）</h3>
+            <label>
+              <span>机器人类型</span>
+              <select name="robot_name" id="evaluationRobot" disabled>
+                <option value="piper">Piper</option>
+                <option value="rm2">RM2</option>
+              </select>
+            </label>
+            <label>
+              <span>评测名称</span>
+              <input name="name" type="text" value="evaluation" required />
+            </label>
+            <label>
+              <span>任务名称</span>
+              <input name="task_name" type="text" value="unnamed-task" required />
+            </label>
+            <label>
+              <span>Policy Label</span>
+              <input name="policy_label" type="text" />
+            </label>
+            <label class="wide">
+              <span>Prompt</span>
+              <input name="prompt" type="text" />
+            </label>
+            <label>
+              <span>计划轮次</span>
+              <input name="planned_episodes" type="number" min="1" step="1" value="3" required />
+            </label>
+            <label>
+              <span>单轮超时（秒）</span>
+              <input name="max_episode_seconds" type="number" min="0.1" step="0.1" value="60" required />
+            </label>
+            <label>
+              <span>操作员</span>
+              <input name="operator" type="text" />
+            </label>
+            <label>
+              <span>Tags（逗号分隔）</span>
+              <input name="tags" type="text" />
+            </label>
+            <label class="wide">
+              <span>存储根目录（可选）</span>
+              <input name="storage_root" type="text" placeholder="recordings 下的相对目录" />
+            </label>
+            <label class="wide">
+              <span>评测备注</span>
+              <input name="notes" type="text" />
+            </label>
+            <div class="toggles wide">
+              <label><input name="auto_advance" type="checkbox" /> 自动下一轮</label>
+              <label><input name="save_data" type="checkbox" checked /> 保存数据</label>
+              <label><input name="save_video" type="checkbox" checked /> 保存视频</label>
+            </div>
+          </form>
+
+          <section class="panel evaluation-status">
+            <div class="panel-title"><h2>评测状态</h2><span id="evaluationState">无活动评测</span></div>
+            <div class="metric-grid evaluation-metrics">
+              <div><span>Policy</span><strong id="evaluationPolicy">-</strong></div>
+              <div><span>轮次</span><strong id="evaluationRound">-</strong></div>
+              <div><span>本轮时长</span><strong id="evaluationElapsed">-</strong></div>
+              <div><span>已完成</span><strong id="evaluationCompleted">0</strong></div>
+              <div><span>有效轮次</span><strong id="evaluationValid">0</strong></div>
+              <div><span>成功 / 失败 / 无效</span><strong id="evaluationResults">0 / 0 / 0</strong></div>
+              <div><span>成功率</span><strong id="evaluationRate">0/0</strong></div>
+              <div><span>超时 / 安全停止</span><strong id="evaluationStops">0 / 0</strong></div>
+              <div><span>Recorder 队列</span><strong id="evaluationRecorderQueue">-</strong></div>
+              <div><span>丢弃事件 / 帧</span><strong id="evaluationDrops">0 / 0</strong></div>
+            </div>
+            <dl class="evaluation-detail">
+              <div><dt>数据集</dt><dd id="evaluationDataset">-</dd></div>
+              <div><dt>最近停止原因</dt><dd id="evaluationStopTrigger">-</dd></div>
+              <div><dt>最新错误</dt><dd id="evaluationError">-</dd></div>
+            </dl>
+          </section>
+        </div>
+
+        <section class="panel evaluation-actions">
+          <div class="panel-title"><h2>轮次控制与人工判定</h2><span id="evaluationLegalActions">-</span></div>
+          <div class="button-row evaluation-button-row">
+            <button id="warmupEvaluationBtn" type="button">Policy 预热</button>
+            <button id="resetReadyBtn" type="button">复位完成</button>
+            <button id="startEpisodeBtn" type="button" class="primary">开始本轮</button>
+            <button id="stopEpisodeBtn" type="button" class="danger">停止本轮</button>
+          </div>
+          <div class="label-controls">
+            <label><span>失败原因</span><select id="failureReason"><option value="">选择失败原因</option><option value="NOT_REACHED">NOT_REACHED</option><option value="GRASP_FAILED">GRASP_FAILED</option><option value="LIFT_FAILED">LIFT_FAILED</option><option value="DROPPED_DURING_TRANSFER">DROPPED_DURING_TRANSFER</option><option value="PLACE_FAILED">PLACE_FAILED</option><option value="GRIPPER_ERROR">GRIPPER_ERROR</option><option value="VISION_ERROR">VISION_ERROR</option><option value="POLICY_ERROR">POLICY_ERROR</option><option value="ACTION_ERROR">ACTION_ERROR</option><option value="SAFETY_STOP">SAFETY_STOP</option><option value="OTHER">OTHER</option></select></label>
+            <label class="wide"><span>Operator Note</span><input id="operatorNote" type="text" /></label>
+            <div class="button-row"><button id="labelSuccessBtn" type="button" class="primary">标记成功</button><button id="labelFailureBtn" type="button" class="danger">标记失败</button><button id="labelInvalidBtn" type="button">标记无效</button></div>
+          </div>
         </section>
       </section>
 

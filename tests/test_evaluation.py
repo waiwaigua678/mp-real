@@ -16,6 +16,7 @@ from mp_real.data.lerobot_v21 import validate_lerobot_v21_dataset
 from mp_real.evaluation.service import EvaluationConflict, EvaluationRuntimeLease, EvaluationService
 from mp_real.runtime.config import InferenceLoopConfig
 from mp_real.runtime.controller import RuntimeController
+from mp_real.runtime.events import SafetyRejected
 from mp_real.runtime.models import ActionSpec, ObservationSnapshot, RobotState
 from mp_real.runtime.startup import PolicyStartupConfig
 from mp_real.web.server import PiperWebHandler, PiperWebServer
@@ -119,8 +120,9 @@ def _loop_config(prompt: str) -> InferenceLoopConfig:
 
 
 class _Broker:
-    def __init__(self, policy: _Policy) -> None:
+    def __init__(self, policy: _Policy, *, robot_name: str = "fake") -> None:
         self.robot = _Robot()
+        self.robot_name = robot_name
         self.policy = policy
         self.service: EvaluationService | None = None
         self.controller: RuntimeController | None = None
@@ -150,9 +152,9 @@ class _Broker:
 
         return EvaluationRuntimeLease(
             controller=controller,
-            runtime_config_snapshot={"robot": "fake", "prompt": "evaluation", "fps": 100.0},
+            runtime_config_snapshot={"robot": self.robot_name, "prompt": "evaluation", "fps": 100.0},
             action_spec_snapshot=dataclasses.asdict(self.robot.action_spec),
-            robot_name="fake",
+            robot_name=self.robot_name,
             make_adapter=lambda prompt: _Adapter(self.robot),
             make_loop_config=_loop_config,
             make_startup_config=lambda: PolicyStartupConfig(
@@ -183,8 +185,10 @@ def _wait_for_state(service: EvaluationService, expected: str, *, timeout: float
 
 
 class EvaluationServiceTests(unittest.TestCase):
-    def _service(self, *, policy: _Policy | None = None) -> tuple[EvaluationService, _Broker]:
-        broker = _Broker(policy or _Policy())
+    def _service(
+        self, *, policy: _Policy | None = None, robot_name: str = "fake"
+    ) -> tuple[EvaluationService, _Broker]:
+        broker = _Broker(policy or _Policy(), robot_name=robot_name)
         service = EvaluationService(broker)
         broker.service = service
         self.addCleanup(broker.close)
@@ -192,7 +196,13 @@ class EvaluationServiceTests(unittest.TestCase):
         return service, broker
 
     @staticmethod
-    def _create(service: EvaluationService, *, planned_episodes: int = 3, max_episode_seconds: float = 1.0) -> None:
+    def _create(
+        service: EvaluationService,
+        *,
+        robot_name: str | None = None,
+        planned_episodes: int = 3,
+        max_episode_seconds: float = 1.0,
+    ) -> None:
         service.create(
             {
                 "name": "three rounds",
@@ -201,6 +211,7 @@ class EvaluationServiceTests(unittest.TestCase):
                 "max_episode_seconds": max_episode_seconds,
                 "reset_mode": "manual",
                 "result_mode": "manual",
+                **({"robot_name": robot_name} if robot_name is not None else {}),
             }
         )
 
@@ -235,6 +246,41 @@ class EvaluationServiceTests(unittest.TestCase):
         self.assertEqual(status["summary"]["completed_episodes"], 3)
         self.assertEqual(status["summary"]["success_rate"], 1.0)
         self.assertIsNone(broker.owner)
+        self.assertEqual(service.complete()["state"], "COMPLETED")
+
+    def test_piper_and_rm2_fake_robots_complete_three_labeled_episodes(self) -> None:
+        for robot_name in ("piper", "rm2"):
+            with self.subTest(robot_name=robot_name):
+                service, _ = self._service(robot_name=robot_name)
+                self._create(service, robot_name=robot_name)
+                self._warm_and_reset(service)
+                for index in range(3):
+                    self._run_and_stop(service)
+                    status = service.label({"result": "SUCCESS"})
+                    if index < 2:
+                        self.assertEqual(status["state"], "WAITING_RESET")
+                        service.reset_ready()
+                self.assertEqual(service.current_or_raise()["state"], "COMPLETED")
+
+    def test_safety_abort_stops_before_manual_result(self) -> None:
+        service, broker = self._service()
+        self._create(service, planned_episodes=1)
+        self._warm_and_reset(service)
+        service.start_episode()
+        running = _wait_for_state(service, "RUNNING")
+        assert broker.controller is not None
+        active = running["active_episode"]
+        service.emit(
+            SafetyRejected(
+                runtime_id=broker.controller.runtime_id,
+                session_id=running["session_id"],
+                episode_id=active["episode_id"],
+                generation_id=active["generation_id"],
+            )
+        )
+        status = _wait_for_state(service, "WAITING_RESULT")
+        self.assertEqual(status["current_episode"]["stop_trigger"], "SAFETY_ABORT")
+        self.assertFalse(broker.controller.status().running)
 
     def test_warmup_failure_enters_error_without_actions(self) -> None:
         service, broker = self._service(policy=_Policy(error=RuntimeError("policy unavailable")))
@@ -290,6 +336,71 @@ class EvaluationServiceTests(unittest.TestCase):
             service.label({"result": "SUCCESS"})
         self.assertEqual(raised.exception.legal_operations, ("reset-ready", "abort"))
 
+    def test_two_concurrent_clients_only_accept_one_label(self) -> None:
+        service, _ = self._service()
+        self._create(service, planned_episodes=2)
+        self._warm_and_reset(service)
+        self._run_and_stop(service)
+        barrier = threading.Barrier(2)
+        outcomes: list[str] = []
+
+        def submit_label() -> None:
+            barrier.wait()
+            try:
+                service.label({"result": "SUCCESS"})
+                outcomes.append("accepted")
+            except EvaluationConflict:
+                outcomes.append("conflict")
+
+        clients = [threading.Thread(target=submit_label, daemon=False) for _ in range(2)]
+        for client in clients:
+            client.start()
+        for client in clients:
+            client.join(timeout=1.0)
+        self.assertCountEqual(outcomes, ["accepted", "conflict"])
+        self.assertEqual(service.current_or_raise()["summary"]["completed_episodes"], 1)
+
+    def test_duplicate_start_is_rejected_without_second_generation(self) -> None:
+        service, broker = self._service()
+        self._create(service)
+        self._warm_and_reset(service)
+        service.start_episode()
+        with self.assertRaises(EvaluationConflict):
+            service.start_episode()
+        status = _wait_for_state(service, "RUNNING")
+        assert broker.controller is not None
+        self.assertEqual(status["active_episode"]["generation_id"], broker.controller.status().generation_id)
+        service.stop_episode()
+        _wait_for_state(service, "WAITING_RESULT")
+
+    def test_recorder_flush_failure_marks_system_error_and_excludes_rate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            broker = _Broker(_Policy())
+            service = EvaluationService(broker, recording_root=directory)
+            broker.service = service
+            self.addCleanup(broker.close)
+            self.addCleanup(service.shutdown)
+            service.create(
+                {
+                    "name": "flush failure",
+                    "task_name": "pick-place",
+                    "planned_episodes": 1,
+                    "max_episode_seconds": 1.0,
+                    "save_data": True,
+                    "save_video": False,
+                }
+            )
+            self._warm_and_reset(service)
+            self._run_and_stop(service)
+            recorder = service._recorder
+            assert recorder is not None
+            recorder.flush = lambda *, timeout=5.0: False  # type: ignore[method-assign]
+            service.label({"result": "SUCCESS"})
+            status = _wait_for_state(service, "ERROR")
+            self.assertIn("Recorder did not flush", status["last_error"])
+            self.assertEqual(status["summary"]["success_rate_denominator"], 0)
+            service.shutdown()
+
     def test_save_data_finalizes_lerobot_dataset_off_the_control_thread(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             broker = _Broker(_Policy())
@@ -310,7 +421,8 @@ class EvaluationServiceTests(unittest.TestCase):
             self._warm_and_reset(service)
             self._run_and_stop(service)
             status = service.label({"result": "SUCCESS"})
-            self.assertEqual(status["state"], "COMPLETED")
+            self.assertEqual(status["state"], "SAVING")
+            status = _wait_for_state(service, "COMPLETED", timeout=5.0)
             deadline = time.monotonic() + 5.0
             datasets = []
             while time.monotonic() < deadline:
@@ -325,6 +437,14 @@ class EvaluationServiceTests(unittest.TestCase):
             )
             report = validate_lerobot_v21_dataset(datasets[0], check_videos=False)
             self.assertTrue(report.valid, report.errors)
+            label_path = datasets[0] / "meta/mp_real/episode_labels.jsonl"
+            labels = [json.loads(line) for line in label_path.read_text().splitlines()]
+            self.assertEqual(labels[0]["result"], "SUCCESS")
+            self.assertEqual(labels[0]["prompt"], "evaluation")
+            info = json.loads((datasets[0] / "meta/info.json").read_text())
+            evaluation_snapshot = info["mp_real"]["runtime_config"]["evaluation"]
+            self.assertEqual(evaluation_snapshot["task_name"], "pick-place")
+            self.assertEqual(evaluation_snapshot["action_spec_snapshot"]["action_dim"], 2)
 
     def test_save_data_abort_without_episode_keeps_recovery_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -397,6 +517,13 @@ class EvaluationServiceTests(unittest.TestCase):
         created = connection.getresponse()
         self.assertEqual(created.status, 200)
         created.read()
+
+        connection.request("GET", "/api/evaluations/current")
+        restored = connection.getresponse()
+        restored_body = json.loads(restored.read())
+        self.assertEqual(restored.status, 200)
+        self.assertEqual(restored_body["evaluation"]["state"], "PREPARING")
+        self.assertEqual(restored_body["evaluation"]["session_id"], restored_body["evaluation"]["evaluation_id"])
 
         connection.request("POST", "/api/evaluations/current/reset-ready", "{}", {"Content-Type": "application/json"})
         response = connection.getresponse()

@@ -17,6 +17,7 @@ import logging
 import os
 import pathlib
 import secrets
+import subprocess
 import threading
 import time
 from typing import Any
@@ -77,6 +78,23 @@ RESET_LEFT_JOINTS = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 RESET_RIGHT_JOINTS = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 RESET_LEFT_GRIPPER = 1.0
 RESET_RIGHT_GRIPPER = 1.0
+
+
+def _git_commit() -> str | None:
+    """Best-effort source revision for immutable evaluation metadata."""
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=pathlib.Path(__file__).resolve().parents[3],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    commit = completed.stdout.strip()
+    return commit or None
 
 CONNECTION_CONFIG_FIELDS = {
     "runtime_mode",
@@ -557,6 +575,8 @@ class RobotWebRuntime:
             controller = self._controller
             args = copy.deepcopy(self._args)
             runtime_snapshot = self.get_config()
+            runtime_snapshot["policy_metadata"] = _json_safe(self._server_metadata or {})
+            runtime_snapshot["git_commit"] = _git_commit()
             action_spec_snapshot = dataclasses.asdict(controller.robot.action_spec)
             startup_config = self._policy_startup_config_locked()
             self._evaluation_owner = evaluation_id
@@ -1839,6 +1859,8 @@ class _LegacyRm2WebRuntime:
             controller = self._controller
             args = copy.deepcopy(self._args)
             runtime_snapshot = self.get_config()
+            runtime_snapshot["policy_metadata"] = {}
+            runtime_snapshot["git_commit"] = _git_commit()
             action_spec_snapshot = dataclasses.asdict(controller.robot.action_spec)
             startup_config = PolicyStartupConfig(
                 warmup_timeout_s=self._policy_timeout,
@@ -2284,7 +2306,10 @@ class PiperWebHandler(BaseHTTPRequestHandler):
             pass
         except Exception as exc:
             logging.exception("GET failed")
-            self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            self._send_json(
+                {"ok": False, "error": f"{type(exc).__name__}: {exc}", "error_type": type(exc).__name__},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -2308,6 +2333,8 @@ class PiperWebHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "evaluation": evaluation})
             elif path == "/api/evaluations/current/abort":
                 self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.abort()})
+            elif path == "/api/evaluations/current/complete":
+                self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.complete()})
             elif path == "/api/config":
                 self._send_json({"ok": True, "config": self.server.runtime.update_config(self._read_json())})
             elif path == "/api/connect":
@@ -2338,7 +2365,10 @@ class PiperWebHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except Exception as exc:
             logging.exception("POST failed")
-            self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            self._send_json(
+                {"ok": False, "error": f"{type(exc).__name__}: {exc}", "error_type": type(exc).__name__},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))

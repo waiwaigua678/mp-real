@@ -190,8 +190,20 @@ class EvaluationSession:
             self._episodes.append(self._active_episode)
             self._active_episode = None
             self._episode_start_pending = False
+
+    def saving_succeeded(self) -> None:
+        """Advance only after the recorder has durably accepted the label.
+
+        ``label`` deliberately leaves the session in ``SAVING``.  The
+        orchestration service calls this method after its recorder flush (and,
+        for the final episode, dataset finalization) has completed.  Keeping
+        this boundary in the existing state machine prevents a following
+        episode from racing a still-writing previous episode.
+        """
+        with self._lock:
+            self._require_internal(EvaluationState.SAVING)
             if len(self._episodes) >= self.config.planned_episodes:
-                self._transition(EvaluationState.COMPLETED)
+                self._transition(EvaluationState.COMPLETED, "all labeled episodes saved")
             else:
                 # Both auto and operator-driven advance require a fresh manual
                 # reset acknowledgement before the next action loop can begin.
@@ -232,7 +244,7 @@ class EvaluationSession:
         with self._lock:
             if self._state in self._TERMINAL_STATES:
                 return
-            self._error = str(error)
+            self._error = error if isinstance(error, str) else f"{type(error).__name__}: {error}"
             if self._active_episode is not None:
                 self._active_episode.result = EvaluationResult.SYSTEM_ERROR
                 self._active_episode.stopped_at_monotonic_ns = (
@@ -240,6 +252,12 @@ class EvaluationSession:
                 )
                 self._episodes.append(self._active_episode)
                 self._active_episode = None
+            elif self._state is EvaluationState.SAVING and self._episodes:
+                # The most recent manual label was not durably saved.  Keep
+                # the episode for auditability, but do not score it as a
+                # successful/failed operator-valid trial.
+                self._episodes[-1].result = EvaluationResult.SYSTEM_ERROR
+                self._episodes[-1].failure_reason = None
             self._episode_start_pending = False
             self._transition(EvaluationState.ERROR, self._error)
 
@@ -249,15 +267,18 @@ class EvaluationSession:
             active = dataclasses.replace(self._active_episode) if self._active_episode is not None else None
             return {
                 "evaluation_id": self.config.evaluation_id,
+                "session_id": self.config.evaluation_id,
                 "state": self._state.value,
                 "config": self.config.to_dict(),
                 "created_at_monotonic_ns": self._created_at_monotonic_ns,
                 "updated_at_monotonic_ns": self._updated_at_monotonic_ns,
                 "error": self._error,
+                "last_error": self._error,
                 "legal_operations": list(self.legal_operations()),
                 "episode_start_pending": self._episode_start_pending,
                 "abort_requested": self._abort_requested,
                 "active_episode": active.to_dict() if active is not None else None,
+                "current_episode": active.to_dict() if active is not None else None,
                 "episodes": [episode.to_dict() for episode in completed],
                 "summary": build_summary(completed, planned_episodes=self.config.planned_episodes),
                 "transitions": [transition.to_dict() for transition in self._transitions],

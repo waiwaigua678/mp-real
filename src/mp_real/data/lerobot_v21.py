@@ -246,6 +246,13 @@ def _build_info(
         if config.save_video
         else None,
         "features": _build_features(config, camera_shapes, require_camera_shapes=require_camera_shapes),
+        "mp_real": {
+            "schema_version": 1,
+            "session_id": config.session_id,
+            "operator": config.operator,
+            "policy_label": config.policy_label,
+            "runtime_config": dict(config.runtime_config),
+        },
     }
 
 
@@ -554,6 +561,14 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
             return self._queue_high_watermark
 
     @property
+    def queue_depth(self) -> int:
+        return self._queue.qsize()
+
+    @property
+    def queue_capacity(self) -> int:
+        return self.config.queue_size
+
+    @property
     def failure(self) -> BaseException | None:
         with self._lock:
             return self._failure
@@ -657,6 +672,7 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
         episode_stats: dict[int, dict[str, object]] = {}
         video_info: dict[str, object] = {}
         labels: dict[int, dict[str, object]] = {}
+        persisted_labels: set[int] = set()
         observations: dict[int, Mapping[str, object]] = {}
         selected_actions: dict[tuple[int, int], np.ndarray] = {}
         stabilized_actions: dict[tuple[int, int], np.ndarray] = {}
@@ -789,12 +805,35 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
                             labels[context.episode_index].setdefault("result", "INVALID")
                             labels[context.episode_index].setdefault("failure_reason", invalid_reason)
                     elif kind == "label":
-                        labels[int(item[1])] = dict(item[2])  # type: ignore[index]
+                        episode_index = int(item[1])  # type: ignore[index]
+                        context = contexts.get(episode_index)
+                        if context is None:
+                            raise ValueError(f"Cannot label unknown episode index: {episode_index}")
+                        labels[episode_index] = dict(item[2])  # type: ignore[index]
+                        _append_jsonl(
+                            self._work_root / "meta" / "mp_real" / "episode_labels.jsonl",
+                            {
+                                "session_id": context.session_id or self.config.session_id,
+                                "episode_index": episode_index,
+                                "source_episode_id": context.episode_id,
+                                "created_at": time.time(),
+                                **labels[episode_index],
+                            },
+                        )
+                        persisted_labels.add(episode_index)
                     elif kind == "flush":
                         item[1].set()  # type: ignore[index]
                     elif kind == "stop":
                         if item[1]:
-                            self._finalize(episodes, contexts, episode_stats, video_info, labels, tasks)
+                            self._finalize(
+                                episodes,
+                                contexts,
+                                episode_stats,
+                                video_info,
+                                labels,
+                                persisted_labels,
+                                tasks,
+                            )
                         else:
                             self._write_recovery("Recorder stopped without finalization")
                         return
@@ -836,6 +875,7 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
         episode_stats: Mapping[int, Mapping[str, object]],
         video_info: Mapping[str, object],
         labels: Mapping[int, Mapping[str, object]],
+        persisted_labels: set[int],
         tasks: Mapping[str, int],
     ) -> None:
         if any(writer.frame_count == 0 for writer in episodes.values()):
@@ -868,14 +908,15 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
                 self._work_root / "meta" / "episodes_stats.jsonl",
                 {"episode_index": episode_index, "stats": episode_stats[episode_index]},
             )
-            label = {
-                "session_id": context.session_id or self.config.session_id,
-                "episode_index": episode_index,
-                "source_episode_id": context.episode_id,
-                "created_at": time.time(),
-                **dict(labels.get(episode_index, {})),
-            }
-            _append_jsonl(self._work_root / "meta" / "mp_real" / "episode_labels.jsonl", label)
+            if episode_index not in persisted_labels:
+                label = {
+                    "session_id": context.session_id or self.config.session_id,
+                    "episode_index": episode_index,
+                    "source_episode_id": context.episode_id,
+                    "created_at": time.time(),
+                    **dict(labels.get(episode_index, {})),
+                }
+                _append_jsonl(self._work_root / "meta" / "mp_real" / "episode_labels.jsonl", label)
         _write_json(self._work_root / "meta" / "stats.json", _aggregate_stats(episode_stats.values()))
         _write_json(
             self._work_root / "meta" / "mp_real" / "recording_summary.json",
@@ -883,6 +924,7 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
                 "dropped_event_count": self.dropped_event_count,
                 "dropped_frame_count": self.dropped_frame_count,
                 "queue_high_watermark": self.queue_high_watermark,
+                "queue_capacity": self.queue_capacity,
             },
         )
         self._write_recovery("finalization complete")

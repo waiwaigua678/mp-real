@@ -71,6 +71,7 @@ class EvaluationConfig:
     operator: str | None
     tags: tuple[str, ...]
     notes: str
+    storage_root: str | None
     runtime_config_snapshot: Mapping[str, Any]
     action_spec_snapshot: Mapping[str, Any]
 
@@ -135,6 +136,7 @@ class EvaluationConfig:
             operator=optional_text("operator"),
             tags=tags,
             notes=str(payload.get("notes", "")),
+            storage_root=optional_text("storage_root"),
             runtime_config_snapshot=runtime_config_snapshot,
             action_spec_snapshot=action_spec_snapshot,
         )

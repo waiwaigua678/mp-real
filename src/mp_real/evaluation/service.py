@@ -77,6 +77,8 @@ class EvaluationService(RuntimeEventSink):
         self._warmup_thread: threading.Thread | None = None
         self._start_thread: threading.Thread | None = None
         self._watchdog_thread: threading.Thread | None = None
+        self._stop_finalize_thread: threading.Thread | None = None
+        self._label_save_thread: threading.Thread | None = None
         self._warmup_stop_event = threading.Event()
         self._start_stop_event = threading.Event()
         self._watchdog_stop_event = threading.Event()
@@ -85,6 +87,7 @@ class EvaluationService(RuntimeEventSink):
         self._recording_failure: str | None = None
         self._recording_has_completed_episode = False
         self._recording_episode_active = False
+        self._policy_warmed_up = False
 
     @property
     def requires_observation_images(self) -> bool:
@@ -130,11 +133,15 @@ class EvaluationService(RuntimeEventSink):
             self._recording_failure = None
             self._recording_has_completed_episode = False
             self._recording_episode_active = False
+            self._policy_warmed_up = False
             if config.save_data:
                 dataset_name = _safe_dataset_name(config.name, session.session_id)
+                recording_root = _recording_root(self._recording_root, config.storage_root)
+                recorder_runtime_config = dict(config.runtime_config_snapshot)
+                recorder_runtime_config["evaluation"] = config.to_dict()
                 self._recorder = LeRobotV21EpisodeRecorder(
                     RecorderConfig(
-                        dataset_root=self._recording_root / dataset_name,
+                        dataset_root=recording_root / dataset_name,
                         dataset_name=dataset_name,
                         robot_name=config.robot_name,
                         fps=float(config.runtime_config_snapshot.get("fps", 10.0)),
@@ -143,7 +150,7 @@ class EvaluationService(RuntimeEventSink):
                         session_id=session.session_id,
                         operator=config.operator,
                         policy_label=config.policy_label,
-                        runtime_config=config.runtime_config_snapshot,
+                        runtime_config=recorder_runtime_config,
                     ),
                     on_failure=lambda error: self._on_recorder_failure(lease.controller, error),
                 )
@@ -234,19 +241,48 @@ class EvaluationService(RuntimeEventSink):
                 lambda: session.label(result, failure_reason=failure_reason, notes=str(payload.get("notes", "")))
             )
             recorder = self._recorder
+            completed_episode = session.snapshot()["episodes"][-1]
+            label = {
+                "result": result.value,
+                "failure_reason": failure_reason.value if failure_reason is not None else None,
+                "stop_trigger": completed_episode["stop_trigger"],
+                "operator": session.config.operator,
+                "notes": str(payload.get("notes", "")),
+                "task_name": session.config.task_name,
+                "prompt": session.config.prompt,
+            }
             if recorder is not None:
-                completed_episode = session.snapshot()["episodes"][-1]
                 recorder.set_episode_label(
                     int(completed_episode["episode_index"]) - 1,
-                    {
-                        "result": result.value,
-                        "failure_reason": failure_reason.value if failure_reason is not None else None,
-                        "operator": session.config.operator,
-                        "notes": str(payload.get("notes", "")),
-                    },
+                    label,
                 )
-            self._maybe_finalize_recorder_locked()
-            self._release_if_terminal_locked()
+                self._start_label_save_locked(
+                    session.session_id,
+                    recorder,
+                    is_final_episode=int(completed_episode["episode_index"]) >= session.config.planned_episodes,
+                )
+            else:
+                session.saving_succeeded()
+                self._release_if_terminal_locked()
+            return self._snapshot_locked()
+
+    def complete(self) -> dict[str, Any]:
+        """Confirm an automatically completed, durably saved evaluation.
+
+        Completion is intentionally never a user-controlled state transition:
+        the final label and recorder flush produce ``COMPLETED``.  This API is
+        idempotent so the UI can safely bind its final confirmation button.
+        """
+        with self._lock:
+            if self._session is None:
+                raise EvaluationConflict("No current evaluation session", legal_operations=("create",))
+            if self._session.state is not EvaluationState.COMPLETED:
+                raise EvaluationConflict(
+                    f"Evaluation is {self._session.state.value}",
+                    legal_operations=self._session.legal_operations(),
+                )
+            if self._label_save_thread is not None and self._label_save_thread.is_alive():
+                raise EvaluationConflict("Episode data is still being finalized", legal_operations=("abort",))
             return self._snapshot_locked()
 
     def abort(self) -> dict[str, Any]:
@@ -287,7 +323,13 @@ class EvaluationService(RuntimeEventSink):
                 self._release_if_terminal_locked(force=True)
         incomplete = [
             attribute
-            for attribute in ("_warmup_thread", "_start_thread", "_watchdog_thread")
+            for attribute in (
+                "_warmup_thread",
+                "_start_thread",
+                "_watchdog_thread",
+                "_stop_finalize_thread",
+                "_label_save_thread",
+            )
             if not self._join_worker(attribute, timeout)
         ]
         if incomplete:
@@ -298,7 +340,6 @@ class EvaluationService(RuntimeEventSink):
     def emit(self, event: RuntimeEvent) -> None:
         """Receive copied runtime events through the controller event sink."""
         controller_to_stop: RuntimeController | None = None
-        recorder_to_end: LeRobotV21EpisodeRecorder | None = None
         recorder_event: LeRobotV21EpisodeRecorder | None = None
         with self._lock:
             session = self._session
@@ -335,28 +376,21 @@ class EvaluationService(RuntimeEventSink):
                 error_type = event.payload.get("error_type", "RuntimeFailed")
                 message = event.payload.get("message", "runtime failed")
                 session.fail(f"{error_type}: {message}")
+                controller_to_stop = lease.controller
             elif isinstance(event, RuntimeStopped):
                 self._watchdog_stop_event.set()
-                if session.abort_requested:
-                    session.finish_abort()
-                else:
-                    session.runtime_stopped(stopped_at_monotonic_ns=event.monotonic_timestamp_ns)
-                recorder_to_end = self._recorder
-                self._recording_has_completed_episode = recorder_to_end is not None
-                self._recording_episode_active = False
-                # RuntimeStopped is emitted after the policy loop has left its
-                # action path, even though RuntimeController may update its
-                # status field a few instructions later.
-                self._release_if_terminal_locked(force=True)
+                self._start_stop_finalization_locked(
+                    session.session_id,
+                    event.episode_id,
+                    lease.controller,
+                    self._recorder,
+                    event.monotonic_timestamp_ns,
+                )
 
         if controller_to_stop is not None:
             controller_to_stop.stop(wait=False)
         if recorder_event is not None:
             recorder_event.emit(event)
-        if recorder_to_end is not None:
-            recorder_to_end.end_episode()
-            with self._lock:
-                self._maybe_finalize_recorder_locked()
 
     def current_or_raise(self) -> dict[str, Any]:
         status = self.current()
@@ -380,14 +414,144 @@ class EvaluationService(RuntimeEventSink):
             "dropped_event_count": recorder.dropped_event_count if recorder is not None else 0,
             "dropped_frame_count": recorder.dropped_frame_count if recorder is not None else 0,
             "queue_high_watermark": recorder.queue_high_watermark if recorder is not None else 0,
+            "queue_depth": recorder.queue_depth if recorder is not None else 0,
+            "queue_capacity": recorder.queue_capacity if recorder is not None else 0,
             "failure": self._recording_failure,
+        }
+        active = snapshot["current_episode"]
+        if active is not None and active["started_at_monotonic_ns"] is not None:
+            snapshot["current_episode_elapsed_s"] = max(
+                0.0,
+                (time.monotonic_ns() - int(active["started_at_monotonic_ns"])) / 1e9,
+            )
+        else:
+            snapshot["current_episode_elapsed_s"] = None
+        snapshot["policy_startup"] = {
+            "phase": "READY" if self._policy_warmed_up else snapshot["state"],
+            "warmed_up": self._policy_warmed_up,
         }
         return snapshot
 
     def _on_recorder_failure(self, controller: RuntimeController, error: BaseException) -> None:
         with self._lock:
             self._recording_failure = f"{type(error).__name__}: {error}"
+            if self._session is not None and not self._session.is_terminal:
+                self._session.fail(error)
         controller.stop(wait=False)
+
+    def _start_stop_finalization_locked(
+        self,
+        session_id: str,
+        episode_id: str | None,
+        controller: RuntimeController,
+        recorder: LeRobotV21EpisodeRecorder | None,
+        stopped_at_monotonic_ns: int,
+    ) -> None:
+        """Join the action loop before exposing a manual result control."""
+        if self._stop_finalize_thread is not None and self._stop_finalize_thread.is_alive():
+            return
+        self._stop_finalize_thread = threading.Thread(
+            target=self._finalize_stopped_episode,
+            args=(session_id, episode_id, controller, recorder, stopped_at_monotonic_ns),
+            name=f"evaluation-stop-finalize-{session_id}",
+            daemon=False,
+        )
+        self._stop_finalize_thread.start()
+
+    def _finalize_stopped_episode(
+        self,
+        session_id: str,
+        episode_id: str | None,
+        controller: RuntimeController,
+        recorder: LeRobotV21EpisodeRecorder | None,
+        stopped_at_monotonic_ns: int,
+    ) -> None:
+        error: BaseException | None = None
+        try:
+            if not controller.join(timeout=10.0, raise_on_error=False):
+                raise TimeoutError("Runtime controller did not exit after RuntimeStopped")
+            controller.raise_if_failed()
+        except BaseException as exc:
+            error = exc
+
+        try:
+            if recorder is not None:
+                recorder.end_episode()
+        except BaseException as exc:
+            error = error or exc
+
+        with self._lock:
+            session = self._session
+            if session is None or session.session_id != session_id:
+                return
+            if error is not None:
+                if recorder is not None and self._recording_failure is None:
+                    self._recording_failure = f"{type(error).__name__}: {error}"
+                if not session.is_terminal:
+                    session.fail(error)
+            elif session.abort_requested:
+                session.finish_abort()
+            elif session.state is EvaluationState.STOPPING:
+                # The identity was already checked on event reception; retain
+                # it in the worker signature to make stale completions
+                # inspectable and reject a changed active episode defensively.
+                if episode_id is None or episode_id == session.active_episode_id:
+                    session.runtime_stopped(stopped_at_monotonic_ns=stopped_at_monotonic_ns)
+            self._recording_has_completed_episode = recorder is not None
+            self._recording_episode_active = False
+            self._maybe_finalize_recorder_locked()
+            if self._stop_finalize_thread is threading.current_thread():
+                self._stop_finalize_thread = None
+            self._release_if_terminal_locked(force=True)
+
+    def _start_label_save_locked(
+        self,
+        session_id: str,
+        recorder: LeRobotV21EpisodeRecorder,
+        *,
+        is_final_episode: bool,
+    ) -> None:
+        if self._label_save_thread is not None and self._label_save_thread.is_alive():
+            raise RuntimeError("A previous evaluation label is still saving")
+        self._label_save_thread = threading.Thread(
+            target=self._flush_label,
+            args=(session_id, recorder, is_final_episode),
+            name=f"evaluation-label-save-{session_id}",
+            daemon=False,
+        )
+        self._label_save_thread.start()
+
+    def _flush_label(
+        self,
+        session_id: str,
+        recorder: LeRobotV21EpisodeRecorder,
+        is_final_episode: bool,
+    ) -> None:
+        error: BaseException | None = None
+        try:
+            if not recorder.flush(timeout=30.0):
+                raise TimeoutError("Recorder did not flush the episode label")
+            recorder.raise_if_failed()
+            if is_final_episode:
+                if not recorder.stop(finalize=True, timeout=30.0):
+                    raise TimeoutError("Recorder did not finalize the evaluation dataset")
+                recorder.raise_if_failed()
+        except BaseException as exc:
+            error = exc
+
+        with self._lock:
+            session = self._session
+            if session is not None and session.session_id == session_id:
+                if error is not None:
+                    self._recording_failure = f"{type(error).__name__}: {error}"
+                    if not session.is_terminal:
+                        session.fail(error)
+                    self._maybe_finalize_recorder_locked()
+                elif session.state is EvaluationState.SAVING:
+                    session.saving_succeeded()
+            if self._label_save_thread is threading.current_thread():
+                self._label_save_thread = None
+            self._release_if_terminal_locked()
 
     def _maybe_finalize_recorder_locked(self) -> None:
         session = self._session
@@ -415,6 +579,7 @@ class EvaluationService(RuntimeEventSink):
             with self._lock:
                 if self._recording_finalize_thread is threading.current_thread():
                     self._recording_finalize_thread = None
+                self._release_if_terminal_locked()
 
     def _run_warmup(
         self,
@@ -463,6 +628,7 @@ class EvaluationService(RuntimeEventSink):
                     session.finish_abort()
                 elif session.state is EvaluationState.WARMING_UP:
                     session.warmup_succeeded()
+                    self._policy_warmed_up = True
                 self._maybe_finalize_recorder_locked()
                 self._release_if_terminal_locked()
         except PolicyStartupCancelled:
@@ -641,7 +807,14 @@ class EvaluationService(RuntimeEventSink):
     def _release_if_terminal_locked(self, *, force: bool = False) -> None:
         if self._session is None or self._lease is None or not self._session.is_terminal:
             return
-        workers = (self._warmup_thread, self._start_thread)
+        workers = (
+            self._warmup_thread,
+            self._start_thread,
+            self._watchdog_thread,
+            self._stop_finalize_thread,
+            self._label_save_thread,
+            self._recording_finalize_thread,
+        )
         if any(worker is not None and worker.is_alive() for worker in workers):
             return
         controller_status = self._lease.controller.status()
@@ -673,3 +846,13 @@ class EvaluationService(RuntimeEventSink):
 def _safe_dataset_name(name: str, session_id: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", name.strip()).strip(".-")
     return f"{normalized or 'evaluation'}-{session_id}"
+
+
+def _recording_root(default_root: pathlib.Path, requested_root: str | None) -> pathlib.Path:
+    """Resolve an optional operator-visible storage root once per session."""
+    if requested_root is None:
+        return default_root
+    candidate = pathlib.Path(requested_root).expanduser()
+    if not candidate.is_absolute():
+        candidate = default_root / candidate
+    return candidate.resolve(strict=False)
