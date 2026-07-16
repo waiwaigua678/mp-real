@@ -174,6 +174,27 @@ the optional `meta/mp_real/` or `telemetry/` extensions. `mp-data-validate`
 returns a non-zero status for schema, timestamp, Parquet, metadata or video
 alignment errors.
 
+### Offline data viewer
+
+Use the dedicated read-only Episode Viewer for synchronized LeRobot v2.1
+videos, state/action curves, runtime events, metrics, and a draggable sample
+timeline. It is intentionally separate from real-robot trajectory replay:
+the process imports no robot SDK and never creates a Robot, Camera, or
+PolicyClient.
+
+```bash
+uv run mp-data-view \
+  --storage-root /home/pc4/.cache/huggingface/lerobot/local/piper_1armblowv01 \
+  --dataset piper_1armblowv01 \
+  --episode 0
+```
+
+Open `http://127.0.0.1:8766`. A storage root may instead contain multiple
+dataset directories; the UI exposes only catalog-generated dataset IDs, never
+arbitrary frontend file paths. Standard LeRobot datasets remain viewable when
+mp-real telemetry is absent; those unavailable fields are displayed as
+unrecorded rather than inferred.
+
 ### Policy warmup and first action
 
 Deployment exposes separate connection, metadata, warmup and steady-inference

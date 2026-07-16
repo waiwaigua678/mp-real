@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from mp_real.data.lerobot_v21 import CODEBASE_VERSION, validate_lerobot_v21_dataset
+from mp_real.data.lerobot_v21 import CODEBASE_VERSION
 from mp_real.data.models import EpisodeStatus
 
 
@@ -74,7 +74,14 @@ class RecordedDataCatalog:
         for root in self._roots:
             if not root.is_dir():
                 continue
-            for candidate in sorted(path for path in root.iterdir() if path.is_dir()):
+            # A CLI user may point a storage root directly at one dataset, while
+            # normal recording storage contains one dataset directory per child.
+            # Supporting both forms keeps the catalog boundary path-safe without
+            # requiring a browser to ever submit a filesystem path.
+            candidates = [root] if (root / "meta" / "info.json").is_file() else sorted(
+                path for path in root.iterdir() if path.is_dir()
+            )
+            for candidate in candidates:
                 info_path = candidate / "meta" / "info.json"
                 if not info_path.is_file():
                     continue
@@ -120,8 +127,10 @@ class RecordedDataCatalog:
         elif incomplete:
             state = EpisodeStatus.INCOMPLETE
         else:
-            report = validate_lerobot_v21_dataset(candidate, check_videos=False)
-            state = EpisodeStatus.COMPLETE if report.valid else EpisodeStatus.CORRUPTED
+            # Catalog pages must stay cheap: validating every Parquet row while
+            # listing a storage root makes a large local archive unusable.  The
+            # explicit validator remains responsible for deep integrity checks.
+            state = EpisodeStatus.COMPLETE
         is_mp_real = (candidate / "meta" / "mp_real" / "schema.json").is_file()
         episodes_json = _read_jsonl(candidate / "meta" / "episodes.jsonl")
         labels = {

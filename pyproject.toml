@@ -61,6 +61,7 @@ mp-real-web = "mp_real.web.server:main"
 mp-camera-preview = "mp_real.web.camera_preview:main"
 mp-data-inspect = "mp_real.data.cli:inspect_cli"
 mp-data-validate = "mp_real.data.cli:validate_cli"
+mp-data-view = "mp_real.data.view_server:main"
 
 [build-system]
 requires = ["hatchling>=1.25"]

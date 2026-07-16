@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>离线数据查看 · mp-real</title>
+    <link rel="stylesheet" href="/static/data_view.css" />
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1>离线数据查看</h1>
+        <p>Episode 查看器 · 只读模式：不会创建 Robot、Camera 或 PolicyClient。</p>
+      </div>
+      <span class="readonly">READ ONLY</span>
+    </header>
+    <main>
+      <section class="card controls">
+        <label>数据集<select id="datasetSelect"></select></label>
+        <label>Episode<select id="episodeSelect"></select></label>
+        <div class="episode-meta" id="episodeMeta">正在载入数据目录…</div>
+      </section>
+
+      <section class="card playback">
+        <div class="playback-buttons">
+          <button id="jumpStart" type="button">⏮ 开始</button>
+          <button id="previousFrame" type="button">◀ 上一帧</button>
+          <button id="playPause" type="button" class="primary">▶ 播放</button>
+          <button id="nextFrame" type="button">下一帧 ▶</button>
+          <button id="jumpEnd" type="button">结束 ⏭</button>
+          <label class="rate">速度<select id="playbackRate"><option value="0.25">0.25x</option><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option></select></label>
+        </div>
+        <input id="progress" type="range" min="0" max="0" value="0" step="1" aria-label="Episode sample progress" />
+        <div class="current-line" id="currentLine">sample 0</div>
+      </section>
+
+      <div class="notice" id="message"></div>
+
+      <section>
+        <div class="section-heading"><h2>同步相机</h2><span>以 sample index 对齐；缺失帧不会插值。</span></div>
+        <div class="camera-grid" id="cameraGrid"></div>
+      </section>
+
+      <section class="two-column">
+        <article class="card">
+          <h2>当前 sample</h2>
+          <dl class="sample-details" id="sampleDetails"></dl>
+          <div class="sample-actions">
+            <button id="selectSample" type="button" class="primary">选择当前样本</button>
+            <button type="button" disabled title="阶段 8 仅查看数据">移动到此状态（仅离线预检）</button>
+            <button type="button" disabled title="阶段 8 不连接 Policy">从此状态开始推理</button>
+            <button type="button" disabled title="阶段 8 不执行真实机器人回放">从此处开始真机回放</button>
+          </div>
+          <div class="selected" id="selectionState">尚未选择 sample</div>
+        </article>
+        <article class="card">
+          <h2>基础指标</h2>
+          <dl class="metrics" id="metrics"></dl>
+        </article>
+      </section>
+
+      <section class="card">
+        <div class="section-heading">
+          <div><h2>状态与动作曲线</h2><span>有界降采样保留首尾、局部极值、异常峰值和事件附近点。</span></div>
+          <label class="curve-picker">显示<select id="curveSeries" multiple size="4"><option value="state">robot state</option><option value="action" selected>expert action</option><option value="selected_raw_action">selected raw action</option><option value="stabilized_action">stabilized action</option><option value="executed_action">executed action</option><option value="inference_latency">inference latency</option><option value="control_cycle">control cycle</option><option value="camera_skew">camera skew</option><option value="action_jump">action jump</option><option value="jerk">jerk</option><option value="safety_modification">safety modification</option></select></label>
+        </div>
+        <div id="curveLegend" class="legend"></div>
+        <svg id="curveChart" viewBox="0 0 900 280" preserveAspectRatio="none" role="img" aria-label="Episode curves"></svg>
+      </section>
+
+      <section class="card">
+        <div class="section-heading"><h2>Runtime events</h2><span>点击事件可跳转到对应 sample。</span></div>
+        <div class="event-list" id="eventList"></div>
+      </section>
+    </main>
+    <script src="/static/data_view.js"></script>
+  </body>
+</html>

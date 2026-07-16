@@ -23,12 +23,15 @@ from mp_real.data.models import (
     RecordedSample,
     RecorderConfig,
 )
+from mp_real.data.view import DataViewSession, EpisodeReader, PlaybackCursor, TimelineIndex, ViewCursor
 
 __all__ = [
     "DatasetMetadata",
+    "DataViewSession",
     "EpisodeMetadata",
     "EpisodeRecordingContext",
     "EpisodeStatus",
+    "EpisodeReader",
     "FakeRecordedEpisodeSource",
     "LeRobotV21EpisodeRecorder",
     "LeRobotV21EpisodeSource",
@@ -36,6 +39,9 @@ __all__ = [
     "RecordedEpisodeSource",
     "RecordedSample",
     "RecorderConfig",
+    "PlaybackCursor",
+    "TimelineIndex",
     "ValidationReport",
+    "ViewCursor",
     "validate_lerobot_v21_dataset",
 ]

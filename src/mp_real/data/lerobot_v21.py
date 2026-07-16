@@ -983,7 +983,10 @@ class LeRobotV21EpisodeSource(RecordedEpisodeSource):
             int(item["episode_index"]): item
             for item in _load_jsonl(self._root / "meta" / "mp_real" / "episode_labels.jsonl")
         }
-        self._table_cache: dict[int, pa.Table] = {}
+        # Keep Parquet metadata/handles, never a decoded full-episode table.
+        # A recording may have a very long episode, and the viewer only needs a
+        # bounded row batch for a selected sample or curve aggregation.
+        self._parquet_files: dict[int, pq.ParquetFile] = {}
         self._status = (
             EpisodeStatus.INCOMPLETE
             if self._root.name.endswith(".inprogress")
@@ -1007,11 +1010,13 @@ class LeRobotV21EpisodeSource(RecordedEpisodeSource):
 
     def get_episode_metadata(self, episode_index: int) -> EpisodeMetadata:
         item = self._episodes[episode_index]
+        declared_length = int(item["length"])
+        actual_length = self.get_length(episode_index)
         return EpisodeMetadata(
             episode_index=episode_index,
-            length=int(item["length"]),
+            length=actual_length,
             tasks=tuple(str(task) for task in item.get("tasks", ())),
-            status=self._status,
+            status=EpisodeStatus.INCOMPLETE if actual_length < declared_length else self._status,
             labels=self._labels.get(episode_index),
         )
 
@@ -1029,17 +1034,20 @@ class LeRobotV21EpisodeSource(RecordedEpisodeSource):
         )
 
     def get_length(self, episode_index: int) -> int:
-        return int(self._episodes[episode_index]["length"])
+        declared_length = int(self._episodes[episode_index]["length"])
+        path = self._root / _data_path(episode_index)
+        if not path.is_file():
+            return 0
+        return min(declared_length, self._parquet_file(episode_index).metadata.num_rows)
 
-    def get_sample(self, episode_index: int, index: int) -> RecordedSample:
-        table = self._table(episode_index)
-        if index < 0 or index >= len(table):
+    def get_sample(self, episode_index: int, index: int, *, include_images: bool = True) -> RecordedSample:
+        if index < 0 or index >= self.get_length(episode_index):
             raise IndexError(index)
-        row = table.slice(index, 1).to_pylist()[0]
+        row = self.get_row(episode_index, index)
         images = {
-            role: self._video_frame(episode_index, role, index)
+            role: self._video_frame(episode_index, role, int(row["frame_index"]))
             for role in self.get_camera_roles()
-            if self._video_file(episode_index, role).is_file()
+            if include_images and self._video_file(episode_index, role).is_file()
         }
         telemetry = {key.removeprefix("mp_real."): value for key, value in row.items() if key.startswith("mp_real.")}
         return RecordedSample(
@@ -1055,7 +1063,10 @@ class LeRobotV21EpisodeSource(RecordedEpisodeSource):
         )
 
     def get_sample_at_timestamp(self, episode_index: int, timestamp: float) -> RecordedSample:
-        index = min(max(round(timestamp * float(self._info["fps"])), 0), self.get_length(episode_index) - 1)
+        length = self.get_length(episode_index)
+        if length <= 0:
+            raise IndexError(f"episode {episode_index} has no readable samples")
+        index = min(max(round(timestamp * float(self._info["fps"])), 0), length - 1)
         return self.get_sample(episode_index, index)
 
     def iter_samples(self, episode_index: int) -> Iterator[RecordedSample]:
@@ -1063,15 +1074,93 @@ class LeRobotV21EpisodeSource(RecordedEpisodeSource):
             yield self.get_sample(episode_index, index)
 
     def close(self) -> None:
-        self._table_cache.clear()
+        self._parquet_files.clear()
 
-    def _table(self, episode_index: int) -> pa.Table:
-        table = self._table_cache.get(episode_index)
-        if table is None:
+    def get_row(self, episode_index: int, index: int, *, columns: tuple[str, ...] | None = None) -> dict[str, Any]:
+        """Read one row through a bounded Parquet batch, without table caching."""
+        file = self._parquet_file(episode_index)
+        if index < 0 or index >= file.metadata.num_rows:
+            raise IndexError(index)
+        available = set(file.schema_arrow.names)
+        selected = [column for column in columns if column in available] if columns is not None else None
+        row_group = 0
+        offset = index
+        while row_group < file.num_row_groups:
+            row_count = file.metadata.row_group(row_group).num_rows
+            if offset < row_count:
+                break
+            offset -= row_count
+            row_group += 1
+        if row_group >= file.num_row_groups:
+            raise IndexError(index)
+        batch_size = 512
+        for batch in file.iter_batches(batch_size=batch_size, row_groups=[row_group], columns=selected):
+            if offset < batch.num_rows:
+                return batch.slice(offset, 1).to_pylist()[0]
+            offset -= batch.num_rows
+        raise IndexError(index)
+
+    def iter_rows(
+        self,
+        episode_index: int,
+        *,
+        columns: tuple[str, ...] | None = None,
+        batch_size: int = 1024,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield Parquet rows in bounded batches for offline metrics/curves."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        file = self._parquet_file(episode_index)
+        available = set(file.schema_arrow.names)
+        selected = [column for column in columns if column in available] if columns is not None else None
+        for batch in file.iter_batches(batch_size=batch_size, columns=selected):
+            yield from batch.to_pylist()
+
+    def get_column_names(self, episode_index: int) -> tuple[str, ...]:
+        return tuple(self._parquet_file(episode_index).schema_arrow.names)
+
+    def get_camera_frame(self, episode_index: int, role: str, frame_index: int) -> np.ndarray | None:
+        frame, _ = self.get_camera_frame_with_index(episode_index, role, frame_index)
+        return frame
+
+    def get_camera_frame_with_index(
+        self, episode_index: int, role: str, frame_index: int
+    ) -> tuple[np.ndarray | None, int | None]:
+        """Return an exact frame or the last older frame when a video is short."""
+        if not self.has_camera_video(episode_index, role):
+            return None, None
+        path = self._video_file(episode_index, role)
+        last_frame: np.ndarray | None = None
+        last_index: int | None = None
+        with av.open(str(path)) as container:
+            for current_index, frame in enumerate(container.decode(video=0)):
+                last_frame = frame.to_ndarray(format="rgb24")
+                last_index = current_index
+                if current_index >= frame_index:
+                    return last_frame, current_index
+        return last_frame, last_index
+
+    def has_camera_video(self, episode_index: int, role: str) -> bool:
+        return role in self.get_camera_roles() and self._video_file(episode_index, role).is_file()
+
+    def get_episode_telemetry(
+        self, episode_index: int, *, keys: tuple[str, ...] | None = None
+    ) -> dict[str, np.ndarray]:
+        """Read optional mp-real telemetry without requiring it for standard data."""
+        path = self._root / _telemetry_path(episode_index)
+        if not path.is_file():
+            return {}
+        with np.load(path, allow_pickle=False) as archive:
+            names = archive.files if keys is None else (name for name in keys if name in archive.files)
+            return {name: np.asarray(archive[name]) for name in names}
+
+    def _parquet_file(self, episode_index: int) -> pq.ParquetFile:
+        file = self._parquet_files.get(episode_index)
+        if file is None:
             path = self._root / _data_path(episode_index)
-            table = pq.read_table(path)
-            self._table_cache[episode_index] = table
-        return table
+            file = pq.ParquetFile(path)
+            self._parquet_files[episode_index] = file
+        return file
 
     def _video_file(self, episode_index: int, role: str) -> Path:
         video_path = self._info.get("video_path")
