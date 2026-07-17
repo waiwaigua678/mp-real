@@ -31,6 +31,7 @@ let cameraRoles = [];
 let evaluation = null;
 let evaluationRequestInFlight = false;
 let poseStatus = null;
+let replayStatus = null;
 accessKeyInput.value = accessKey;
 
 function setMessage(text, kind = "") {
@@ -363,6 +364,7 @@ function applyStatus(status) {
   disconnectBtn.disabled = !status.can_disconnect;
   applyEvaluation(status.evaluation || null);
   applyPose(status.pose || null);
+  applyReplay(status.replay || null);
 }
 
 function applyPose(pose) {
@@ -429,6 +431,85 @@ async function startPoseDeployment() {
   const planHash = poseStatus?.plan?.plan_hash;
   if (!planHash || !window.confirm("确认使用当前真实相机帧和当前机器人状态开始实时推理？")) return;
   await poseRequest("/api/pose/start-deployment", { plan_hash: planHash });
+}
+
+function applyReplay(replay) {
+  replayStatus = replay;
+  const state = replay?.state || "idle";
+  const locked = Boolean(replay?.view_cursor_locked);
+  document.querySelector("#replayState").textContent = state;
+  document.querySelector("#replayDetails").textContent = JSON.stringify(
+    {
+      safety_report: replay?.safety_report || null,
+      plan: replay?.plan || null,
+      robot_cursor: replay?.cursor || null,
+      view_cursor_locked: locked,
+      error: replay?.error || null,
+    },
+    null,
+    2,
+  );
+  const planning = state === "planning";
+  const editable = !locked && !planning && Boolean(currentStatus?.can_edit_connection_config);
+  for (const id of [
+    "#replayDatasetId",
+    "#replayEpisodeIndex",
+    "#replayStartSample",
+    "#replayEndSample",
+    "#replayMode",
+    "#replayTiming",
+    "#replayFps",
+    "#replaySpeedScale",
+  ]) {
+    document.querySelector(id).disabled = !editable;
+  }
+  document.querySelector("#replayPlanBtn").disabled = !editable;
+  document.querySelector("#replayConnectBtn").disabled = state !== "validated";
+  document.querySelector("#replayStartBtn").disabled = state !== "armed";
+  document.querySelector("#replayPauseBtn").disabled = state !== "running";
+  document.querySelector("#replayResumeBtn").disabled = state !== "paused";
+  document.querySelector("#replayStopBtn").disabled = !["connecting", "moving_to_start", "armed", "running", "paused", "stopping"].includes(state);
+  document.querySelector("#replayEmergencyBtn").disabled = document.querySelector("#replayStopBtn").disabled;
+}
+
+function replayPlanPayload() {
+  const optionalNumber = (id) => {
+    const value = document.querySelector(id).value;
+    return value === "" ? null : Number(value);
+  };
+  return {
+    dataset_id: document.querySelector("#replayDatasetId").value.trim(),
+    episode_index: Number(document.querySelector("#replayEpisodeIndex").value),
+    start_sample: optionalNumber("#replayStartSample"),
+    end_sample: optionalNumber("#replayEndSample"),
+    mode: document.querySelector("#replayMode").value,
+    timing_mode: document.querySelector("#replayTiming").value,
+    fps: optionalNumber("#replayFps"),
+    speed_scale: Number(document.querySelector("#replaySpeedScale").value),
+  };
+}
+
+async function replayRequest(url, payload = {}) {
+  try {
+    const data = await requestJson(url, { method: "POST", body: JSON.stringify(payload) });
+    applyReplay(data.replay);
+    await refreshStatus();
+    return data.replay;
+  } catch (error) {
+    setMessage(error.message, "bad");
+    await refreshStatus();
+    return null;
+  }
+}
+
+async function createReplayPlan() {
+  await replayRequest("/api/replay/plan", replayPlanPayload());
+}
+
+async function startReplay() {
+  const planHash = replayStatus?.plan?.plan_hash;
+  if (!planHash || !window.confirm(`确认以当前计划 ${planHash.slice(0, 12)}… 开始真机轨迹回放？`)) return;
+  await replayRequest("/api/replay/start", { plan_hash: planHash });
 }
 
 async function refreshStatus() {
@@ -572,6 +653,13 @@ document.querySelector("#poseExecuteBtn").addEventListener("click", executePose)
 document.querySelector("#poseStopBtn").addEventListener("click", () => poseRequest("/api/pose/stop"));
 document.querySelector("#posePrepareDeployBtn").addEventListener("click", preparePoseDeployment);
 document.querySelector("#poseStartDeployBtn").addEventListener("click", startPoseDeployment);
+document.querySelector("#replayPlanBtn").addEventListener("click", createReplayPlan);
+document.querySelector("#replayConnectBtn").addEventListener("click", () => replayRequest("/api/replay/connect"));
+document.querySelector("#replayStartBtn").addEventListener("click", startReplay);
+document.querySelector("#replayPauseBtn").addEventListener("click", () => replayRequest("/api/replay/pause"));
+document.querySelector("#replayResumeBtn").addEventListener("click", () => replayRequest("/api/replay/resume"));
+document.querySelector("#replayStopBtn").addEventListener("click", () => replayRequest("/api/replay/stop"));
+document.querySelector("#replayEmergencyBtn").addEventListener("click", () => replayRequest("/api/replay/emergency-stop"));
 createEvaluationBtn.addEventListener("click", createEvaluation);
 abortEvaluationBtn.addEventListener("click", () => evaluationRequest("/api/evaluations/current/abort"));
 completeEvaluationBtn.addEventListener("click", () => evaluationRequest("/api/evaluations/current/complete"));

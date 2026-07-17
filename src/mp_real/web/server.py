@@ -65,6 +65,18 @@ from mp_real.pose.models import (
     PoseValidationReport,
 )
 from mp_real.pose.validation import MoveToStateValidator
+from mp_real.replay.controller import RobotReplayController
+from mp_real.replay.models import (
+    ReplayMode,
+    ReplayPlan,
+    ReplaySafetyReport,
+    ReplayState,
+    ReplayTimingMode,
+    RobotReplayCursor,
+    json_safe as _replay_json_safe,
+)
+from mp_real.replay.planning import ReplayPlanner
+from mp_real.replay.recording import ReplayRecordWriter, ReplayRecordingConfig
 from mp_real.web.runtime import CachedFrameObservationSource, WebInferenceAdapter, WebLoopHooks
 from mp_real.web.profiles import (
     PIPER_WEB_PROFILE,
@@ -185,6 +197,34 @@ def _pose_plan_json(plan: MoveToRecordedStatePlan | None) -> dict[str, Any] | No
         "safety_warnings": list(plan.safety_warnings),
         "required_confirmations": list(plan.required_confirmations),
     }
+
+
+def _replay_report_json(report: ReplaySafetyReport | None) -> dict[str, Any] | None:
+    if report is None:
+        return None
+    return _replay_json_safe(report)
+
+
+def _replay_plan_json(plan: ReplayPlan | None) -> dict[str, Any] | None:
+    if plan is None:
+        return None
+    return {
+        "plan_id": plan.plan_id,
+        "plan_hash": plan.plan_hash,
+        "dataset_id": plan.dataset_id,
+        "episode_index": plan.episode_index,
+        "start_sample": plan.start_sample,
+        "end_sample": plan.end_sample,
+        "mode": plan.mode.value,
+        "timing_mode": plan.timing_mode.value,
+        "speed_scale": plan.speed_scale,
+        "expected_duration_s": plan.expected_duration_s,
+        "step_count": len(plan.steps),
+    }
+
+
+def _replay_cursor_json(cursor: RobotReplayCursor | None) -> dict[str, Any] | None:
+    return _replay_json_safe(cursor) if cursor is not None else None
 
 
 def _runtime_mode(value: Any) -> RuntimeMode:
@@ -530,6 +570,7 @@ class RobotWebRuntime:
         resource_manager: ResourceLeaseManager | None = None,
         recorded_data_roots: tuple[pathlib.Path | str, ...] = (),
         pose_mapping_config: PoseMappingConfig | None = None,
+        replay_record_root: pathlib.Path | str | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._frame_condition = threading.Condition(self._lock)
@@ -555,6 +596,7 @@ class RobotWebRuntime:
         self._recorded_data_roots = tuple(recorded_data_roots)
         self._recorded_data_view = DataViewSession(self._recorded_data_roots) if self._recorded_data_roots else None
         self._pose_mapping_config = pose_mapping_config
+        self._replay_record_root = pathlib.Path(replay_record_root) if replay_record_root is not None else None
         self._pose_target = None
         self._pose_validation: PoseValidationReport | None = None
         self._pose_plan: MoveToRecordedStatePlan | None = None
@@ -572,6 +614,23 @@ class RobotWebRuntime:
         self._pose_progress: PoseMoveProgress | None = None
         self._pose_prepared = None
         self._recorded_start_context: dict[str, Any] | None = None
+
+        # Stage-10 replay is intentionally separate from policy deployment and
+        # recorded-state handoff.  Its worker owns the only motion path.
+        self._replay_plan: ReplayPlan | None = None
+        self._replay_report: ReplaySafetyReport | None = None
+        self._replay_controller: RobotReplayController | None = None
+        self._replay_robot: Robot | None = None
+        self._replay_lease: ResourceLease | None = None
+        self._replay_plan_thread: threading.Thread | None = None
+        self._replay_connect_thread: threading.Thread | None = None
+        self._replay_watch_thread: threading.Thread | None = None
+        self._replay_stop_event = threading.Event()
+        self._replay_generation_id = 0
+        self._replay_phase = ReplayState.IDLE
+        self._replay_error: str | None = None
+        self._replay_view_locked = False
+        self._replay_recorder: ReplayRecordWriter | None = None
 
         self._controller: RuntimeController | None = None
         self._loop_hooks = WebLoopHooks(
@@ -1122,6 +1181,342 @@ class RobotWebRuntime:
             prefetch_first_chunk=self._policy_prefetch_first_chunk,
         )
 
+    def replay_plan(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Queue a fully offline replay preflight; this never constructs hardware."""
+        dataset_id = str(payload.get("dataset_id", ""))
+        episode_index = int(payload.get("episode_index", -1))
+        start_sample = payload.get("start_sample")
+        end_sample = payload.get("end_sample")
+        try:
+            mode = ReplayMode(str(payload.get("mode", ReplayMode.COMMAND_REPLAY.value)))
+            timing_mode = ReplayTimingMode(str(payload.get("timing_mode", ReplayTimingMode.RECORDED_TIMESTAMPS.value)))
+        except ValueError as exc:
+            raise ApiError(f"invalid replay mode/timing: {exc}") from exc
+        speed_scale = float(payload.get("speed_scale", 0.1))
+        fps_value = payload.get("fps")
+        fps = float(fps_value) if fps_value is not None else None
+        with self._lock:
+            if self._recorded_data_view is None:
+                raise ApiError("No recorded-data root is configured for this Web server", HTTPStatus.CONFLICT)
+            if (
+                self._connected
+                or self._running
+                or self._pose_worker_active_locked()
+                or self._replay_active_locked()
+                or self._pose_phase not in {"idle", "offline_preflighted", "offline_rejected", "failed", "aborted"}
+            ):
+                raise ApiError("Disconnect active robot control before generating a replay plan", HTTPStatus.CONFLICT)
+            if self._replay_plan_thread is not None and self._replay_plan_thread.is_alive():
+                raise ApiError("Replay planning is already in progress", HTTPStatus.CONFLICT)
+            viewer = self._recorded_data_view
+            profile = self._profile
+            args = copy.deepcopy(self._args)
+            self._replay_generation_id += 1
+            generation_id = self._replay_generation_id
+            self._replay_stop_event.clear()
+            self._replay_plan = None
+            self._replay_report = None
+            self._replay_controller = None
+            self._replay_error = None
+            self._replay_phase = ReplayState.PLANNING
+            self._replay_view_locked = False
+            worker = threading.Thread(
+                target=self._run_replay_plan,
+                args=(
+                    viewer,
+                    profile.robot_name,
+                    profile.action_spec_for_args(args),
+                    dataset_id,
+                    episode_index,
+                    int(start_sample) if start_sample is not None else None,
+                    int(end_sample) if end_sample is not None else None,
+                    mode,
+                    timing_mode,
+                    fps,
+                    speed_scale,
+                    generation_id,
+                ),
+                name=f"{profile.robot_name}-replay-plan-g{generation_id}",
+                daemon=False,
+            )
+            self._replay_plan_thread = worker
+            worker.start()
+        return self.replay_status()
+
+    def _run_replay_plan(
+        self,
+        viewer: DataViewSession,
+        robot_name: str,
+        action_spec: Any,
+        dataset_id: str,
+        episode_index: int,
+        start_sample: int | None,
+        end_sample: int | None,
+        mode: ReplayMode,
+        timing_mode: ReplayTimingMode,
+        fps: float | None,
+        speed_scale: float,
+        generation_id: int,
+    ) -> None:
+        try:
+            result = ReplayPlanner(viewer.replay_source(dataset_id)).plan(
+                robot_name=robot_name,
+                target_action_spec=action_spec,
+                dataset_id=dataset_id,
+                episode_index=episode_index,
+                start_sample=start_sample,
+                end_sample=end_sample,
+                mode=mode,
+                timing_mode=timing_mode,
+                fps=fps,
+                speed_scale=speed_scale,
+                generation_id=generation_id,
+            )
+        except BaseException as exc:
+            with self._lock:
+                if generation_id == self._replay_generation_id:
+                    self._replay_phase = ReplayState.ERROR
+                    self._replay_error = f"{type(exc).__name__}: {exc}"
+            return
+        with self._lock:
+            if generation_id != self._replay_generation_id or self._replay_stop_event.is_set():
+                return
+            self._replay_report = result.report
+            self._replay_plan = result.plan
+            self._replay_phase = ReplayState.VALIDATED if result.report.valid else ReplayState.ERROR
+            self._replay_error = (
+                None if result.report.valid else "; ".join(item.message for item in result.report.errors)
+            )
+
+    def replay_connect(self) -> dict[str, Any]:
+        """Create only the selected Robot, then let ReplayController move to start."""
+        with self._lock:
+            plan = self._replay_plan
+            if self._replay_phase is not ReplayState.VALIDATED or plan is None:
+                raise ApiError("A valid offline replay plan is required", HTTPStatus.CONFLICT)
+            if self._connected or self._running or self._pose_worker_active_locked() or self._replay_active_locked():
+                raise ApiError("Another robot-control lifecycle is active", HTTPStatus.CONFLICT)
+            try:
+                lease = self._resource_manager.acquire(
+                    self._resource_owner_id,
+                    (
+                        ResourceRequest(ResourceType.ROBOT_CONTROL, self._profile.robot_name),
+                        ResourceRequest(ResourceType.RECORDED_DATA, plan.dataset_id),
+                    ),
+                )
+            except ResourceLeaseConflict as exc:
+                raise ApiError(str(exc), HTTPStatus.CONFLICT) from exc
+            args = copy.deepcopy(self._args)
+            self._replay_generation_id += 1
+            generation_id = self._replay_generation_id
+            self._replay_stop_event.clear()
+            self._replay_lease = lease
+            self._replay_phase = ReplayState.CONNECTING
+            self._replay_error = None
+            self._replay_view_locked = True
+            worker = threading.Thread(
+                target=self._run_replay_connect,
+                args=(plan, args, lease, generation_id),
+                name=f"{self._profile.robot_name}-replay-connect-{plan.plan_id[:8]}",
+                daemon=False,
+            )
+            self._replay_connect_thread = worker
+            worker.start()
+        return self.replay_status()
+
+    def _run_replay_connect(self, plan: ReplayPlan, args: Any, lease: ResourceLease, generation_id: int) -> None:
+        robot: Robot | None = None
+        recorder: ReplayRecordWriter | None = None
+        try:
+            args.reset_on_start = False
+            if hasattr(args, "enable_on_start"):
+                args.enable_on_start = False
+            if hasattr(args, "speed_percent"):
+                args.speed_percent = min(int(args.speed_percent), 10)
+            robot = self._robot_factory(self._profile.robot_name, args)
+
+            def lease_valid() -> bool:
+                with self._lock:
+                    return (
+                        generation_id == self._replay_generation_id
+                        and self._replay_lease is lease
+                        and not lease.released
+                        and not self._replay_stop_event.is_set()
+                    )
+
+            if self._replay_record_root is not None:
+                recorder = ReplayRecordWriter(ReplayRecordingConfig(self._replay_record_root), plan)
+                recorder.start()
+            controller = RobotReplayController(
+                robot,
+                plan,
+                lease_valid=lease_valid,
+                record_callback=recorder.emit if recorder is not None else None,
+                thread_name=f"{self._profile.robot_name}-replay",
+            )
+            with self._lock:
+                if not lease_valid():
+                    raise RuntimeError("replay connection was superseded")
+                self._replay_robot = robot
+                self._replay_controller = controller
+                self._replay_recorder = recorder
+            controller.prepare()
+            watcher = threading.Thread(
+                target=self._watch_replay_prepare,
+                args=(controller, robot, lease, generation_id),
+                name=f"{self._profile.robot_name}-replay-prepare-watch-{plan.plan_id[:8]}",
+                daemon=False,
+            )
+            with self._lock:
+                self._replay_watch_thread = watcher
+            watcher.start()
+        except BaseException as exc:
+            if recorder is not None:
+                recorder.stop(result="connection_error")
+            if robot is not None:
+                try:
+                    robot.close()
+                except BaseException:
+                    pass
+            lease.release()
+            with self._lock:
+                if generation_id == self._replay_generation_id:
+                    self._replay_robot = None
+                    self._replay_lease = None
+                    self._replay_recorder = None
+                    self._replay_phase = ReplayState.ERROR
+                    self._replay_error = f"{type(exc).__name__}: {exc}"
+                    self._replay_view_locked = False
+
+    def _watch_replay_prepare(
+        self, controller: RobotReplayController, robot: Robot, lease: ResourceLease, generation_id: int
+    ) -> None:
+        controller.join()
+        cursor = controller.cursor()
+        if cursor.state is ReplayState.ARMED:
+            with self._lock:
+                if generation_id == self._replay_generation_id and self._replay_controller is controller:
+                    self._replay_phase = ReplayState.ARMED
+            return
+        self._release_replay_resources(controller, robot, lease, generation_id)
+
+    def replay_start(self, plan_hash: str) -> dict[str, Any]:
+        with self._lock:
+            controller = self._replay_controller
+            robot = self._replay_robot
+            lease = self._replay_lease
+            generation_id = self._replay_generation_id
+            if (
+                controller is None
+                or robot is None
+                or lease is None
+                or controller.cursor().state is not ReplayState.ARMED
+            ):
+                raise ApiError("Replay must reach ARMED before it can start", HTTPStatus.CONFLICT)
+            try:
+                controller.confirm_and_start(plan_hash)
+            except BaseException as exc:
+                raise ApiError(f"{type(exc).__name__}: {exc}", HTTPStatus.CONFLICT) from exc
+            self._replay_phase = ReplayState.RUNNING
+            watcher = threading.Thread(
+                target=self._watch_replay_run,
+                args=(controller, robot, lease, generation_id),
+                name=f"{self._profile.robot_name}-replay-run-watch-{controller.plan.plan_id[:8]}",
+                daemon=False,
+            )
+            self._replay_watch_thread = watcher
+            watcher.start()
+        return self.replay_status()
+
+    def replay_pause(self) -> dict[str, Any]:
+        with self._lock:
+            controller = self._replay_controller
+        if controller is None or not controller.pause():
+            raise ApiError("Replay is not running", HTTPStatus.CONFLICT)
+        return self.replay_status()
+
+    def replay_resume(self) -> dict[str, Any]:
+        with self._lock:
+            controller = self._replay_controller
+        if controller is None or not controller.resume():
+            raise ApiError("Replay resume was rejected; move to the recorded pause state first", HTTPStatus.CONFLICT)
+        return self.replay_status()
+
+    def replay_stop(self, *, emergency: bool = False) -> dict[str, Any]:
+        with self._lock:
+            controller = self._replay_controller
+        if controller is None:
+            return self.replay_status()
+        controller.stop(emergency=emergency, wait=False)
+        return self.replay_status()
+
+    def _watch_replay_run(
+        self, controller: RobotReplayController, robot: Robot, lease: ResourceLease, generation_id: int
+    ) -> None:
+        controller.join()
+        self._release_replay_resources(controller, robot, lease, generation_id)
+
+    def _release_replay_resources(
+        self, controller: RobotReplayController, robot: Robot, lease: ResourceLease, generation_id: int
+    ) -> None:
+        with self._lock:
+            recorder = self._replay_recorder if self._replay_controller is controller else None
+            if self._replay_controller is controller:
+                self._replay_recorder = None
+        if recorder is not None:
+            recorder.stop(result=controller.cursor().state.value)
+        try:
+            robot.close()
+        finally:
+            lease.release()
+        with self._lock:
+            if generation_id == self._replay_generation_id and self._replay_controller is controller:
+                self._replay_robot = None
+                self._replay_lease = None
+                self._replay_phase = controller.cursor().state
+                if recorder is not None and recorder.error is not None:
+                    self._replay_phase = ReplayState.ERROR
+                    self._replay_error = f"ReplayRecordingError: {recorder.error}"
+                else:
+                    self._replay_error = controller.cursor().message if controller.error() is not None else None
+                self._replay_view_locked = False
+
+    def replay_status(self) -> dict[str, Any]:
+        with self._lock:
+            controller = self._replay_controller
+            cursor = controller.cursor() if controller is not None else None
+            state = (
+                ReplayState.ERROR
+                if self._replay_phase is ReplayState.ERROR and self._replay_error is not None
+                else cursor.state
+                if cursor is not None
+                else self._replay_phase
+            )
+            return {
+                "state": state.value,
+                "error": self._replay_error,
+                "view_cursor_locked": self._replay_view_locked,
+                "plan": _replay_plan_json(self._replay_plan),
+                "safety_report": _replay_report_json(self._replay_report),
+                "cursor": _replay_cursor_json(cursor),
+            }
+
+    def _replay_active_locked(self) -> bool:
+        cursor = self._replay_controller.cursor() if self._replay_controller is not None else None
+        if cursor is not None and cursor.state in {
+            ReplayState.CONNECTING,
+            ReplayState.MOVING_TO_START,
+            ReplayState.ARMED,
+            ReplayState.RUNNING,
+            ReplayState.PAUSED,
+            ReplayState.STOPPING,
+        }:
+            return True
+        return any(
+            thread is not None and thread.is_alive()
+            for thread in (self._replay_plan_thread, self._replay_connect_thread, self._replay_watch_thread)
+        )
+
     def pose_select(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Select and preflight a recorded state without constructing hardware."""
         dataset_id = str(payload.get("dataset_id", ""))
@@ -1134,6 +1529,7 @@ class RobotWebRuntime:
                 self._connected
                 or self._running
                 or self._pose_robot is not None
+                or self._replay_active_locked()
                 or self._pose_phase not in {"idle", "offline_preflighted", "offline_rejected", "failed", "aborted"}
             ):
                 raise ApiError(
@@ -1173,6 +1569,8 @@ class RobotWebRuntime:
                 )
             if self._connected or self._running or self._pose_worker_active_locked():
                 raise ApiError("Normal deployment or another pose connection is active", HTTPStatus.CONFLICT)
+            if self._replay_active_locked():
+                raise ApiError("Trajectory replay owns robot control", HTTPStatus.CONFLICT)
             target = self._pose_target
             args = copy.deepcopy(self._args)
             try:
@@ -1617,6 +2015,10 @@ class RobotWebRuntime:
             self._refresh_controller_state_locked()
             if self._evaluation_owner is not None:
                 raise ApiError("Evaluation owns robot control; use the evaluation API", HTTPStatus.CONFLICT)
+            if self._replay_active_locked():
+                raise ApiError(
+                    "Trajectory replay owns robot control; stop it before starting deployment", HTTPStatus.CONFLICT
+                )
             mode = self._runtime_mode
             if mode is RuntimeMode.CAMERA_PREVIEW:
                 if self._connected:
@@ -1664,6 +2066,10 @@ class RobotWebRuntime:
                 raise ApiError(
                     "Evaluation owns this deployment; it must finish before reconnecting",
                     HTTPStatus.CONFLICT,
+                )
+            if self._replay_active_locked():
+                raise ApiError(
+                    "Trajectory replay owns robot control; stop it before connecting deployment", HTTPStatus.CONFLICT
                 )
             if self._running or self._stop_requested or self._startup_active_locked():
                 raise ApiError("Runtime is running or stopping", HTTPStatus.CONFLICT)
@@ -2028,12 +2434,46 @@ class RobotWebRuntime:
         with self._lock:
             if self._evaluation_owner is not None:
                 raise ApiError("Evaluation owns this deployment; abort it before disconnecting", HTTPStatus.CONFLICT)
+            # Cancel replay before touching normal or pose resources.  The
+            # replay lease predicate observes this generation immediately.
+            self._replay_generation_id += 1
+            self._replay_stop_event.set()
+            replay_controller = self._replay_controller
+        if replay_controller is not None:
+            replay_controller.stop(emergency=True, wait=True, timeout=2.0)
+        with self._lock:
+            replay_threads = tuple(
+                thread
+                for thread in (self._replay_plan_thread, self._replay_connect_thread, self._replay_watch_thread)
+                if thread is not None and thread is not threading.current_thread()
+            )
+        replay_deadline = time.monotonic() + 5.0
+        for thread in replay_threads:
+            thread.join(max(0.0, replay_deadline - time.monotonic()))
+        if any(thread.is_alive() for thread in replay_threads):
+            raise ApiError("Replay worker is still stopping; retry disconnect shortly", HTTPStatus.CONFLICT)
+        with self._lock:
+            replay_robot = self._replay_robot
+            replay_lease = self._replay_lease
+            replay_recorder = self._replay_recorder
+            self._replay_robot = None
+            self._replay_lease = None
+            self._replay_recorder = None
+            self._replay_view_locked = False
+            if self._replay_phase not in {ReplayState.COMPLETED, ReplayState.ABORTED, ReplayState.ERROR}:
+                self._replay_phase = ReplayState.ABORTED
             # Every pose worker observes this generation.  Join before normal
             # deployment cleanup so an old handoff cannot resurrect resources.
             self._pose_generation_id += 1
             self._pose_stop_event.set()
             pose_controller = self._pose_controller
             pose_moving = self._pose_phase in {"moving", "stopping"}
+        if replay_robot is not None:
+            replay_robot.close()
+        if replay_lease is not None:
+            replay_lease.release()
+        if replay_recorder is not None:
+            replay_recorder.stop(result="disconnected")
         if pose_controller is not None and pose_moving:
             pose_controller.stop(wait=True, timeout=2.0)
         with self._lock:
@@ -2287,6 +2727,7 @@ class RobotWebRuntime:
             }
             startup_active = self._startup_active_locked()
             connection_active = self._connection_active_locked()
+            replay_active = self._replay_active_locked()
             can_reset = (
                 self._runtime_mode is RuntimeMode.DEPLOYMENT
                 and self._controller is not None
@@ -2312,6 +2753,7 @@ class RobotWebRuntime:
                 and not self._stop_requested
                 and not connection_active
                 and not startup_active
+                and not replay_active
                 and self._phase in {"idle", "error", "warmup_failed"},
                 "can_start": (
                     self._runtime_mode is RuntimeMode.CAMERA_PREVIEW
@@ -2330,11 +2772,13 @@ class RobotWebRuntime:
                 or self._stop_requested
                 or connection_active
                 or startup_active
+                or replay_active
                 or (self._runtime_mode is RuntimeMode.CAMERA_PREVIEW and self._phase == "previewing"),
                 "can_disconnect": self._connected
                 or self._running
                 or connection_active
                 or startup_active
+                or replay_active
                 or self._phase in {"connecting", "connecting_cameras", "error", "stopped", "warmup_failed", "stopping"},
                 "can_reset": can_reset,
                 "step": loop.step,
@@ -2375,6 +2819,7 @@ class RobotWebRuntime:
                 "frames": frames,
                 "evaluation": evaluation,
                 "pose": self.pose_status(),
+                "replay": self.replay_status(),
                 "logs": list(self._logs),
                 "resource_leases": self._resource_manager.snapshot(),
             }
@@ -2885,13 +3330,7 @@ class PiperWebHandler(BaseHTTPRequestHandler):
             elif path == "/api/evaluations/current":
                 self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.current()})
             elif path == "/api/replay/status":
-                self._send_json(
-                    {
-                        "ok": True,
-                        "available": False,
-                        "message": "Recorded-session playback will be implemented in stage 7.",
-                    }
-                )
+                self._send_json({"ok": True, "replay": self.server.runtime.replay_status()})
             elif path.startswith("/snapshot/") and path.endswith(".jpg"):
                 camera_name = path.removeprefix("/snapshot/").removesuffix(".jpg")
                 frame = self.server.runtime.wait_frame(camera_name, -1, timeout=0.1)
@@ -2938,6 +3377,23 @@ class PiperWebHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.complete()})
             elif path == "/api/config":
                 self._send_json({"ok": True, "config": self.server.runtime.update_config(self._read_json())})
+            elif path == "/api/replay/plan":
+                self._send_json({"ok": True, "replay": self.server.runtime.replay_plan(self._read_json())})
+            elif path == "/api/replay/connect":
+                self._send_json({"ok": True, "replay": self.server.runtime.replay_connect()})
+            elif path == "/api/replay/start":
+                payload = self._read_json()
+                self._send_json(
+                    {"ok": True, "replay": self.server.runtime.replay_start(str(payload.get("plan_hash", "")))}
+                )
+            elif path == "/api/replay/pause":
+                self._send_json({"ok": True, "replay": self.server.runtime.replay_pause()})
+            elif path == "/api/replay/resume":
+                self._send_json({"ok": True, "replay": self.server.runtime.replay_resume()})
+            elif path == "/api/replay/stop":
+                self._send_json({"ok": True, "replay": self.server.runtime.replay_stop()})
+            elif path == "/api/replay/emergency-stop":
+                self._send_json({"ok": True, "replay": self.server.runtime.replay_stop(emergency=True)})
             elif path == "/api/pose/select":
                 self._send_json({"ok": True, "pose": self.server.runtime.pose_select(self._read_json())})
             elif path == "/api/pose/connect":
@@ -3093,6 +3549,7 @@ class PiperWebServer(ThreadingHTTPServer):
             resource_manager=self.runtime.resource_manager,
             recorded_data_roots=self.runtime._recorded_data_roots,
             pose_mapping_config=self.runtime._pose_mapping_config,
+            replay_record_root=self.runtime._replay_record_root,
         )
         return self.runtime.get_config()
 
@@ -3134,6 +3591,12 @@ def main() -> None:
         "--pose-mapping-config",
         type=pathlib.Path,
         help="Versioned explicit JSON mapping for a non-identical recorded-state schema.",
+    )
+    parser.add_argument(
+        "--replay-record-root",
+        type=pathlib.Path,
+        default=pathlib.Path("recordings/replay"),
+        help="Directory for atomic, explicit real-robot replay records.",
     )
     cli_args = parser.parse_args()
 
@@ -3182,6 +3645,7 @@ def main() -> None:
         policy_timeout=cli_args.policy_timeout,
         recorded_data_roots=tuple(cli_args.recorded_data_root),
         pose_mapping_config=pose_mapping_config,
+        replay_record_root=cli_args.replay_record_root,
     )
     access_key = cli_args.access_key or os.environ.get("MOTRIX_WEB_ACCESS_KEY")
     server = PiperWebServer((cli_args.host, cli_args.port), PiperWebHandler, runtime, access_key=access_key)

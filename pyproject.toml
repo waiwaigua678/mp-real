@@ -63,6 +63,7 @@ mp-data-inspect = "mp_real.data.cli:inspect_cli"
 mp-data-validate = "mp_real.data.cli:validate_cli"
 mp-data-view = "mp_real.data.view_server:main"
 mp-move-to-recorded-state = "mp_real.pose.cli:cli"
+mp-robot-replay = "mp_real.replay.cli:cli"
 
 [build-system]
 requires = ["hatchling>=1.25"]

@@ -586,6 +586,10 @@ class DataViewSession:
             sample_index=timeline.clamp_index(sample_index),
         )
 
+    def replay_source(self, dataset_id: str) -> LeRobotV21EpisodeSource:
+        """Return a catalog-owned read-only source for background planning."""
+        return self._reader(dataset_id).source
+
     def _dataset_entries(self) -> tuple[_DatasetEntry, ...]:
         entries = []
         for dataset in self._catalog.scan():

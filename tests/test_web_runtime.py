@@ -55,6 +55,11 @@ class _FakePoseWebRobot(_FakeWebRobot):
     def read_state(self) -> RobotState:
         return RobotState(self.state.copy(), time.monotonic())
 
+    def execute_transition(self, previous: np.ndarray | None, target: np.ndarray) -> np.ndarray:
+        executed = super().execute_transition(previous, target)
+        self.state = executed.copy()
+        return executed
+
     def get_current_pose_state(self) -> RobotState:
         return self.read_state()
 
@@ -192,6 +197,65 @@ def _wait_until(predicate: Any, *, timeout: float = 2.0) -> None:
 
 
 class WebRuntimeTests(unittest.TestCase):
+    def test_trajectory_replay_plans_offline_then_runs_without_policy_client(self) -> None:
+        from tests.test_data_view import _write_dataset
+
+        with TemporaryDirectory() as directory:
+            args = _default_args(camera_profile="black")
+            fake = _FakePoseWebRobot(PIPER_WEB_PROFILE.action_spec_for_args(args))
+            _write_dataset(Path(directory) / "recorded", spec=fake.action_spec, frames=1, save_video=False)
+            factories = {"robot": 0, "policy": 0}
+
+            def robot_factory(name: str, config: Any) -> _FakePoseWebRobot:
+                del name, config
+                factories["robot"] += 1
+                return fake
+
+            def policy_factory(server_url: str, api_key: str | None, timeout: float) -> _FakeWebPolicy:
+                del server_url, api_key, timeout
+                factories["policy"] += 1
+                return _FakeWebPolicy()
+
+            runtime = PiperWebRuntime(
+                args,
+                robot_factory=robot_factory,
+                policy_client_factory=policy_factory,
+                camera_factory=lambda config: {},
+                recorded_data_roots=(Path(directory),),
+            )
+            dataset_id = runtime._recorded_data_view.datasets()[0]["dataset_id"]
+            runtime.replay_plan(
+                {
+                    "dataset_id": dataset_id,
+                    "episode_index": 0,
+                    "mode": "state",
+                    "timing_mode": "fixed",
+                    "fps": 100.0,
+                    "speed_scale": 0.1,
+                }
+            )
+            _wait_until(lambda: runtime.replay_status()["state"] in {"validated", "error"})
+            self.assertEqual(runtime.replay_status()["state"], "validated", runtime.replay_status())
+            self.assertEqual(factories, {"robot": 0, "policy": 0})
+
+            runtime.replay_connect()
+            _wait_until(lambda: runtime.replay_status()["state"] in {"armed", "error"})
+            replay = runtime.replay_status()
+            self.assertEqual(replay["state"], "armed", replay)
+            self.assertTrue(replay["view_cursor_locked"])
+            self.assertEqual(factories, {"robot": 1, "policy": 0})
+
+            runtime.replay_start(replay["plan"]["plan_hash"])
+            _wait_until(
+                lambda: runtime.replay_status()["state"] in {"completed", "error", "aborted"}
+                and not runtime.replay_status()["view_cursor_locked"]
+            )
+            self.assertEqual(runtime.replay_status()["state"], "completed", runtime.replay_status())
+            self.assertFalse(runtime.replay_status()["view_cursor_locked"])
+            self.assertGreater(len(fake.executed), 0)
+            self.assertEqual(factories["policy"], 0)
+            self.assertEqual(runtime.resource_manager.snapshot(), {})
+
     def test_recorded_pose_handoff_never_resets_and_uses_fresh_policy_start(self) -> None:
         # Reuse the recorder fixture to exercise the state-only target read.
         from tests.test_data_view import _write_dataset
@@ -375,9 +439,11 @@ class WebRuntimeTests(unittest.TestCase):
 
         runtime.start()
         _wait_until(
-            lambda: runtime.status()["frames"]["cam_head"]["error"] is not None
-            and runtime.status()["frames"]["cam_left_wrist"]["sequence"] > 0
-            and runtime.status()["frames"]["cam_right_wrist"]["sequence"] > 0
+            lambda: (
+                runtime.status()["frames"]["cam_head"]["error"] is not None
+                and runtime.status()["frames"]["cam_left_wrist"]["sequence"] > 0
+                and runtime.status()["frames"]["cam_right_wrist"]["sequence"] > 0
+            )
         )
         status = runtime.status()
         self.assertGreater(status["frames"]["cam_left_wrist"]["sequence"], 0)
@@ -421,12 +487,13 @@ class WebRuntimeTests(unittest.TestCase):
         runtime = PiperWebRuntime(
             args,
             robot_factory=lambda name, config: calls.__setitem__("robot", calls["robot"] + 1) or robot,
-            policy_client_factory=lambda server_url, api_key, timeout: calls.__setitem__(
-                "policy", calls["policy"] + 1
-            )
-            or policy,
-            camera_factory=lambda config: calls.__setitem__("camera", calls["camera"] + 1)
-            or {name: _TrackedCamera(name) for name in CAMERA_NAMES},
+            policy_client_factory=lambda server_url, api_key, timeout: (
+                calls.__setitem__("policy", calls["policy"] + 1) or policy
+            ),
+            camera_factory=lambda config: (
+                calls.__setitem__("camera", calls["camera"] + 1)
+                or {name: _TrackedCamera(name) for name in CAMERA_NAMES}
+            ),
         )
         self.addCleanup(runtime.disconnect)
 

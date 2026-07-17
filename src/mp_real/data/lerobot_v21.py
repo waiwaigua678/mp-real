@@ -252,6 +252,14 @@ def _build_info(
             "operator": config.operator,
             "policy_label": config.policy_label,
             "runtime_config": dict(config.runtime_config),
+            # The standard LeRobot ``action`` field is populated only from
+            # ActionExecuted events.  Naming that provenance explicitly is
+            # required before a future real-robot command replay may consume
+            # the dataset; raw model chunks remain telemetry only.
+            "replay": {
+                "action_source": "executed_action",
+                "action_mode": "joint_position_target",
+            },
         },
     }
 

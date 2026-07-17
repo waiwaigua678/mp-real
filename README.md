@@ -219,6 +219,25 @@ arbitrary frontend file paths. Standard LeRobot datasets remain viewable when
 mp-real telemetry is absent; those unavailable fields are displayed as
 unrecorded rather than inferred.
 
+### Safe robot trajectory replay
+
+`mp-robot-replay` is distinct from offline viewing: it is policy-free and
+defaults to a completely offline plan/report.  It accepts only explicitly
+declared standard actions for command replay; state trajectory following is a
+separate, visibly labelled mode.
+
+```bash
+uv run mp-robot-replay \
+  --robot piper --dataset recordings/<dataset> --episode-index 0 \
+  --mode command --timing recorded --speed-scale 0.1
+```
+
+`--execute` additionally requires the exact reviewed `--confirm-plan-hash`.
+It creates no `PolicyClient` or camera, moves to the recorded start state at
+low speed, then waits for confirmation before sending trajectory targets.
+Review [the stage-10 hardware gates](docs/hardware_validation_stage_10.md)
+before any physical test.
+
 ### Policy warmup and first action
 
 Deployment exposes separate connection, metadata, warmup and steady-inference

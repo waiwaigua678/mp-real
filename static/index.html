@@ -75,6 +75,33 @@
           <pre class="metadata" id="poseDetails">未选择 recorded sample</pre>
         </section>
 
+        <section class="panel" id="robotReplayPanel">
+          <div class="panel-title"><h2>真机轨迹回放</h2><span id="replayState">idle</span></div>
+          <p class="subline">独立于离线查看与 Policy 推理。命令回放只读取经声明的标准 <code>action</code>；状态跟随会明确标记为非命令精确复现。</p>
+          <div class="button-row">
+            <label>Dataset ID <input id="replayDatasetId" type="text" placeholder="ds_..." /></label>
+            <label>Episode <input id="replayEpisodeIndex" type="number" min="0" value="0" /></label>
+            <label>Start <input id="replayStartSample" type="number" min="0" /></label>
+            <label>End <input id="replayEndSample" type="number" min="0" /></label>
+            <label>模式
+              <select id="replayMode"><option value="command">命令回放</option><option value="state">状态轨迹跟随</option></select>
+            </label>
+            <label>时间
+              <select id="replayTiming"><option value="recorded">记录时间戳</option><option value="fixed">固定 FPS</option></select>
+            </label>
+            <label>FPS <input id="replayFps" type="number" min="1" step="0.1" placeholder="仅固定模式" /></label>
+            <label>速度比例 <input id="replaySpeedScale" type="number" min="0.01" max="1" step="0.01" value="0.1" /></label>
+            <button id="replayPlanBtn" type="button">生成真机回放计划</button>
+            <button id="replayConnectBtn" type="button">连接机器人并移至起点</button>
+            <button id="replayStartBtn" type="button" class="danger">确认开始回放</button>
+            <button id="replayPauseBtn" type="button">暂停</button>
+            <button id="replayResumeBtn" type="button">继续</button>
+            <button id="replayStopBtn" type="button" class="danger">停止</button>
+            <button id="replayEmergencyBtn" type="button" class="danger">紧急停止</button>
+          </div>
+          <pre class="metadata" id="replayDetails">未生成 replay plan</pre>
+        </section>
+
         <section class="lower-grid">
           <section class="panel metrics">
             <div class="panel-title">

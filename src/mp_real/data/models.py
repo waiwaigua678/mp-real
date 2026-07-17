@@ -131,12 +131,19 @@ class FakeRecordedEpisodeSource:
         episodes: Mapping[int, Sequence[RecordedSample]],
         *,
         robot_name: str = "fake",
+        info: Mapping[str, Any] | None = None,
     ) -> None:
         self._action_spec = action_spec
         self._episodes = {index: tuple(samples) for index, samples in episodes.items()}
         self._metadata = DatasetMetadata(
             root=Path("<fake>"),
-            info={"codebase_version": "v2.1", "robot_type": robot_name, "fps": 1.0},
+            info={
+                "codebase_version": "v2.1",
+                "robot_type": robot_name,
+                "fps": 1.0,
+                "mp_real": {"replay": {"action_source": "standard_action", "action_mode": "joint_position_target"}},
+                **dict(info or {}),
+            },
             status=EpisodeStatus.COMPLETE,
             is_mp_real=True,
             action_spec=action_spec,
