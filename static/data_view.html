@@ -10,7 +10,7 @@
     <header>
       <div>
         <h1>离线数据查看</h1>
-        <p>Episode 查看器 · 只读模式：不会创建 Robot、Camera 或 PolicyClient。</p>
+        <p>Episode 查看器 · 浏览时不会创建 Robot、Camera 或 PolicyClient；开环任务仅在显式提交后连接 Policy。</p>
       </div>
       <span class="readonly">READ ONLY</span>
     </header>
@@ -19,6 +19,22 @@
         <label>数据集<select id="datasetSelect"></select></label>
         <label>Episode<select id="episodeSelect"></select></label>
         <div class="episode-meta" id="episodeMeta">正在载入数据目录…</div>
+      </section>
+
+      <section class="card open-loop">
+        <div class="section-heading"><div><h2>Teacher-forced 开环评测</h2><span>使用真实录制 observation；不创建 Robot，不发送动作。</span></div></div>
+        <div class="open-loop-controls">
+          <label>Policy URL<input id="openLoopPolicyUrl" value="ws://127.0.0.1:8000" /></label>
+          <label>Policy label<input id="openLoopPolicyLabel" value="policy" /></label>
+          <label>target source<select id="openLoopTargetSource"><option value="action">action</option><option value="executed_action">executed_action</option><option value="expert_action">expert_action</option></select></label>
+          <label>alignment<select id="openLoopAlignment"><option value="sample_index">sample index</option><option value="timestamp">timestamp</option><option value="absolute_control_step">absolute control step</option></select></label>
+          <label>timestamp tolerance (s)<input id="openLoopTimestampError" type="number" min="0" step="0.001" value="0.05" /></label>
+          <label>camera roles（逗号分隔，留空为全部）<input id="openLoopCameraRoles" /></label>
+          <label class="checkbox"><input id="openLoopFrameControl" type="checkbox" /> frame_index 是 control step</label>
+        </div>
+        <div class="sample-actions"><button id="startOpenLoop" type="button" class="primary">开始开环评测</button><button id="stopOpenLoop" type="button" disabled>停止评测</button></div>
+        <div class="selected" id="openLoopStatus">尚未提交开环评测。</div>
+        <div class="open-loop-result" id="openLoopResult"></div>
       </section>
 
       <section class="card playback">

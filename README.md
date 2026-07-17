@@ -203,8 +203,9 @@ motion test.
 Use the dedicated read-only Episode Viewer for synchronized LeRobot v2.1
 videos, state/action curves, runtime events, metrics, and a draggable sample
 timeline. It is intentionally separate from real-robot trajectory replay:
-the process imports no robot SDK and never creates a Robot, Camera, or
-PolicyClient.
+the process imports no robot SDK and never creates a Robot or Camera. Browsing
+does not create a PolicyClient; an explicitly submitted Stage-11 open-loop job
+may create one in its background worker only.
 
 ```bash
 uv run mp-data-view \
@@ -218,6 +219,38 @@ dataset directories; the UI exposes only catalog-generated dataset IDs, never
 arbitrary frontend file paths. Standard LeRobot datasets remain viewable when
 mp-real telemetry is absent; those unavailable fields are displayed as
 unrecorded rather than inferred.
+
+### Teacher-forced open-loop policy evaluation
+
+`mp-open-loop-eval` evaluates full policy action chunks against real LeRobot
+v2.1 observations. It creates no `Robot`, does not import a robot SDK, and
+never sends an action. Warmup chunks are discarded; fresh per-sample
+predictions are written beneath an isolated result directory.
+
+```bash
+uv run mp-open-loop-eval \
+  --dataset recordings/<dataset> \
+  --episode 0 \
+  --policy-url ws://127.0.0.1:8000 \
+  --policy-label pi05-checkpoint-a \
+  --target-source action \
+  --alignment sample_index \
+  --output open_loop_results/pi05-checkpoint-a
+```
+
+For absolute-control-step alignment, the dataset must have valid
+`mp_real.chunk_cursor` telemetry and the operator must explicitly declare that
+its `frame_index` values are control steps:
+
+```bash
+uv run mp-open-loop-eval ... \
+  --alignment absolute_control_step \
+  --allow-frame-index-as-control-step
+```
+
+For an episode with multiple tasks, `--prompt-override` is required. Results
+with different ActionSpec or target sources must not be combined. See
+`docs/validation_stage_11.md` before comparing real policy checkpoints.
 
 ### Safe robot trajectory replay
 

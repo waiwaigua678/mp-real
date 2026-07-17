@@ -26,6 +26,7 @@ from mp_real.pose.models import (
 from mp_real.robots.base import Robot
 from mp_real.robots.registry import register_robot
 from mp_real.runtime.config import InferenceLoopConfig
+from mp_real.runtime.inference import decode_action_chunk_for_spec
 from mp_real.runtime.inference import run_infer_only as run_generic_infer_only
 from mp_real.runtime.inference import run_rtc_loop as run_generic_rtc_loop
 from mp_real.runtime.inference import run_sync_loop as run_generic_sync_loop
@@ -538,12 +539,17 @@ def action_to_targets(action: np.ndarray) -> tuple[np.ndarray, float, np.ndarray
 
 
 def response_to_action_chunk(response: dict, args: Args) -> np.ndarray:
-    action_chunk = np.array(response["actions"], dtype=np.float32, copy=True)
-    if action_chunk.ndim != 2:
-        raise RuntimeError(f"Expected action chunk [T, 14], got shape {action_chunk.shape}")
-    if len(action_chunk) < args.replan_steps:
-        raise RuntimeError(f"replan_steps={args.replan_steps}, but policy returned only {len(action_chunk)} actions")
-    return action_chunk[: args.replan_steps, :14]
+    return decode_action_chunk_for_spec(
+        response,
+        action_spec=ActionSpec(
+            action_dim=14,
+            state_dim=14,
+            joint_dof_per_arm=6,
+            joint_unit="rad",
+            camera_roles=("cam_head", "cam_left_wrist", "cam_right_wrist"),
+        ),
+        replan_steps=args.replan_steps,
+    )
 
 
 def gripper_to_deg(value: float, args: Args) -> float:

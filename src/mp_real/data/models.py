@@ -111,6 +111,8 @@ class RecordedEpisodeSource(Protocol):
 
     def get_length(self, episode_index: int) -> int: ...
 
+    def get_task(self, episode_index: int, task_index: int) -> str: ...
+
     def get_pose_state_sample(self, episode_index: int, index: int) -> tuple[np.ndarray, float]: ...
 
     def get_sample(self, episode_index: int, index: int) -> RecordedSample: ...
@@ -173,6 +175,15 @@ class FakeRecordedEpisodeSource:
 
     def get_length(self, episode_index: int) -> int:
         return len(self._episodes[episode_index])
+
+    def get_task(self, episode_index: int, task_index: int) -> str:
+        metadata = self.get_episode_metadata(episode_index)
+        if len(metadata.tasks) != 1:
+            raise ValueError(
+                f"fake episode {episode_index} does not have one unambiguous task; use an explicit prompt override"
+            )
+        del task_index
+        return metadata.tasks[0]
 
     def get_pose_state_sample(self, episode_index: int, index: int) -> tuple[np.ndarray, float]:
         sample = self._episodes[episode_index][index]

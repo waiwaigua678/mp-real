@@ -18,7 +18,7 @@ from mp_real.common.runtime import (
     sleep_remaining,
 )
 from mp_real.runtime.config import InferenceLoopConfig
-from mp_real.runtime.models import ActionProvenance, ObservationSnapshot
+from mp_real.runtime.models import ActionProvenance, ActionSpec, ObservationSnapshot
 
 
 class PolicyClient(Protocol):
@@ -51,6 +51,35 @@ class PolicyProtocolError(RuntimeError):
 
 class ActionDecodeError(RuntimeError):
     """The robot-specific action decoder rejected a policy response."""
+
+
+def decode_action_chunk_for_spec(
+    response: Mapping[str, Any], *, action_spec: ActionSpec, replan_steps: int
+) -> np.ndarray:
+    """Decode the common OpenPI ``actions`` payload against an ActionSpec.
+
+    Robot modules may add command-side conversion after this boundary, but the
+    policy chunk's shape, dimensionality and replan contract are shared by
+    deployment and teacher-forced offline evaluation.
+    """
+
+    if replan_steps <= 0:
+        raise ValueError("replan_steps must be positive")
+    try:
+        raw = np.asarray(response["actions"], dtype=np.float32)
+    except KeyError as exc:
+        raise ActionDecodeError("Policy response is missing 'actions'") from exc
+    except (TypeError, ValueError) as exc:
+        raise ActionDecodeError("Policy response 'actions' is not numeric") from exc
+    try:
+        validated = action_spec.validate_chunk(raw)
+    except (RuntimeError, ValueError) as exc:
+        raise ActionDecodeError(str(exc)) from exc
+    if len(validated) < replan_steps:
+        raise ActionDecodeError(
+            f"replan_steps={replan_steps}, but policy returned only {len(validated)} actions"
+        )
+    return validated[:replan_steps].copy()
 
 
 @dataclasses.dataclass(frozen=True)

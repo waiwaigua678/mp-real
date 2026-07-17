@@ -1048,6 +1048,17 @@ class LeRobotV21EpisodeSource(RecordedEpisodeSource):
             return 0
         return min(declared_length, self._parquet_file(episode_index).metadata.num_rows)
 
+    def get_task(self, episode_index: int, task_index: int) -> str:
+        """Return the recorded task selected by a sample's standard task index."""
+        if episode_index not in self._episodes:
+            raise KeyError(episode_index)
+        try:
+            return self._tasks[task_index]
+        except KeyError as exc:
+            raise DatasetValidationError(
+                f"episode {episode_index} references unknown task_index {task_index}"
+            ) from exc
+
     def get_sample(self, episode_index: int, index: int, *, include_images: bool = True) -> RecordedSample:
         if index < 0 or index >= self.get_length(episode_index):
             raise IndexError(index)

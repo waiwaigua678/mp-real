@@ -15,6 +15,8 @@ let fractionalIndex = 0;
 let lastTick = null;
 let loadingSample = false;
 let requestGeneration = 0;
+let openLoopJobId = null;
+let openLoopPollTimer = null;
 
 async function requestJson(url, options = {}) {
   const response = await fetch(url, { cache: "no-store", ...options });
@@ -319,6 +321,114 @@ function playbackTick(now) {
   requestAnimationFrame(playbackTick);
 }
 
+async function startOpenLoop() {
+  if (!datasetId || !metadata) throw new Error("请先选择可读取的 dataset 和 episode");
+  const payload = await requestJson("/api/data-view/open-loop-evaluations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      dataset_id: datasetId,
+      episode_index: episodeIndex,
+      policy_url: document.querySelector("#openLoopPolicyUrl").value,
+      policy_label: document.querySelector("#openLoopPolicyLabel").value,
+      target_source: document.querySelector("#openLoopTargetSource").value,
+      alignment: document.querySelector("#openLoopAlignment").value,
+      max_timestamp_error: Number(document.querySelector("#openLoopTimestampError").value),
+      camera_roles: document.querySelector("#openLoopCameraRoles").value.split(",").map((item) => item.trim()).filter(Boolean),
+      allow_frame_index_as_control_step: document.querySelector("#openLoopFrameControl").checked,
+    }),
+  });
+  openLoopJobId = payload.job.job_id;
+  document.querySelector("#stopOpenLoop").disabled = false;
+  renderOpenLoopStatus(payload.job);
+  pollOpenLoop();
+}
+
+async function pollOpenLoop() {
+  if (!openLoopJobId) return;
+  try {
+    const payload = await requestJson(`/api/data-view/open-loop-evaluations/${encodeURIComponent(openLoopJobId)}`);
+    renderOpenLoopStatus(payload.job);
+    if (["complete", "partial_error", "cancelled", "error"].includes(payload.job.state)) {
+      document.querySelector("#stopOpenLoop").disabled = true;
+      if (payload.job.state === "complete" || payload.job.state === "partial_error") await loadOpenLoopReport();
+      openLoopPollTimer = null;
+      return;
+    }
+  } catch (error) {
+    setMessage(error.message);
+    return;
+  }
+  openLoopPollTimer = window.setTimeout(pollOpenLoop, 500);
+}
+
+function renderOpenLoopStatus(job) {
+  const progress = job.progress || {};
+  const suffix = progress.total_samples ? ` · ${progress.completed_samples || 0}/${progress.total_samples} samples` : "";
+  document.querySelector("#openLoopStatus").textContent = `job ${job.job_id} · ${job.state}${suffix}${job.error_message ? ` · ${job.error_message}` : ""}`;
+}
+
+async function stopOpenLoop() {
+  if (!openLoopJobId) return;
+  const payload = await requestJson(`/api/data-view/open-loop-evaluations/${encodeURIComponent(openLoopJobId)}/stop`, { method: "POST" });
+  renderOpenLoopStatus(payload.job);
+}
+
+async function loadOpenLoopReport() {
+  if (!openLoopJobId) return;
+  const payload = await requestJson(
+    `/api/data-view/open-loop-evaluations/${encodeURIComponent(openLoopJobId)}/reports/${episodeIndex}?curves=1`,
+  );
+  const report = payload.report;
+  const result = document.querySelector("#openLoopResult");
+  result.replaceChildren();
+  const summary = document.createElement("div");
+  summary.textContent = `teacher_forced=${report.teacher_forced} · valid predictions=${report.valid_prediction_count} · overall MAE=${fmt(report.metrics?.overall_mae)} · RMSE=${fmt(report.metrics?.overall_rmse)}`;
+  result.appendChild(summary);
+  const horizon = document.createElement("div");
+  horizon.textContent = `horizon MAE: ${(report.metrics?.horizons || []).map((item) => `h${item.horizon}:${fmt(item.mae)}`).join(" · ") || "—"}`;
+  result.appendChild(horizon);
+  renderOpenLoopCurves(report.curves || [], result);
+  for (const item of report.top_errors || []) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = `最大误差 ${item.dimension_name}=${fmt(item.error)} · sample ${item.request_index} · h${item.horizon}`;
+    button.addEventListener("click", () => loadSample(item.request_index));
+    result.appendChild(button);
+  }
+}
+
+function renderOpenLoopCurves(series, container) {
+  const points = series.flatMap((item) => item.points || []);
+  if (!points.length) return;
+  const values = points.map((point) => Number(point[1])).filter(Number.isFinite);
+  if (!values.length) return;
+  let min = Math.min(...values); let max = Math.max(...values);
+  if (min === max) { min -= 1; max += 1; }
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 900 180");
+  svg.setAttribute("class", "open-loop-chart");
+  const colors = ["#08777f", "#c45424", "#6a4c93", "#2f855a", "#b7791f", "#c53030"];
+  const maxIndex = Math.max(...points.map((point) => Number(point[0])), 1);
+  series.forEach((item, index) => {
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    const d = (item.points || []).map((point, pointIndex) => {
+      const x = 12 + Number(point[0]) / maxIndex * 876;
+      const y = 168 - (Number(point[1]) - min) / (max - min) * 156;
+      return `${pointIndex ? "L" : "M"}${x.toFixed(2)},${y.toFixed(2)}`;
+    }).join(" ");
+    path.setAttribute("d", d);
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", colors[Math.floor(index / 2) % colors.length]);
+    path.setAttribute("stroke-width", item.kind === "prediction" ? "2" : "1");
+    if (item.kind === "target") path.setAttribute("stroke-dasharray", "4 3");
+    svg.appendChild(path);
+  });
+  const label = document.createElement("div");
+  label.textContent = "实线：prediction；虚线：target。颜色对应 action dimension。";
+  container.append(label, svg);
+}
+
 datasetSelect.addEventListener("change", async () => { datasetId = datasetSelect.value; await loadEpisodes(); });
 episodeSelect.addEventListener("change", async () => { episodeIndex = Number(episodeSelect.value); await loadEpisode(); });
 progress.addEventListener("input", () => setIndex(Number(progress.value)));
@@ -333,6 +443,8 @@ document.querySelector("#selectSample").addEventListener("click", async () => {
   const payload = await requestJson("/api/data-view/selection", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dataset_id: datasetId, episode_index: episodeIndex, sample_index: currentIndex, playback_rate: Number(playbackRate.value) }) });
   document.querySelector("#selectionState").textContent = `已选择 dataset ${payload.selection.dataset_id} · episode ${payload.selection.episode_index} · sample ${payload.selection.sample_index}，供后续阶段使用。`;
 });
+document.querySelector("#startOpenLoop").addEventListener("click", () => startOpenLoop().catch((error) => setMessage(error.message)));
+document.querySelector("#stopOpenLoop").addEventListener("click", () => stopOpenLoop().catch((error) => setMessage(error.message)));
 
 loadDatasets().catch((error) => setMessage(error.message));
 requestAnimationFrame(playbackTick);

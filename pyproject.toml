@@ -62,6 +62,7 @@ mp-camera-preview = "mp_real.web.camera_preview:main"
 mp-data-inspect = "mp_real.data.cli:inspect_cli"
 mp-data-validate = "mp_real.data.cli:validate_cli"
 mp-data-view = "mp_real.data.view_server:main"
+mp-open-loop-eval = "mp_real.evaluation.open_loop.cli:cli"
 mp-move-to-recorded-state = "mp_real.pose.cli:cli"
 mp-robot-replay = "mp_real.replay.cli:cli"
 
