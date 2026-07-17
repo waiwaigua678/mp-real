@@ -231,7 +231,7 @@ PIPER_WEB_PROFILE = RobotWebProfile(
     validate_args=_piper_validate,
     configure_reset=_piper_reset_args,
     include_camera_params=False,
-    capabilities=RobotWebCapabilities(True, False, False, True, ("sync", "rtc", "infer_only")),
+    capabilities=RobotWebCapabilities(True, True, False, True, ("sync", "rtc", "infer_only")),
 )
 
 RM2_WEB_PROFILE = RobotWebProfile(
@@ -246,7 +246,7 @@ RM2_WEB_PROFILE = RobotWebProfile(
     validate_args=infer_rm2.validate_args,
     configure_reset=_rm2_reset_args,
     include_camera_params=True,
-    capabilities=RobotWebCapabilities(True, False, False, True, ("sync", "rtc", "infer_only")),
+    capabilities=RobotWebCapabilities(True, True, False, True, ("sync", "rtc", "infer_only")),
 )
 
 WEB_PROFILES: dict[str, RobotWebProfile] = {

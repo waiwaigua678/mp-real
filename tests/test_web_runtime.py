@@ -3,12 +3,17 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import numpy as np
 
 from mp_real.common.camera import BlackCamera
+from mp_real.pose.models import PoseMoveProgress, PoseMoveResult, PoseValidationReport
+from mp_real.robots.piper import infer as infer_piper
 from mp_real.runtime.models import ActionSpec, RobotState
+from mp_real.web.profiles import PIPER_WEB_PROFILE
 from mp_real.web.server import CAMERA_NAMES, PiperWebRuntime, _default_args
 
 
@@ -38,6 +43,55 @@ class _FakeWebRobot:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _FakePoseWebRobot(_FakeWebRobot):
+    def __init__(self, action_spec: ActionSpec) -> None:
+        super().__init__()
+        self.action_spec = action_spec
+        self.state = np.zeros(action_spec.state_dim, dtype=np.float32)
+        self.pose_stops = 0
+
+    def read_state(self) -> RobotState:
+        return RobotState(self.state.copy(), time.monotonic())
+
+    def get_current_pose_state(self) -> RobotState:
+        return self.read_state()
+
+    def validate_pose_target(self, target: object) -> PoseValidationReport:
+        del target
+        return PoseValidationReport()
+
+    def plan_move_to_state(self, plan: object) -> object:
+        return plan
+
+    def execute_pose_plan(
+        self, plan: object, *, stop_event: threading.Event, on_progress: Any = None
+    ) -> PoseMoveResult:
+        for waypoint in plan.waypoints:
+            if stop_event.is_set():
+                return PoseMoveResult(plan.plan_id, "aborted", self.read_state(), None, "stopped")
+            self.state = waypoint.target.copy()
+            if on_progress is not None:
+                on_progress(
+                    PoseMoveProgress(
+                        plan.plan_id,
+                        waypoint.index,
+                        len(plan.waypoints),
+                        self.state.copy(),
+                        waypoint.target.copy(),
+                        0.0,
+                        time.monotonic_ns(),
+                    )
+                )
+        return PoseMoveResult(plan.plan_id, "reached", self.read_state(), 0.0)
+
+    def stop_pose_motion(self) -> None:
+        self.pose_stops += 1
+
+    def verify_target_reached(self, plan: object) -> PoseMoveResult:
+        error = float(np.max(np.abs(self.state - plan.target_state)))
+        return PoseMoveResult(plan.plan_id, "reached" if error <= 0.05 else "failed", self.read_state(), error)
 
 
 class _FakeWebPolicy:
@@ -138,6 +192,62 @@ def _wait_until(predicate: Any, *, timeout: float = 2.0) -> None:
 
 
 class WebRuntimeTests(unittest.TestCase):
+    def test_recorded_pose_handoff_never_resets_and_uses_fresh_policy_start(self) -> None:
+        # Reuse the recorder fixture to exercise the state-only target read.
+        from tests.test_data_view import _write_dataset
+
+        with TemporaryDirectory() as directory:
+            args = _default_args(camera_profile="black")
+            args.enable_on_start = False
+            args.reset_on_start = False
+            args.use_rtc = False
+            args.replan_steps = 1
+            args.max_steps = 1
+            args.fps = 1000.0
+            spec = PIPER_WEB_PROFILE.action_spec_for_args(args)
+            _write_dataset(Path(directory) / "recorded", spec=spec, robot_name="piper", frames=2, save_video=False)
+            robot = _FakePoseWebRobot(spec)
+            policy = _SlowFirstPolicy(0.0, actions=[9.0, 2.0, 3.0])
+            runtime = PiperWebRuntime(
+                args,
+                robot_factory=lambda name, config: robot,
+                policy_client_factory=lambda server_url, api_key, timeout: policy,
+                camera_factory=lambda config: {
+                    name: BlackCamera(name, width=config.camera_width, height=config.camera_height)
+                    for name in CAMERA_NAMES
+                },
+                recorded_data_roots=(Path(directory),),
+            )
+            self.addCleanup(runtime.disconnect)
+            dataset_id = runtime._recorded_data_view.datasets()[0]["dataset_id"]
+
+            selected = runtime.pose_select({"dataset_id": dataset_id, "episode_index": 0, "sample_index": 0})
+            self.assertEqual(selected["phase"], "offline_preflighted")
+            runtime.pose_connect()
+            _wait_until(lambda: runtime.pose_status()["phase"] in {"awaiting_move_confirmation", "failed"})
+            plan = runtime.pose_status()["plan"]
+            self.assertIsNotNone(plan)
+            runtime.pose_execute(plan["plan_hash"])
+            _wait_until(lambda: runtime.pose_status()["phase"] == "reached")
+            runtime.pose_prepare_deployment(plan["plan_hash"])
+            _wait_until(lambda: runtime.pose_status()["phase"] in {"awaiting_deployment_confirmation", "failed"})
+            self.assertEqual(runtime.pose_status()["phase"], "awaiting_deployment_confirmation")
+            runtime.pose_start_deployment(plan["plan_hash"])
+            _wait_until(lambda: runtime.status()["phase"] in {"stopped", "error"}, timeout=5.0)
+
+            self.assertEqual(robot.reset_count, 0)
+            self.assertGreaterEqual(len(policy.observations), 3)  # warmup, discarded prefetch, fresh final prefetch
+            np.testing.assert_array_equal(
+                robot.executed,
+                [
+                    infer_piper.stabilize_action(
+                        np.full(spec.action_dim, 3.0, dtype=np.float32),
+                        np.zeros(spec.action_dim, dtype=np.float32),
+                        args,
+                    )
+                ],
+            )
+
     def test_piper_web_runs_once_with_fake_robot_and_policy(self) -> None:
         args = _default_args(camera_profile="black")
         args.dry_run = True

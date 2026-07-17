@@ -30,6 +30,7 @@ let accessKey = sessionStorage.getItem("motrixAccessKey") || "";
 let cameraRoles = [];
 let evaluation = null;
 let evaluationRequestInFlight = false;
+let poseStatus = null;
 accessKeyInput.value = accessKey;
 
 function setMessage(text, kind = "") {
@@ -361,6 +362,73 @@ function applyStatus(status) {
   resetBtn.disabled = !status.can_reset;
   disconnectBtn.disabled = !status.can_disconnect;
   applyEvaluation(status.evaluation || null);
+  applyPose(status.pose || null);
+}
+
+function applyPose(pose) {
+  poseStatus = pose;
+  const phase = pose?.phase || "idle";
+  document.querySelector("#posePhase").textContent = phase;
+  document.querySelector("#poseDetails").textContent = JSON.stringify(
+    {
+      target: pose?.target || null,
+      validation: pose?.offline_validation || null,
+      plan: pose?.plan || null,
+      progress: pose?.progress || null,
+      error: pose?.error || null,
+    },
+    null,
+    2,
+  );
+  document.querySelector("#poseSelectBtn").disabled = !currentStatus?.can_edit_connection_config;
+  document.querySelector("#poseConnectBtn").disabled = phase !== "offline_preflighted";
+  document.querySelector("#poseExecuteBtn").disabled = phase !== "awaiting_move_confirmation";
+  document.querySelector("#poseStopBtn").disabled = phase !== "moving";
+  document.querySelector("#posePrepareDeployBtn").disabled = !["reached", "reached_with_warning"].includes(phase);
+  document.querySelector("#poseStartDeployBtn").disabled = phase !== "awaiting_deployment_confirmation";
+}
+
+async function poseRequest(url, payload = {}) {
+  try {
+    const data = await requestJson(url, { method: "POST", body: JSON.stringify(payload) });
+    applyPose(data.pose);
+    await refreshStatus();
+    return data.pose;
+  } catch (error) {
+    setMessage(error.message, "bad");
+    await refreshStatus();
+    return null;
+  }
+}
+
+function poseSelectionPayload() {
+  return {
+    dataset_id: document.querySelector("#poseDatasetId").value.trim(),
+    episode_index: Number(document.querySelector("#poseEpisodeIndex").value),
+    sample_index: Number(document.querySelector("#poseSampleIndex").value),
+  };
+}
+
+async function selectPose() {
+  await poseRequest("/api/pose/select", poseSelectionPayload());
+}
+
+async function executePose() {
+  const planHash = poseStatus?.plan?.plan_hash;
+  if (!planHash || !window.confirm(`确认以低速执行计划 ${planHash.slice(0, 12)}…？`)) return;
+  await poseRequest("/api/pose/execute", { plan_hash: planHash });
+}
+
+async function preparePoseDeployment() {
+  const planHash = poseStatus?.plan?.plan_hash;
+  if (!planHash || !window.confirm("确认姿态已到达；将连接真实相机和 Policy，但不会 reset 或执行 warmup action。")) return;
+  await poseRequest("/api/pose/prepare-deployment", { plan_hash: planHash });
+}
+
+async function startPoseDeployment() {
+  const planHash = poseStatus?.plan?.plan_hash;
+  if (!planHash || !window.confirm("确认使用当前真实相机帧和当前机器人状态开始实时推理？")) return;
+  await poseRequest("/api/pose/start-deployment", { plan_hash: planHash });
 }
 
 async function refreshStatus() {
@@ -498,6 +566,12 @@ startBtn.addEventListener("click", startRuntime);
 stopBtn.addEventListener("click", stopRuntime);
 resetBtn.addEventListener("click", resetRuntime);
 disconnectBtn.addEventListener("click", disconnectRuntime);
+document.querySelector("#poseSelectBtn").addEventListener("click", selectPose);
+document.querySelector("#poseConnectBtn").addEventListener("click", () => poseRequest("/api/pose/connect"));
+document.querySelector("#poseExecuteBtn").addEventListener("click", executePose);
+document.querySelector("#poseStopBtn").addEventListener("click", () => poseRequest("/api/pose/stop"));
+document.querySelector("#posePrepareDeployBtn").addEventListener("click", preparePoseDeployment);
+document.querySelector("#poseStartDeployBtn").addEventListener("click", startPoseDeployment);
 createEvaluationBtn.addEventListener("click", createEvaluation);
 abortEvaluationBtn.addEventListener("click", () => evaluationRequest("/api/evaluations/current/abort"));
 completeEvaluationBtn.addEventListener("click", () => evaluationRequest("/api/evaluations/current/complete"));

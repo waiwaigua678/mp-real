@@ -23,6 +23,14 @@ from mp_real.common.camera import (
 )
 from mp_real.common.runtime import parse_server_url, sleep_until
 from mp_real.policy_client import websocket_client_policy
+from mp_real.pose.models import (
+    MoveToRecordedStatePlan,
+    PoseMoveProgress,
+    PoseMoveResult,
+    PoseValidationIssue,
+    PoseValidationReport,
+    RecordedPoseTarget,
+)
 from mp_real.robots.base import Robot
 from mp_real.robots.registry import register_robot
 from mp_real.runtime.config import InferenceLoopConfig
@@ -391,6 +399,87 @@ class Rm2Robot(Robot):
 
     def reset(self) -> None:
         maybe_reset_arms(self.left, self.right, self.args, self.robot_lock)
+
+    def get_current_pose_state(self) -> RobotState:
+        return self.read_state()
+
+    def validate_pose_target(self, target: RecordedPoseTarget) -> PoseValidationReport:
+        del target
+        issues: list[PoseValidationIssue] = []
+        if not all(callable(getattr(arm, "stop", None)) for arm in (self.left, self.right)):
+            issues.append(PoseValidationIssue("stop_motion_unsupported", "RM2 arm stop() is unavailable"))
+        issues.append(
+            PoseValidationIssue(
+                "workspace_validation_unavailable",
+                "RM2 workspace validation is not configured for this SDK deployment",
+            )
+        )
+        issues.extend(
+            (
+                PoseValidationIssue(
+                    "joint_limit_validation_unavailable",
+                    "RM2 joint-limit validation is not configured for this SDK deployment",
+                ),
+                PoseValidationIssue(
+                    "health_validation_unavailable",
+                    "RM2 health validation is not configured for this SDK deployment",
+                ),
+            )
+        )
+        return PoseValidationReport(tuple(issues))
+
+    def plan_move_to_state(self, plan: MoveToRecordedStatePlan) -> MoveToRecordedStatePlan:
+        if plan.target_state.shape != (self.action_spec.state_dim,):
+            raise ValueError("RM2 pose plan dimension does not match its ActionSpec")
+        return plan
+
+    def execute_pose_plan(self, plan, *, stop_event, on_progress=None) -> PoseMoveResult:
+        previous = self.get_current_pose_state()
+        for waypoint in plan.waypoints:
+            if stop_event.is_set():
+                return PoseMoveResult(plan.plan_id, "aborted", previous, None, "stop requested")
+            cycle_started_ns = time.monotonic_ns()
+            error = float(np.max(np.abs(previous.values - waypoint.target)))
+            if error > plan.constraints.max_tracking_error:
+                return PoseMoveResult(plan.plan_id, "failed", previous, error, "tracking error exceeded")
+            with self.robot_lock:
+                _send_action_unlocked(waypoint.target, self.left, self.right, self.args)
+            if stop_event.wait(plan.constraints.control_period_s):
+                return PoseMoveResult(plan.plan_id, "aborted", self.get_current_pose_state(), None, "stop requested")
+            previous = self.get_current_pose_state()
+            elapsed_s = (time.monotonic_ns() - cycle_started_ns) / 1e9
+            if elapsed_s > plan.constraints.control_period_s + plan.constraints.max_control_overrun_s:
+                return PoseMoveResult(plan.plan_id, "failed", previous, None, "control cycle overrun")
+            if on_progress is not None:
+                on_progress(
+                    PoseMoveProgress(
+                        plan.plan_id,
+                        waypoint.index,
+                        len(plan.waypoints),
+                        previous.values.copy(),
+                        waypoint.target.copy(),
+                        float(np.max(np.abs(previous.values - waypoint.target))),
+                        time.monotonic_ns(),
+                    )
+                )
+        return PoseMoveResult(plan.plan_id, "reached", previous, 0.0)
+
+    def stop_pose_motion(self) -> None:
+        errors: list[BaseException] = []
+        with self.robot_lock:
+            for arm in (self.left, self.right):
+                try:
+                    arm.stop()
+                except BaseException as exc:
+                    errors.append(exc)
+        if errors:
+            raise errors[0]
+
+    def verify_target_reached(self, plan: MoveToRecordedStatePlan) -> PoseMoveResult:
+        current = self.get_current_pose_state()
+        error = float(np.max(np.abs(current.values - plan.target_state)))
+        status = "reached" if error <= plan.constraints.tracking_tolerance else "failed"
+        return PoseMoveResult(plan.plan_id, status, current, error, None if status == "reached" else "tracking error")
 
     def close(self) -> None:
         for arm in (self.left, self.right):

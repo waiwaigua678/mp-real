@@ -53,6 +53,15 @@ class ResourceLease:
             self._released = True
         self._manager._release(self.owner_id, self.requests)
 
+    def replace(self, requests: Iterable[ResourceRequest]) -> ResourceLease:
+        """Atomically change this owner's resource set without a release gap."""
+        with self._lock:
+            if self._released:
+                raise RuntimeError("cannot replace a released resource lease")
+            replacement = self._manager._replace(self.owner_id, self.requests, requests)
+            self._released = True
+            return replacement
+
     def __enter__(self) -> ResourceLease:
         return self
 
@@ -112,3 +121,34 @@ class ResourceLeaseManager:
             for request in requests:
                 if self._owners.get(request) == owner_id:
                     del self._owners[request]
+
+    def _replace(
+        self,
+        owner_id: str,
+        previous: tuple[ResourceRequest, ...],
+        requested: Iterable[ResourceRequest],
+    ) -> ResourceLease:
+        normalized = tuple(dict.fromkeys(requested))
+        if not normalized:
+            raise ValueError("at least one resource request is required")
+        with self._lock:
+            # A stale handle must never delete a resource that another
+            # lifecycle acquired after the original owner released it.
+            if any(self._owners.get(request) != owner_id for request in previous):
+                raise ResourceLeaseConflict("resource lease is no longer owned by this lifecycle")
+            conflicts = [
+                (request, owner)
+                for request in normalized
+                if (owner := self._owners.get(request)) is not None and owner != owner_id
+            ]
+            if conflicts:
+                request, owner = conflicts[0]
+                raise ResourceLeaseConflict(
+                    f"{request.resource_type.value}:{request.scope} is already owned by {owner}"
+                )
+            for request in previous:
+                if request not in normalized and self._owners.get(request) == owner_id:
+                    del self._owners[request]
+            for request in normalized:
+                self._owners[request] = owner_id
+        return ResourceLease(self, owner_id, normalized)

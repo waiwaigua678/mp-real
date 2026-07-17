@@ -174,6 +174,30 @@ the optional `meta/mp_real/` or `telemetry/` extensions. `mp-data-validate`
 returns a non-zero status for schema, timestamp, Parquet, metadata or video
 alignment errors.
 
+### Safe recorded-state pose planning
+
+Inspect a recorded `observation.state` without creating a Robot, camera, or
+PolicyClient. Dry-run is the default; `--execute` additionally requires a
+freshly revalidated plan hash and is intended only after the Stage 9 hardware
+gates have been approved.
+
+```bash
+uv run mp-move-to-recorded-state \
+  --robot piper --dataset recordings/<dataset> --episode-index 0 --sample-index 0
+```
+
+For a different but explicitly approved state schema, pass the same versioned
+JSON mapping to the CLI with `--config mapping.json`, or to the Web server
+with `--pose-mapping-config mapping.json`. Mapping is total and records every
+unit conversion; positional or implicit unit conversion is rejected.
+
+The Web server can be given an allow-listed recording root with repeated
+`--recorded-data-root PATH` options. The recorded-state panel submits only a
+dataset/episode/sample reference; the server rereads `observation.state`,
+performs schema preflight, then requires a plan-hash confirmation before a
+low-speed move. See `docs/hardware_validation_stage_9.md` before any real
+motion test.
+
 ### Offline data viewer
 
 Use the dedicated read-only Episode Viewer for synchronized LeRobot v2.1

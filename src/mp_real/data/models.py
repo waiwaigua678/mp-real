@@ -111,6 +111,8 @@ class RecordedEpisodeSource(Protocol):
 
     def get_length(self, episode_index: int) -> int: ...
 
+    def get_pose_state_sample(self, episode_index: int, index: int) -> tuple[np.ndarray, float]: ...
+
     def get_sample(self, episode_index: int, index: int) -> RecordedSample: ...
 
     def get_sample_at_timestamp(self, episode_index: int, timestamp: float) -> RecordedSample: ...
@@ -164,6 +166,10 @@ class FakeRecordedEpisodeSource:
 
     def get_length(self, episode_index: int) -> int:
         return len(self._episodes[episode_index])
+
+    def get_pose_state_sample(self, episode_index: int, index: int) -> tuple[np.ndarray, float]:
+        sample = self._episodes[episode_index][index]
+        return np.asarray(sample.state, dtype=np.float32).copy(), float(sample.timestamp)
 
     def get_sample(self, episode_index: int, index: int) -> RecordedSample:
         return self._episodes[episode_index][index]

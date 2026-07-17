@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 import copy
 import dataclasses
 import enum
@@ -33,9 +33,11 @@ except ImportError:
 
 from mp_real.common.image import preprocess_image
 from mp_real.common.runtime import rtc_replan_stride
+from mp_real.data.view import DataViewSession
 from mp_real.evaluation.service import EvaluationConflict, EvaluationRuntimeLease, EvaluationService
 from mp_real.policy_client import msgpack_numpy
 from mp_real.robots.base import Robot
+from mp_real.robots.pose import PoseControlCapability
 from mp_real.robots.piper import infer as infer_piper
 from mp_real.robots.rm2 import infer as infer_rm2
 from mp_real.robots.registry import create_robot
@@ -53,6 +55,16 @@ from mp_real.runtime.startup import (
     PolicyStartupConfig,
     PolicyStartupCoordinator,
 )
+from mp_real.pose.config import load_pose_mapping_config
+from mp_real.pose.controller import PoseMoveController
+from mp_real.pose.models import (
+    MoveToRecordedStatePlan,
+    PoseMappingConfig,
+    PoseMotionConstraints,
+    PoseMoveProgress,
+    PoseValidationReport,
+)
+from mp_real.pose.validation import MoveToStateValidator
 from mp_real.web.runtime import CachedFrameObservationSource, WebInferenceAdapter, WebLoopHooks
 from mp_real.web.profiles import (
     PIPER_WEB_PROFILE,
@@ -95,6 +107,7 @@ def _git_commit() -> str | None:
         return None
     commit = completed.stdout.strip()
     return commit or None
+
 
 CONNECTION_CONFIG_FIELDS = {
     "runtime_mode",
@@ -143,6 +156,35 @@ class RuntimeMode(enum.StrEnum):
     DEPLOYMENT = "deployment"
     CAMERA_PREVIEW = "camera_preview"
     OFFLINE_REPLAY = "offline_replay"
+
+
+def _pose_validation_json(report: PoseValidationReport | None) -> dict[str, Any] | None:
+    if report is None:
+        return None
+    return {
+        "valid": report.valid,
+        "mapping_fingerprint": report.mapping_fingerprint,
+        "issues": [dataclasses.asdict(issue) for issue in report.issues],
+        "warnings": [dataclasses.asdict(issue) for issue in report.warnings],
+    }
+
+
+def _pose_plan_json(plan: MoveToRecordedStatePlan | None) -> dict[str, Any] | None:
+    if plan is None:
+        return None
+    return {
+        "plan_id": plan.plan_id,
+        "plan_hash": plan.plan_hash,
+        "current_state": plan.current_state.values.tolist(),
+        "target_state": plan.target_state.tolist(),
+        "per_dimension_delta": plan.per_dimension_delta.tolist(),
+        "mapped_joint_names": list(plan.mapped_joint_names),
+        "unit_conversions": [dataclasses.asdict(item) for item in plan.unit_conversions],
+        "expected_duration_s": plan.expected_duration_s,
+        "waypoint_count": len(plan.waypoints),
+        "safety_warnings": list(plan.safety_warnings),
+        "required_confirmations": list(plan.required_confirmations),
+    }
 
 
 def _runtime_mode(value: Any) -> RuntimeMode:
@@ -486,6 +528,8 @@ class RobotWebRuntime:
         policy_client_factory: Callable[[str, str | None, float], PolicyClient] | None = None,
         camera_factory: Callable[[Any], dict[str, infer_piper.Camera]] | None = None,
         resource_manager: ResourceLeaseManager | None = None,
+        recorded_data_roots: tuple[pathlib.Path | str, ...] = (),
+        pose_mapping_config: PoseMappingConfig | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._frame_condition = threading.Condition(self._lock)
@@ -508,6 +552,26 @@ class RobotWebRuntime:
         self._resource_lease: ResourceLease | None = None
         self._evaluation_owner: str | None = None
         self._evaluation_service = EvaluationService(self)
+        self._recorded_data_roots = tuple(recorded_data_roots)
+        self._recorded_data_view = DataViewSession(self._recorded_data_roots) if self._recorded_data_roots else None
+        self._pose_mapping_config = pose_mapping_config
+        self._pose_target = None
+        self._pose_validation: PoseValidationReport | None = None
+        self._pose_plan: MoveToRecordedStatePlan | None = None
+        self._pose_robot: Robot | None = None
+        self._pose_controller: PoseMoveController | None = None
+        self._pose_lease: ResourceLease | None = None
+        self._pose_connect_thread: threading.Thread | None = None
+        self._pose_watch_thread: threading.Thread | None = None
+        self._pose_handoff_thread: threading.Thread | None = None
+        self._pose_deploy_thread: threading.Thread | None = None
+        self._pose_stop_event = threading.Event()
+        self._pose_generation_id = 0
+        self._pose_phase = "idle"
+        self._pose_error: str | None = None
+        self._pose_progress: PoseMoveProgress | None = None
+        self._pose_prepared = None
+        self._recorded_start_context: dict[str, Any] | None = None
 
         self._controller: RuntimeController | None = None
         self._loop_hooks = WebLoopHooks(
@@ -577,6 +641,8 @@ class RobotWebRuntime:
             runtime_snapshot = self.get_config()
             runtime_snapshot["policy_metadata"] = _json_safe(self._server_metadata or {})
             runtime_snapshot["git_commit"] = _git_commit()
+            if self._recorded_start_context is not None:
+                runtime_snapshot["recorded_start"] = copy.deepcopy(self._recorded_start_context)
             action_spec_snapshot = dataclasses.asdict(controller.robot.action_spec)
             startup_config = self._policy_startup_config_locked()
             self._evaluation_owner = evaluation_id
@@ -1056,6 +1122,496 @@ class RobotWebRuntime:
             prefetch_first_chunk=self._policy_prefetch_first_chunk,
         )
 
+    def pose_select(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Select and preflight a recorded state without constructing hardware."""
+        dataset_id = str(payload.get("dataset_id", ""))
+        episode_index = int(payload.get("episode_index", -1))
+        sample_index = int(payload.get("sample_index", -1))
+        with self._lock:
+            if self._recorded_data_view is None:
+                raise ApiError("No recorded-data root is configured for this Web server", HTTPStatus.CONFLICT)
+            if (
+                self._connected
+                or self._running
+                or self._pose_robot is not None
+                or self._pose_phase not in {"idle", "offline_preflighted", "offline_rejected", "failed", "aborted"}
+            ):
+                raise ApiError(
+                    "Disconnect deployment and finish the current pose session before selecting a sample",
+                    HTTPStatus.CONFLICT,
+                )
+            viewer = self._recorded_data_view
+            profile = self._profile
+            args = copy.deepcopy(self._args)
+        target = viewer.pose_target(dataset_id, episode_index, sample_index)
+        validation = (
+            MoveToStateValidator(
+                profile.robot_name,
+                profile.action_spec_for_args(args),
+                mapping_config=self._pose_mapping_config,
+            )
+            .validate(target)
+            .report
+        )
+        with self._lock:
+            self._pose_target = target
+            self._pose_validation = validation
+            self._pose_plan = None
+            self._pose_phase = "offline_preflighted" if validation.valid else "offline_rejected"
+            self._pose_error = None if validation.valid else "; ".join(issue.message for issue in validation.issues)
+        return self.pose_status()
+
+    def pose_connect(self) -> dict[str, Any]:
+        """Queue a robot-only pose connection.  It never creates policy/cameras."""
+        with self._lock:
+            if self._pose_target is None or self._pose_validation is None:
+                raise ApiError("Select and preflight a recorded sample first", HTTPStatus.CONFLICT)
+            if not self._pose_validation.valid:
+                raise ApiError(
+                    "Offline pose preflight failed; an explicit mapping/configuration is required",
+                    HTTPStatus.CONFLICT,
+                )
+            if self._connected or self._running or self._pose_worker_active_locked():
+                raise ApiError("Normal deployment or another pose connection is active", HTTPStatus.CONFLICT)
+            target = self._pose_target
+            args = copy.deepcopy(self._args)
+            try:
+                lease = self._resource_manager.acquire(
+                    self._resource_owner_id,
+                    (
+                        ResourceRequest(ResourceType.ROBOT_CONTROL, self._profile.robot_name),
+                        ResourceRequest(ResourceType.RECORDED_DATA, target.dataset_id),
+                    ),
+                )
+            except ResourceLeaseConflict as exc:
+                raise ApiError(str(exc), HTTPStatus.CONFLICT) from exc
+            self._pose_lease = lease
+            self._pose_phase = "connecting_robot"
+            self._pose_error = None
+            self._pose_generation_id += 1
+            generation_id = self._pose_generation_id
+            self._pose_stop_event.clear()
+            self._pose_connect_thread = threading.Thread(
+                target=self._run_pose_connect,
+                args=(target, args, lease, generation_id),
+                name=f"{self._profile.robot_name}-pose-connect-{target.target_id[:8]}",
+                daemon=False,
+            )
+            self._pose_connect_thread.start()
+        return self.pose_status()
+
+    def _run_pose_connect(self, target: Any, args: Any, lease: ResourceLease, generation_id: int) -> None:
+        robot: Robot | None = None
+        try:
+            args.reset_on_start = False
+            if hasattr(args, "enable_on_start"):
+                args.enable_on_start = False
+            if hasattr(args, "speed_percent"):
+                args.speed_percent = min(int(args.speed_percent), 10)
+            robot = self._robot_factory(self._profile.robot_name, args)
+            self._require_pose_active(generation_id)
+            if not isinstance(robot, PoseControlCapability):
+                raise RuntimeError(f"{self._profile.robot_name} does not implement PoseControlCapability")
+            validation = MoveToStateValidator(
+                self._profile.robot_name,
+                robot.action_spec,
+                mapping_config=self._pose_mapping_config,
+            ).validate(target)
+            validation.report.require_valid()
+            robot.validate_pose_target(target).require_valid()
+            plan = MoveToRecordedStatePlan.build(
+                target=target,
+                current_state=robot.get_current_pose_state(),
+                target_state=validation.values,
+                gripper_indices=validation.gripper_indices,
+                mapped_joint_names=validation.field_names,
+                conversions=validation.mappings,
+                constraints=PoseMotionConstraints(),
+                safety_warnings=("vendor command speed capped at 10 percent",),
+                mapping_fingerprint=validation.report.mapping_fingerprint,
+                session_id=f"pose-{target.target_id[:16]}",
+                generation_id=1,
+            )
+            plan = robot.plan_move_to_state(plan)
+            self._require_pose_active(generation_id)
+        except BaseException as exc:
+            if robot is not None:
+                try:
+                    robot.close()
+                except BaseException:
+                    pass
+            lease.release()
+            with self._lock:
+                if self._pose_lease is lease:
+                    self._pose_lease = None
+                if generation_id == self._pose_generation_id:
+                    self._pose_phase = "aborted" if self._pose_stop_event.is_set() else "failed"
+                    self._pose_error = f"{type(exc).__name__}: {exc}"
+            self.log(f"Recorded-state pose connection ended: {type(exc).__name__}: {exc}")
+            return
+        with self._lock:
+            if self._pose_lease is not lease or lease.released or not self._pose_active_locked(generation_id):
+                should_close = True
+            else:
+                should_close = False
+                self._pose_robot = robot
+                self._pose_plan = plan
+                self._pose_phase = "awaiting_move_confirmation"
+                self._pose_error = None
+        if should_close:
+            robot.close()
+
+    def pose_execute(self, plan_hash: str) -> dict[str, Any]:
+        with self._lock:
+            plan = self._pose_plan
+            robot = self._pose_robot
+            if self._pose_phase != "awaiting_move_confirmation" or plan is None or robot is None:
+                raise ApiError("A connected, revalidated pose plan is required", HTTPStatus.CONFLICT)
+            if not secrets.compare_digest(plan.plan_hash, str(plan_hash)):
+                raise ApiError("The confirmation plan hash does not match the current plan", HTTPStatus.CONFLICT)
+            if not isinstance(robot, PoseControlCapability):
+                raise ApiError("Robot no longer supports recorded-state pose control", HTTPStatus.CONFLICT)
+            controller = PoseMoveController(robot, thread_name=f"{self._profile.robot_name}-pose")
+            self._pose_controller = controller
+            self._pose_phase = "moving"
+            self._pose_progress = None
+            try:
+                controller.start(plan, on_progress=self._record_pose_progress)
+            except BaseException as exc:
+                self._pose_controller = None
+                self._pose_phase = "failed"
+                self._pose_error = f"{type(exc).__name__}: {exc}"
+                raise ApiError(self._pose_error, HTTPStatus.CONFLICT) from exc
+            watcher = threading.Thread(
+                target=self._watch_pose_move,
+                args=(controller, plan),
+                name=f"{self._profile.robot_name}-pose-watch-{plan.plan_id[:8]}",
+                daemon=False,
+            )
+            self._pose_watch_thread = watcher
+            watcher.start()
+        return self.pose_status()
+
+    def _record_pose_progress(self, progress: PoseMoveProgress) -> None:
+        with self._lock:
+            if self._pose_plan is not None and progress.plan_id == self._pose_plan.plan_id:
+                self._pose_progress = progress
+
+    def _watch_pose_move(self, controller: PoseMoveController, plan: MoveToRecordedStatePlan) -> None:
+        controller.join(raise_on_error=False)
+        error = controller.error()
+        result = controller.result()
+        with self._lock:
+            if self._pose_controller is not controller or self._pose_plan is not plan:
+                return
+            if error is not None:
+                self._pose_phase = "failed"
+                self._pose_error = f"{type(error).__name__}: {error}"
+            elif result is not None and result.status in {"reached", "reached_with_warning"}:
+                self._pose_phase = result.status
+                self._pose_error = result.message
+            else:
+                self._pose_phase = "failed"
+                self._pose_error = "pose controller ended without a verified result"
+
+    def pose_stop(self) -> dict[str, Any]:
+        with self._lock:
+            controller = self._pose_controller
+            if controller is None or self._pose_phase != "moving":
+                return self.pose_status()
+            self._pose_phase = "stopping"
+        controller.stop(wait=False)
+        return self.pose_status()
+
+    def pose_prepare_deployment(self, plan_hash: str) -> dict[str, Any]:
+        """Handoff a verified pose connection to cameras/policy without reset."""
+        with self._lock:
+            plan = self._pose_plan
+            robot = self._pose_robot
+            lease = self._pose_lease
+            if (
+                self._pose_phase not in {"reached", "reached_with_warning"}
+                or plan is None
+                or robot is None
+                or lease is None
+            ):
+                raise ApiError(
+                    "A reached recorded-state pose is required before deployment handoff",
+                    HTTPStatus.CONFLICT,
+                )
+            if not secrets.compare_digest(plan.plan_hash, str(plan_hash)):
+                raise ApiError("The handoff plan hash does not match the reached plan", HTTPStatus.CONFLICT)
+            if self._pose_handoff_thread is not None and self._pose_handoff_thread.is_alive():
+                raise ApiError("Recorded-state deployment handoff is already running", HTTPStatus.CONFLICT)
+            self._pose_phase = "handoff_connecting"
+            self._pose_error = None
+            generation_id = self._pose_generation_id
+            args = copy.deepcopy(self._args)
+            self._pose_handoff_thread = threading.Thread(
+                target=self._run_pose_handoff,
+                args=(plan, robot, lease, args, generation_id),
+                name=f"{self._profile.robot_name}-pose-handoff-{plan.plan_id[:8]}",
+                daemon=False,
+            )
+            self._pose_handoff_thread.start()
+        return self.pose_status()
+
+    def _run_pose_handoff(
+        self,
+        plan: MoveToRecordedStatePlan,
+        robot: Robot,
+        lease: ResourceLease,
+        args: Any,
+        generation_id: int,
+    ) -> None:
+        client: PolicyClient | None = None
+        cameras: dict[str, infer_piper.Camera] = {}
+        controller: RuntimeController | None = None
+        replacement: ResourceLease | None = None
+        try:
+            requested = (
+                *self._resource_requests(RuntimeMode.DEPLOYMENT, args),
+                ResourceRequest(ResourceType.RECORDED_DATA, plan.target.dataset_id),
+            )
+            replacement = lease.replace(requested)
+            self._require_pose_active(generation_id)
+            client = self._create_policy_client(args)
+            self._require_pose_active(generation_id)
+            cameras = self._camera_factory(args)
+            self._require_pose_active(generation_id)
+            adapter = self._make_inference_adapter(robot, args)
+            controller = RuntimeController(
+                robot,
+                adapter,
+                client,
+                self._loop_config(args),
+                hooks=self._loop_hooks,
+                on_step=self._loop_hooks.on_step,
+                thread_name=f"{self._profile.robot_name}-web-run",
+                print_infer_only_chunks=False,
+                event_sink=CompositeRuntimeEventSink(InMemoryRuntimeEventSink(), self._evaluation_service),
+            )
+            with self._lock:
+                if self._pose_robot is not robot or self._pose_lease is not lease:
+                    raise PolicyStartupCancelled("pose handoff was superseded")
+                self._require_pose_active(generation_id)
+                self._resource_lease = replacement
+                self._pose_lease = None
+                self._pose_robot = None
+                self._pose_controller = None
+                self._controller = controller
+                self._cameras = cameras
+                self._connected = True
+                self._policy_connected = True
+                self._policy_state = "WARMING_UP"
+                self._phase = "pose_warming_up"
+                self._ensure_camera_thread_locked(args, self._camera_stream_fps)
+                startup_config = self._policy_startup_config_locked()
+            coordinator = PolicyStartupCoordinator(
+                controller.policy_client,
+                adapter,
+                self._loop_config(args),
+                startup_config,
+                hooks=self._loop_hooks,
+                stop_requested=lambda: self._pose_cancelled(generation_id),
+            )
+            prepared = coordinator.prepare()
+            with self._lock:
+                if self._controller is not controller:
+                    raise PolicyStartupCancelled("pose handoff was superseded")
+                self._require_pose_active(generation_id)
+                self._pose_prepared = prepared
+                self._pose_phase = "awaiting_deployment_confirmation"
+                self._phase = "pose_ready_to_deploy"
+                self._policy_state = "READY"
+        except BaseException as exc:
+            if cameras:
+                close_profile_cameras(cameras)
+            if controller is not None:
+                controller.close()
+            else:
+                if client is not None:
+                    client.close()
+                if robot is not None:
+                    robot.close()
+            if replacement is not None:
+                replacement.release()
+            elif not lease.released:
+                lease.release()
+            with self._lock:
+                self._controller = None
+                self._cameras = {}
+                self._resource_lease = None
+                self._pose_lease = None
+                self._pose_robot = None
+                self._connected = False
+                self._policy_connected = False
+                self._pose_phase = "aborted" if self._pose_cancelled(generation_id) else "failed"
+                self._pose_error = f"{type(exc).__name__}: {exc}"
+                self._phase = "error"
+                self._policy_state = "ERROR"
+            self.log(f"Recorded-state deployment handoff failed: {type(exc).__name__}: {exc}")
+
+    def pose_start_deployment(self, plan_hash: str) -> dict[str, Any]:
+        """After a second confirmation, request a new live first chunk and start."""
+        with self._lock:
+            plan = self._pose_plan
+            controller = self._controller
+            if self._pose_phase != "awaiting_deployment_confirmation" or plan is None or controller is None:
+                raise ApiError(
+                    "Recorded-state policy warmup must finish before deployment can start",
+                    HTTPStatus.CONFLICT,
+                )
+            if not secrets.compare_digest(plan.plan_hash, str(plan_hash)):
+                raise ApiError("The deployment plan hash does not match the reached plan", HTTPStatus.CONFLICT)
+            current = controller.robot.read_state()
+            tracking_error = float(np.max(np.abs(current.values - plan.target_state)))
+            if tracking_error > plan.constraints.tracking_tolerance:
+                raise ApiError(
+                    "Robot pose changed after handoff; generate and revalidate a new move plan",
+                    HTTPStatus.CONFLICT,
+                )
+            if self._pose_deploy_thread is not None and self._pose_deploy_thread.is_alive():
+                raise ApiError("Recorded-state deployment start is already running", HTTPStatus.CONFLICT)
+            args = copy.deepcopy(self._args)
+            baseline_sequences = {name: frame.sequence for name, frame in self._frames.items()}
+            self._pose_phase = "prefetching_fresh_live_chunk"
+            generation_id = self._pose_generation_id
+            self._pose_deploy_thread = threading.Thread(
+                target=self._run_pose_deployment_start,
+                args=(plan, controller, args, baseline_sequences, tracking_error, generation_id),
+                name=f"{self._profile.robot_name}-pose-deploy-{plan.plan_id[:8]}",
+                daemon=False,
+            )
+            self._pose_deploy_thread.start()
+        return self.pose_status()
+
+    def _run_pose_deployment_start(
+        self,
+        plan: MoveToRecordedStatePlan,
+        controller: RuntimeController,
+        args: Any,
+        baseline_sequences: Mapping[str, int],
+        tracking_error: float,
+        generation_id: int,
+    ) -> None:
+        try:
+            self._wait_for_fresh_pose_frames(args, baseline_sequences, generation_id)
+            adapter = self._make_inference_adapter(controller.robot, args)
+            startup_config = dataclasses.replace(self._policy_startup_config_locked(), warmup_enabled=False)
+            prepared = PolicyStartupCoordinator(
+                controller.policy_client,
+                adapter,
+                self._loop_config(args),
+                startup_config,
+                hooks=self._loop_hooks,
+                stop_requested=lambda: self._pose_cancelled(generation_id),
+            ).prepare()
+            with self._lock:
+                if self._controller is not controller or self._pose_plan is not plan:
+                    return
+                self._require_pose_active(generation_id)
+                self._recorded_start_context = {
+                    "source_dataset": plan.target.dataset_id,
+                    "source_episode_index": plan.target.episode_index,
+                    "source_sample_index": plan.target.sample_index,
+                    "started_from_recorded_state": True,
+                    "move_plan_id": plan.plan_id,
+                    "target_tracking_error": tracking_error,
+                }
+                controller.configure_event_identity(session_id=plan.session_id, episode_id=None)
+                controller.configure(
+                    adapter,
+                    self._loop_config(args),
+                    hooks=self._loop_hooks,
+                    on_step=self._loop_hooks.on_step,
+                    initial_chunk=prepared.initial_chunk,
+                    initial_provenance=prepared.initial_provenance,
+                )
+                self._running = True
+                self._phase = "running"
+                self._policy_state = "RUNNING"
+                self._pose_phase = "deploying"
+            controller.start()
+        except BaseException as exc:
+            with self._lock:
+                if self._controller is controller:
+                    self._running = False
+                    self._phase = "pose_ready_to_deploy"
+                    self._policy_state = "READY"
+                    self._pose_phase = "awaiting_deployment_confirmation"
+                    self._pose_error = f"{type(exc).__name__}: {exc}"
+
+    def _wait_for_fresh_pose_frames(
+        self, args: Any, baseline_sequences: Mapping[str, int], generation_id: int
+    ) -> None:
+        deadline = time.monotonic() + args.camera_timeout
+        roles = self._profile.camera_roles_for_args(args)
+        with self._frame_condition:
+            while any(self._frames[name].sequence <= baseline_sequences.get(name, -1) for name in roles):
+                self._require_pose_active(generation_id)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("No fresh real camera frames arrived after recorded-state handoff")
+                self._frame_condition.wait(min(0.05, remaining))
+
+    def pose_status(self) -> dict[str, Any]:
+        with self._lock:
+            target = self._pose_target
+            plan = self._pose_plan
+            progress = self._pose_progress
+            return {
+                "phase": self._pose_phase,
+                "error": self._pose_error,
+                "target": {
+                    "dataset_id": target.dataset_id,
+                    "episode_index": target.episode_index,
+                    "sample_index": target.sample_index,
+                    "robot_name": target.robot_name,
+                    "state_schema": list(target.state_schema),
+                    "state_values": target.state_values.tolist(),
+                    "joint_unit": target.joint_unit,
+                    "target_id": target.target_id,
+                }
+                if target is not None
+                else None,
+                "offline_validation": _pose_validation_json(self._pose_validation),
+                "plan": _pose_plan_json(plan),
+                "progress": {
+                    "waypoint_index": progress.waypoint_index,
+                    "waypoint_count": progress.waypoint_count,
+                    "tracking_error": progress.tracking_error,
+                    "timestamp_monotonic_ns": progress.monotonic_timestamp_ns,
+                }
+                if progress is not None
+                else None,
+            }
+
+    def _pose_connect_active_locked(self) -> bool:
+        return self._pose_connect_thread is not None and self._pose_connect_thread.is_alive()
+
+    def _pose_worker_active_locked(self) -> bool:
+        return any(
+            thread is not None and thread.is_alive()
+            for thread in (
+                self._pose_connect_thread,
+                self._pose_watch_thread,
+                self._pose_handoff_thread,
+                self._pose_deploy_thread,
+            )
+        )
+
+    def _pose_active_locked(self, generation_id: int) -> bool:
+        return generation_id == self._pose_generation_id and not self._pose_stop_event.is_set()
+
+    def _pose_cancelled(self, generation_id: int) -> bool:
+        with self._lock:
+            return not self._pose_active_locked(generation_id)
+
+    def _require_pose_active(self, generation_id: int) -> None:
+        if self._pose_cancelled(generation_id):
+            raise PolicyStartupCancelled("recorded-state pose session was cancelled")
+
     def start(self) -> dict[str, Any]:
         with self._lock:
             self._refresh_controller_state_locked()
@@ -1472,6 +2028,48 @@ class RobotWebRuntime:
         with self._lock:
             if self._evaluation_owner is not None:
                 raise ApiError("Evaluation owns this deployment; abort it before disconnecting", HTTPStatus.CONFLICT)
+            # Every pose worker observes this generation.  Join before normal
+            # deployment cleanup so an old handoff cannot resurrect resources.
+            self._pose_generation_id += 1
+            self._pose_stop_event.set()
+            pose_controller = self._pose_controller
+            pose_moving = self._pose_phase in {"moving", "stopping"}
+        if pose_controller is not None and pose_moving:
+            pose_controller.stop(wait=True, timeout=2.0)
+        with self._lock:
+            pose_threads = tuple(
+                thread
+                for thread in (
+                    self._pose_connect_thread,
+                    self._pose_watch_thread,
+                    self._pose_handoff_thread,
+                    self._pose_deploy_thread,
+                )
+                if thread is not None and thread is not threading.current_thread()
+            )
+        deadline = time.monotonic() + 5.0
+        for thread in pose_threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        if any(thread.is_alive() for thread in pose_threads):
+            raise ApiError("Recorded-state worker is still stopping; retry disconnect shortly", HTTPStatus.CONFLICT)
+
+        # A pose-only connection has no RuntimeController yet, so normal
+        # deployment cleanup would otherwise leave its Robot/lease behind.
+        with self._lock:
+            pose_robot = self._pose_robot
+            pose_lease = self._pose_lease
+            self._pose_controller = None
+            self._pose_robot = None
+            self._pose_lease = None
+            self._pose_plan = None
+            self._pose_progress = None
+            self._pose_prepared = None
+            self._pose_phase = "idle"
+            self._pose_error = None
+        if pose_robot is not None:
+            pose_robot.close()
+        if pose_lease is not None:
+            pose_lease.release()
         self.stop(wait=True)
         with self._lock:
             if self._running or self._startup_active_locked() or self._connection_active_locked():
@@ -1776,6 +2374,7 @@ class RobotWebRuntime:
                 },
                 "frames": frames,
                 "evaluation": evaluation,
+                "pose": self.pose_status(),
                 "logs": list(self._logs),
                 "resource_leases": self._resource_manager.snapshot(),
             }
@@ -2281,6 +2880,8 @@ class PiperWebHandler(BaseHTTPRequestHandler):
                 self._send_json(self.server.runtime.status())
             elif path == "/api/config":
                 self._send_json(self.server.runtime.get_config())
+            elif path == "/api/pose/status":
+                self._send_json({"ok": True, "pose": self.server.runtime.pose_status()})
             elif path == "/api/evaluations/current":
                 self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.current()})
             elif path == "/api/replay/status":
@@ -2337,6 +2938,27 @@ class PiperWebHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.complete()})
             elif path == "/api/config":
                 self._send_json({"ok": True, "config": self.server.runtime.update_config(self._read_json())})
+            elif path == "/api/pose/select":
+                self._send_json({"ok": True, "pose": self.server.runtime.pose_select(self._read_json())})
+            elif path == "/api/pose/connect":
+                self._send_json({"ok": True, "pose": self.server.runtime.pose_connect()})
+            elif path == "/api/pose/execute":
+                payload = self._read_json()
+                self._send_json(
+                    {"ok": True, "pose": self.server.runtime.pose_execute(str(payload.get("plan_hash", "")))}
+                )
+            elif path == "/api/pose/stop":
+                self._send_json({"ok": True, "pose": self.server.runtime.pose_stop()})
+            elif path == "/api/pose/prepare-deployment":
+                payload = self._read_json()
+                self._send_json(
+                    {"ok": True, "pose": self.server.runtime.pose_prepare_deployment(str(payload.get("plan_hash", "")))}
+                )
+            elif path == "/api/pose/start-deployment":
+                payload = self._read_json()
+                self._send_json(
+                    {"ok": True, "pose": self.server.runtime.pose_start_deployment(str(payload.get("plan_hash", "")))}
+                )
             elif path == "/api/connect":
                 self._send_json({"ok": True, "status": self.server.runtime.connect()})
             elif path == "/api/start":
@@ -2456,8 +3078,22 @@ class PiperWebServer(ThreadingHTTPServer):
             raise ApiError("robot must be piper or rm2")
         if self.runtime.status()["connected"] or self.runtime.status()["running"]:
             raise ApiError("Disconnect before changing robot", HTTPStatus.CONFLICT)
+        if self.runtime.pose_status()["phase"] not in {
+            "idle",
+            "offline_preflighted",
+            "offline_rejected",
+            "failed",
+            "aborted",
+        }:
+            raise ApiError("Finish the recorded-state pose session before changing robot", HTTPStatus.CONFLICT)
         profile = get_web_profile(name)
-        self.runtime = RobotWebRuntime(profile=profile, resource_manager=self.runtime.resource_manager)
+        self.runtime = RobotWebRuntime(
+            profile=profile,
+            policy_timeout=self.runtime._policy_timeout,
+            resource_manager=self.runtime.resource_manager,
+            recorded_data_roots=self.runtime._recorded_data_roots,
+            pose_mapping_config=self.runtime._pose_mapping_config,
+        )
         return self.runtime.get_config()
 
 
@@ -2487,10 +3123,31 @@ def main() -> None:
     parser.add_argument("--policy-timeout", type=float, default=3.0)
     parser.add_argument("--robot", choices=("piper", "rm2"), default="piper")
     parser.add_argument("--access-key", default=None, help="Require X-Motrix-Key for Web control requests.")
+    parser.add_argument(
+        "--recorded-data-root",
+        action="append",
+        type=pathlib.Path,
+        default=[],
+        help="Allowed local recording root for safe recorded-state selection; may be repeated.",
+    )
+    parser.add_argument(
+        "--pose-mapping-config",
+        type=pathlib.Path,
+        help="Versioned explicit JSON mapping for a non-identical recorded-state schema.",
+    )
     cli_args = parser.parse_args()
 
     if cli_args.policy_timeout <= 0:
         parser.error("--policy-timeout must be positive")
+
+    try:
+        pose_mapping_config = (
+            load_pose_mapping_config(cli_args.pose_mapping_config)
+            if cli_args.pose_mapping_config is not None
+            else None
+        )
+    except (OSError, TypeError, ValueError, KeyError) as exc:
+        parser.error(f"invalid --pose-mapping-config: {exc}")
 
     profile = get_web_profile(cli_args.robot)
     runtime_args = (
@@ -2519,7 +3176,13 @@ def main() -> None:
         level=getattr(logging, cli_args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    runtime: Any = RobotWebRuntime(runtime_args, profile=profile, policy_timeout=cli_args.policy_timeout)
+    runtime: Any = RobotWebRuntime(
+        runtime_args,
+        profile=profile,
+        policy_timeout=cli_args.policy_timeout,
+        recorded_data_roots=tuple(cli_args.recorded_data_root),
+        pose_mapping_config=pose_mapping_config,
+    )
     access_key = cli_args.access_key or os.environ.get("MOTRIX_WEB_ACCESS_KEY")
     server = PiperWebServer((cli_args.host, cli_args.port), PiperWebHandler, runtime, access_key=access_key)
     logging.info("Robot web UI (%s): http://%s:%s", profile.robot_name, cli_args.host, cli_args.port)

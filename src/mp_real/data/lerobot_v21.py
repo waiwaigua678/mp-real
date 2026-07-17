@@ -993,7 +993,7 @@ class LeRobotV21EpisodeSource(RecordedEpisodeSource):
             or (self._root / "meta" / "mp_real" / "recovery.json").exists()
             else EpisodeStatus.COMPLETE
         )
-        self._action_spec = _action_spec_from_info(self._info)
+        self._action_spec = _action_spec_from_recording_schema(self._root, self._info)
 
     def list_episodes(self) -> tuple[EpisodeMetadata, ...]:
         return tuple(self.get_episode_metadata(index) for index in sorted(self._episodes))
@@ -1061,6 +1061,13 @@ class LeRobotV21EpisodeSource(RecordedEpisodeSource):
             images=images,
             telemetry=telemetry,
         )
+
+    def get_pose_state_sample(self, episode_index: int, index: int) -> tuple[np.ndarray, float]:
+        """Read exactly the recorded state and timestamp for a pose target."""
+        if index < 0 or index >= self.get_length(episode_index):
+            raise IndexError(index)
+        row = self.get_row(episode_index, index, columns=("timestamp", "observation.state"))
+        return np.asarray(row["observation.state"], dtype=np.float32), float(row["timestamp"])
 
     def get_sample_at_timestamp(self, episode_index: int, timestamp: float) -> RecordedSample:
         length = self.get_length(episode_index)
@@ -1179,6 +1186,31 @@ class LeRobotV21EpisodeSource(RecordedEpisodeSource):
                 if frame_index == index:
                     return frame.to_ndarray(format="rgb24")
         raise IndexError(f"Video {path} contains no frame {index}")
+
+
+def _action_spec_from_recording_schema(root: Path, info: Mapping[str, Any]) -> ActionSpec:
+    """Prefer mp-real's exact ActionSpec snapshot over lossy LeRobot fields."""
+    schema_path = root / "meta" / "mp_real" / "schema.json"
+    if schema_path.is_file():
+        try:
+            payload = _load_json(schema_path)["action_spec"]
+            if isinstance(payload, Mapping):
+                return ActionSpec(
+                    action_dim=int(payload["action_dim"]),
+                    state_dim=int(payload["state_dim"]),
+                    joint_dof_per_arm=int(payload["joint_dof_per_arm"]),
+                    joint_unit=str(payload["joint_unit"]),
+                    camera_roles=tuple(str(item) for item in payload["camera_roles"]),
+                    supports_rtc=bool(payload.get("supports_rtc", True)),
+                    supports_interpolation=bool(payload.get("supports_interpolation", True)),
+                    state_fields=tuple(VectorField(**field) for field in payload.get("state_fields", ())),
+                    action_fields=tuple(VectorField(**field) for field in payload.get("action_fields", ())),
+                )
+        except (KeyError, TypeError, ValueError):
+            # An invalid optional extension is represented by the conservative
+            # unknown schema below and will be rejected by pose validation.
+            pass
+    return _action_spec_from_info(info)
 
 
 def _action_spec_from_info(info: Mapping[str, Any]) -> ActionSpec:

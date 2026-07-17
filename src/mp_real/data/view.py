@@ -16,6 +16,7 @@ import numpy as np
 from mp_real.data.catalog import CatalogDataset, RecordedDataCatalog
 from mp_real.data.lerobot_v21 import LeRobotV21EpisodeSource
 from mp_real.data.models import EpisodeMetadata, RecordedSample
+from mp_real.data.pose import recorded_pose_target
 from mp_real.evaluation.metrics import compute_episode_metrics
 
 
@@ -569,6 +570,21 @@ class DataViewSession:
         with self._lock:
             self._selection = cursor
         return {"selection": dataclasses.asdict(cursor)}
+
+    def pose_target(self, dataset_id: str, episode_index: int, sample_index: int):
+        """Return a state-only target for a separate, authenticated control flow.
+
+        This does not acquire a Robot or make a motion; the caller must still
+        perform its own schema and live-state revalidation.
+        """
+        reader = self._reader(dataset_id)
+        timeline = reader.timeline(episode_index)
+        return recorded_pose_target(
+            reader.source,
+            dataset_id=dataset_id,
+            episode_index=episode_index,
+            sample_index=timeline.clamp_index(sample_index),
+        )
 
     def _dataset_entries(self) -> tuple[_DatasetEntry, ...]:
         entries = []
