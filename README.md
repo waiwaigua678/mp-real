@@ -252,6 +252,30 @@ For an episode with multiple tasks, `--prompt-override` is required. Results
 with different ActionSpec or target sources must not be combined. See
 `docs/validation_stage_11.md` before comparing real policy checkpoints.
 
+### Reproducible Baselines and A/B comparison
+
+`mp-baseline` stores small, versioned experiment definitions under
+`recordings/baselines/` by default. A Baseline captures the Git commit, policy
+identity, ActionSpec, camera/robot/runtime/RTC/safety settings, evaluation
+protocol and compact links to real-robot and open-loop results. It never stores
+an API key or episode/video payload.
+
+```bash
+uv run mp-baseline list
+uv run mp-baseline show <id>
+uv run mp-baseline diff <id-a> <id-b>
+uv run mp-baseline compare <id-a> <id-b>
+```
+
+The Robot Web **Baseline** page is the authoritative UI storage path; create
+and clone operations are queued to a bounded background writer. Starting from
+a Baseline only creates a manual evaluation session. It does not warm up a
+policy, start an episode, or send an action. A changed runtime is rejected with
+a categorized configuration diff until the operator explicitly creates a
+derived Baseline. See `docs/baseline_workflow.md`, the Piper/RM2
+[`robot_capability_matrix.md`](docs/robot_capability_matrix.md), and the
+[`piper_rm2_generality_audit.md`](docs/piper_rm2_generality_audit.md).
+
 ### Safe robot trajectory replay
 
 `mp-robot-replay` is distinct from offline viewing: it is policy-free and

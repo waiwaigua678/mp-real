@@ -6,7 +6,7 @@ import os
 import queue
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -314,6 +314,66 @@ class _VideoWriter:
                 "video.channels": 3,
                 "has_audio": False,
             }
+
+
+class _SequentialVideoReader:
+    """One bounded, thread-safe decoder for sequential viewer frame reads.
+
+    Episode playback normally asks for frame ``n`` followed by ``n + 1``.  A
+    fresh PyAV container for every request turns that into repeated decoding
+    from frame zero.  This reader holds only the last decoded RGB frame and a
+    decoder cursor, so sequential reads are O(1) decoded frames while random
+    backwards seeks deliberately restart from the beginning.  The latter is
+    less common and keeps cache memory and seek assumptions bounded.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = threading.RLock()
+        self._container: Any | None = None
+        self._frames: Iterator[Any] | None = None
+        self._next_index = 0
+        self._last_frame: np.ndarray | None = None
+        self._last_index: int | None = None
+        self._exhausted = False
+
+    def frame_at(self, frame_index: int) -> tuple[np.ndarray | None, int | None]:
+        if frame_index < 0:
+            raise IndexError(frame_index)
+        with self._lock:
+            if self._last_index == frame_index and self._last_frame is not None:
+                return self._last_frame.copy(), self._last_index
+            if self._container is None or (self._last_index is not None and frame_index < self._last_index):
+                self._restart_locked()
+            while self._next_index <= frame_index and not self._exhausted:
+                assert self._frames is not None
+                try:
+                    frame = next(self._frames)
+                except StopIteration:
+                    self._exhausted = True
+                    break
+                self._last_frame = frame.to_ndarray(format="rgb24")
+                self._last_index = self._next_index
+                self._next_index += 1
+            if self._last_frame is None:
+                return None, None
+            return self._last_frame.copy(), self._last_index
+
+    def close(self) -> None:
+        with self._lock:
+            if self._container is not None:
+                self._container.close()
+            self._container = None
+            self._frames = None
+            self._last_frame = None
+            self._last_index = None
+            self._next_index = 0
+            self._exhausted = False
+
+    def _restart_locked(self) -> None:
+        self.close()
+        self._container = av.open(str(self._path))
+        self._frames = iter(self._container.decode(video=0))
 
 
 class _EpisodeWriter:
@@ -995,6 +1055,12 @@ class LeRobotV21EpisodeSource(RecordedEpisodeSource):
         # A recording may have a very long episode, and the viewer only needs a
         # bounded row batch for a selected sample or curve aggregation.
         self._parquet_files: dict[int, pq.ParquetFile] = {}
+        # Keep a small LRU of sequential decoders.  Each decoder retains only
+        # its most recently decoded frame, and is closed on eviction or source
+        # shutdown so browsing many episodes cannot accumulate video handles.
+        self._video_readers: OrderedDict[tuple[int, str], _SequentialVideoReader] = OrderedDict()
+        self._video_reader_lock = threading.RLock()
+        self._video_reader_capacity = 6
         self._status = (
             EpisodeStatus.INCOMPLETE
             if self._root.name.endswith(".inprogress")
@@ -1101,6 +1167,10 @@ class LeRobotV21EpisodeSource(RecordedEpisodeSource):
 
     def close(self) -> None:
         self._parquet_files.clear()
+        with self._video_reader_lock:
+            for reader in self._video_readers.values():
+                reader.close()
+            self._video_readers.clear()
 
     def get_row(self, episode_index: int, index: int, *, columns: tuple[str, ...] | None = None) -> dict[str, Any]:
         """Read one row through a bounded Parquet batch, without table caching."""
@@ -1155,16 +1225,7 @@ class LeRobotV21EpisodeSource(RecordedEpisodeSource):
         """Return an exact frame or the last older frame when a video is short."""
         if not self.has_camera_video(episode_index, role):
             return None, None
-        path = self._video_file(episode_index, role)
-        last_frame: np.ndarray | None = None
-        last_index: int | None = None
-        with av.open(str(path)) as container:
-            for current_index, frame in enumerate(container.decode(video=0)):
-                last_frame = frame.to_ndarray(format="rgb24")
-                last_index = current_index
-                if current_index >= frame_index:
-                    return last_frame, current_index
-        return last_frame, last_index
+        return self._video_reader(episode_index, role).frame_at(frame_index)
 
     def has_camera_video(self, episode_index: int, role: str) -> bool:
         return role in self.get_camera_roles() and self._video_file(episode_index, role).is_file()
@@ -1199,12 +1260,24 @@ class LeRobotV21EpisodeSource(RecordedEpisodeSource):
         )
 
     def _video_frame(self, episode_index: int, role: str, index: int) -> np.ndarray:
-        path = self._video_file(episode_index, role)
-        with av.open(str(path)) as container:
-            for frame_index, frame in enumerate(container.decode(video=0)):
-                if frame_index == index:
-                    return frame.to_ndarray(format="rgb24")
-        raise IndexError(f"Video {path} contains no frame {index}")
+        frame, rendered_frame_index = self._video_reader(episode_index, role).frame_at(index)
+        if frame is None or rendered_frame_index != index:
+            raise IndexError(f"Video {self._video_file(episode_index, role)} contains no frame {index}")
+        return frame
+
+    def _video_reader(self, episode_index: int, role: str) -> _SequentialVideoReader:
+        key = (episode_index, role)
+        with self._video_reader_lock:
+            reader = self._video_readers.get(key)
+            if reader is not None:
+                self._video_readers.move_to_end(key)
+                return reader
+            reader = _SequentialVideoReader(self._video_file(episode_index, role))
+            self._video_readers[key] = reader
+            while len(self._video_readers) > self._video_reader_capacity:
+                _, evicted = self._video_readers.popitem(last=False)
+                evicted.close()
+            return reader
 
 
 def _action_spec_from_recording_schema(root: Path, info: Mapping[str, Any]) -> ActionSpec:
@@ -1214,17 +1287,7 @@ def _action_spec_from_recording_schema(root: Path, info: Mapping[str, Any]) -> A
         try:
             payload = _load_json(schema_path)["action_spec"]
             if isinstance(payload, Mapping):
-                return ActionSpec(
-                    action_dim=int(payload["action_dim"]),
-                    state_dim=int(payload["state_dim"]),
-                    joint_dof_per_arm=int(payload["joint_dof_per_arm"]),
-                    joint_unit=str(payload["joint_unit"]),
-                    camera_roles=tuple(str(item) for item in payload["camera_roles"]),
-                    supports_rtc=bool(payload.get("supports_rtc", True)),
-                    supports_interpolation=bool(payload.get("supports_interpolation", True)),
-                    state_fields=tuple(VectorField(**field) for field in payload.get("state_fields", ())),
-                    action_fields=tuple(VectorField(**field) for field in payload.get("action_fields", ())),
-                )
+                return ActionSpec.from_dict(payload)
         except (KeyError, TypeError, ValueError):
             # An invalid optional extension is represented by the conservative
             # unknown schema below and will be rejected by pose validation.

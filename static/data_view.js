@@ -15,6 +15,8 @@ let fractionalIndex = 0;
 let lastTick = null;
 let loadingSample = false;
 let requestGeneration = 0;
+let sampleAbortController = null;
+const cameraViews = new Map();
 let openLoopJobId = null;
 let openLoopPollTimer = null;
 
@@ -94,22 +96,30 @@ async function loadEpisode() {
 async function loadSample(index) {
   if (!metadata || !datasetId) return;
   const normalized = Math.max(0, Math.min(metadata.length - 1, Math.round(index)));
-  currentIndex = normalized;
-  progress.value = String(normalized);
+  sampleAbortController?.abort();
+  const abortController = new AbortController();
+  sampleAbortController = abortController;
   loadingSample = true;
   const generation = ++requestGeneration;
   try {
     const payload = await requestJson(
       `/api/data-view/datasets/${encodeURIComponent(datasetId)}/episodes/${episodeIndex}/sample?sample_index=${normalized}`,
+      { signal: abortController.signal },
     );
     if (generation !== requestGeneration) return;
+    await renderCameras(payload.cameras || {}, normalized, generation, abortController.signal);
+    if (generation !== requestGeneration) return;
+    currentIndex = normalized;
+    progress.value = String(normalized);
     currentSample = payload;
     renderSample(payload);
-    renderCameras(payload.cameras || {});
   } catch (error) {
-    if (generation === requestGeneration) setMessage(error.message);
+    if (generation === requestGeneration && error.name !== "AbortError") setMessage(error.message);
   } finally {
-    if (generation === requestGeneration) loadingSample = false;
+    if (generation === requestGeneration) {
+      loadingSample = false;
+      sampleAbortController = null;
+    }
   }
 }
 
@@ -144,53 +154,93 @@ function renderSample(sample) {
   }
 }
 
-function renderCameras(cameras) {
+async function renderCameras(cameras, sampleAtRequest, generation, signal) {
   const grid = document.querySelector("#cameraGrid");
-  grid.replaceChildren();
-  for (const [role, camera] of Object.entries(cameras)) {
-    const panel = document.createElement("article");
-    panel.className = "camera";
-    const heading = document.createElement("h3");
-    heading.textContent = role;
-    const meta = document.createElement("div");
-    meta.className = "camera-meta";
-    const setMeta = (reused = camera.frame_reused, rendered = camera.frame_index) => {
-      meta.textContent = `frame ${camera.frame_index} · rendered ${rendered ?? "—"} · frame_id ${camera.frame_id ?? "—"} · ts ${camera.camera_timestamp_ns ?? "—"} · reused ${reused ?? "—"} · age ${camera.camera_age_ns === null ? "—" : `${(camera.camera_age_ns / 1e6).toFixed(1)} ms`}`;
-    };
-    setMeta();
-    panel.append(heading, meta);
+  const rendered = await Promise.all(Object.entries(cameras).map(async ([role, camera]) => {
+    let bitmap = null;
+    let missingText = null;
+    let reused = camera.frame_reused;
+    let renderedFrame = camera.frame_index;
     if (camera.missing) {
-      const missing = document.createElement("div");
-      missing.className = "missing";
-      missing.textContent = "missing video frame";
-      panel.appendChild(missing);
+      missingText = "missing video frame";
     } else {
-      const image = document.createElement("img");
-      image.alt = `${role} sample ${currentIndex}`;
-      const sampleAtRequest = currentIndex;
       const url = `/api/data-view/datasets/${encodeURIComponent(datasetId)}/episodes/${episodeIndex}/frame?sample_index=${sampleAtRequest}&role=${encodeURIComponent(role)}&t=${Date.now()}`;
-      fetch(url, { cache: "no-store" })
-        .then(async (response) => {
-          if (!response.ok) throw new Error("camera frame unavailable");
-          const imageUrl = URL.createObjectURL(await response.blob());
-          if (sampleAtRequest !== currentIndex) {
-            URL.revokeObjectURL(imageUrl);
-            return;
-          }
-          image.onload = () => URL.revokeObjectURL(imageUrl);
-          image.src = imageUrl;
-          setMeta(
-            response.headers.get("X-Frame-Reused") === "true" || camera.frame_reused,
-            response.headers.get("X-Rendered-Frame-Index") || camera.frame_index,
-          );
-        })
-        .catch(() => {
-          if (sampleAtRequest === currentIndex) setMeta(true, "missing");
-        });
-      panel.appendChild(image);
+      try {
+        const response = await fetch(url, { cache: "no-store", signal });
+        if (!response.ok) throw new Error("camera frame unavailable");
+        bitmap = await createImageBitmap(await response.blob());
+        reused = response.headers.get("X-Frame-Reused") === "true" || camera.frame_reused;
+        renderedFrame = response.headers.get("X-Rendered-Frame-Index") || camera.frame_index;
+      } catch (error) {
+        bitmap?.close();
+        if (error.name === "AbortError") throw error;
+        missingText = "camera frame unavailable";
+        reused = true;
+        renderedFrame = "missing";
+        bitmap = null;
+      }
     }
-    grid.appendChild(panel);
+    return { role, camera, bitmap, missingText, reused, renderedFrame };
+  }));
+  if (generation !== requestGeneration) {
+    rendered.forEach((item) => item.bitmap?.close());
+    return;
   }
+  const activeRoles = new Set(rendered.map((item) => item.role));
+  for (const [role, view] of cameraViews) {
+    if (activeRoles.has(role)) continue;
+    view.panel.remove();
+    cameraViews.delete(role);
+  }
+  for (const item of rendered) {
+    const view = cameraViews.get(item.role) || createCameraView(grid, item.role);
+    view.meta.textContent = cameraMetaText(item.camera, item.reused, item.renderedFrame);
+    if (item.bitmap) {
+      if (view.canvas.width !== item.bitmap.width || view.canvas.height !== item.bitmap.height) {
+        view.canvas.width = item.bitmap.width;
+        view.canvas.height = item.bitmap.height;
+      }
+      view.context.drawImage(item.bitmap, 0, 0);
+      item.bitmap.close();
+      view.canvas.hidden = false;
+      view.missing.hidden = true;
+      view.hasFrame = true;
+    } else if (!view.hasFrame) {
+      view.missing.textContent = item.missingText || "camera frame unavailable";
+      view.canvas.hidden = true;
+      view.missing.hidden = false;
+    }
+  }
+}
+
+function createCameraView(grid, role) {
+  const panel = document.createElement("article");
+  panel.className = "camera";
+  const heading = document.createElement("h3");
+  heading.textContent = role;
+  const meta = document.createElement("div");
+  meta.className = "camera-meta";
+  const media = document.createElement("div");
+  media.className = "camera-media";
+  const canvas = document.createElement("canvas");
+  canvas.className = "camera-frame";
+  canvas.setAttribute("aria-label", `${role} playback`);
+  canvas.hidden = true;
+  const missing = document.createElement("div");
+  missing.className = "missing";
+  missing.textContent = "loading camera frame";
+  media.append(canvas, missing);
+  panel.append(heading, meta, media);
+  grid.appendChild(panel);
+  const context = canvas.getContext("2d", { alpha: false });
+  if (!context) throw new Error(`2D canvas is unavailable for camera ${role}`);
+  const view = { panel, meta, canvas, context, missing, hasFrame: false };
+  cameraViews.set(role, view);
+  return view;
+}
+
+function cameraMetaText(camera, reused = camera.frame_reused, rendered = camera.frame_index) {
+  return `frame ${camera.frame_index} · rendered ${rendered ?? "—"} · frame_id ${camera.frame_id ?? "—"} · ts ${camera.camera_timestamp_ns ?? "—"} · reused ${reused ?? "—"} · age ${camera.camera_age_ns === null ? "—" : `${(camera.camera_age_ns / 1e6).toFixed(1)} ms`}`;
 }
 
 async function loadMetrics() {

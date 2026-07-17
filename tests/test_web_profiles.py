@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 import time
 import unittest
 from typing import Any
@@ -145,6 +146,51 @@ class RobotWebProfileTests(unittest.TestCase):
         leases = status["resource_leases"]
         self.assertEqual(leases, {"recorded_data:rm2": next(iter(leases.values()))})
 
+    def test_profiles_publish_round_trip_action_specs_and_baseline_categories(self) -> None:
+        for profile in (PIPER_WEB_PROFILE, RM2_WEB_PROFILE):
+            with self.subTest(robot=profile.robot_name):
+                args = profile.default_args()
+                spec = profile.action_spec_for_args(args)
+                self.assertEqual(ActionSpec.from_dict(spec.to_dict()), spec)
+                self.assertGreater(spec.arm_count or 0, 0)
+                self.assertTrue(spec.capabilities["supports_gripper"])
+                categories = profile.baseline_config_for_args(args)
+                self.assertEqual(set(categories), {"camera_config", "robot_config", "safety_config"})
+                self.assertEqual(tuple(categories["camera_config"]["roles"]), spec.camera_roles)
+
+    def test_web_baseline_create_and_clone_are_profile_owned_and_hardware_free(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = PIPER_WEB_PROFILE.default_args()
+            args.cam_head_backend = args.cam_left_wrist_backend = args.cam_right_wrist_backend = "black"
+            runtime = RobotWebRuntime(args, profile=PIPER_WEB_PROFILE, baseline_root=directory)
+            self.addCleanup(runtime.shutdown_baselines)
+            self.addCleanup(runtime.disconnect)
+            job = runtime.create_baseline(
+                {
+                    "name": "profile baseline",
+                    "robot_name": "piper",
+                    "task_name": "pick",
+                    "prompt": "pick",
+                    "policy_label": "fake-policy",
+                    "planned_episodes": 3,
+                    "max_episode_duration_s": 30.0,
+                }
+            )
+            _wait(lambda: runtime.baseline_job_status(job["job_id"])["finished"])
+            created = runtime.baseline_job_status(job["job_id"])
+            self.assertEqual(created["state"], "complete", created)
+            baseline = runtime.baseline_service.list()[0]
+            self.assertEqual(tuple(baseline.camera_config["roles"]), baseline.camera_roles)
+            self.assertIn("transports", baseline.robot_config)
+            self.assertIn("max_action_step", baseline.safety_config)
+
+            clone = runtime.clone_baseline(
+                baseline.baseline_id,
+                {"patch": {"name": "profile baseline derived"}, "derived_reason": "name for inspection"},
+            )
+            _wait(lambda: runtime.baseline_job_status(clone["job_id"])["finished"])
+            self.assertEqual(runtime.baseline_job_status(clone["job_id"])["state"], "complete")
+
 
 class ResourceLeaseManagerTests(unittest.TestCase):
     def test_second_robot_control_owner_is_rejected(self) -> None:
@@ -159,6 +205,41 @@ class ResourceLeaseManagerTests(unittest.TestCase):
         lease = manager.acquire("open-loop-evaluation", [ResourceRequest(ResourceType.POLICY_CLIENT, "ws://policy")])
         self.addCleanup(lease.release)
         self.assertIsNone(manager.owner_of(ResourceRequest(ResourceType.ROBOT_CONTROL, "piper")))
+
+    def test_control_conflict_matrix_and_non_control_modes(self) -> None:
+        manager = ResourceLeaseManager()
+        robot = ResourceRequest(ResourceType.ROBOT_CONTROL, "piper")
+        policy = ResourceRequest(ResourceType.POLICY_CLIENT, "ws://policy")
+        cameras = ResourceRequest(ResourceType.CAMERAS, "piper:all")
+        recorded_data = ResourceRequest(ResourceType.RECORDED_DATA, "dataset-a")
+
+        deployment = manager.acquire("normal-deployment", (robot, policy, cameras))
+        for blocked_owner in ("robot-replay", "evaluation", "move-to-state", "second-control-session"):
+            with self.subTest(blocked_owner=blocked_owner), self.assertRaises(ResourceLeaseConflict):
+                manager.acquire(blocked_owner, (robot,))
+        deployment.release()
+
+        replay = manager.acquire("robot-replay", (robot,))
+        with self.assertRaises(ResourceLeaseConflict):
+            manager.acquire("policy-deployment", (robot, policy))
+        with self.assertRaises(ResourceLeaseConflict):
+            manager.acquire("second-replay", (robot,))
+        replay.release()
+
+        pose = manager.acquire("move-to-state", (robot,))
+        for blocked_owner in ("normal-deployment", "evaluation"):
+            with self.subTest(blocked_owner=blocked_owner), self.assertRaises(ResourceLeaseConflict):
+                manager.acquire(blocked_owner, (robot,))
+        pose.release()
+
+        # Viewing Baselines needs no lease. Offline data and camera preview can
+        # coexist because they do not request the same hardware resource.
+        data_view = manager.acquire("offline-data-view", (recorded_data,))
+        preview = manager.acquire("camera-preview", (cameras,))
+        self.assertEqual(manager.owner_of(recorded_data), "offline-data-view")
+        self.assertEqual(manager.owner_of(cameras), "camera-preview")
+        preview.release()
+        data_view.release()
 
 
 if __name__ == "__main__":

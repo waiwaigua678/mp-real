@@ -33,6 +33,12 @@ except ImportError:
 from mp_real.common.image import preprocess_image
 from mp_real.common.runtime import rtc_replan_stride
 from mp_real.data.view import DataViewSession
+from mp_real.evaluation.baseline import (
+    BaselineConfigurationConflict,
+    BaselineReferenceWriter,
+    BaselineService,
+    BaselineStore,
+)
 from mp_real.evaluation.service import EvaluationConflict, EvaluationRuntimeLease, EvaluationService
 from mp_real.policy_client.client import PolicyClient
 from mp_real.robots.base import Robot
@@ -499,6 +505,7 @@ class RobotWebRuntime:
         recorded_data_roots: tuple[pathlib.Path | str, ...] = (),
         pose_mapping_config: PoseMappingConfig | None = None,
         replay_record_root: pathlib.Path | str | None = None,
+        baseline_root: pathlib.Path | str = "recordings/baselines",
     ) -> None:
         self._lock = threading.RLock()
         self._frame_condition = threading.Condition(self._lock)
@@ -520,7 +527,10 @@ class RobotWebRuntime:
         self._resource_owner_id = f"web-{profile.robot_name}-{secrets.token_hex(8)}"
         self._resource_lease: ResourceLease | None = None
         self._evaluation_owner: str | None = None
-        self._evaluation_service = EvaluationService(self)
+        self._baseline_root = pathlib.Path(baseline_root).expanduser().resolve(strict=False)
+        self._baseline_service = BaselineService(BaselineStore(self._baseline_root))
+        self._baseline_writer: BaselineReferenceWriter | None = None
+        self._evaluation_service = EvaluationService(self, terminal_sink=self._submit_baseline_reference)
         self._recorded_data_roots = tuple(recorded_data_roots)
         self._recorded_data_view = DataViewSession(self._recorded_data_roots) if self._recorded_data_roots else None
         self._pose_mapping_config = pose_mapping_config
@@ -598,6 +608,90 @@ class RobotWebRuntime:
     @property
     def evaluation_service(self) -> EvaluationService:
         return self._evaluation_service
+
+    @property
+    def baseline_service(self) -> BaselineService:
+        return self._baseline_service
+
+    def baseline_status(self) -> dict[str, Any]:
+        with self._lock:
+            writer = self._baseline_writer
+        return writer.status() if writer is not None else {"state": "idle", "queue_depth": 0, "queue_capacity": 16}
+
+    def baseline_job_status(self, job_id: str) -> dict[str, Any]:
+        return self._baseline_writer_or_start().job_status(job_id)
+
+    def create_baseline(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        runtime = self._baseline_runtime_snapshot()
+        return self._baseline_writer_or_start().submit_create(payload, runtime_config=runtime, git_commit=_git_commit())
+
+    def clone_baseline(self, baseline_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        patch = payload.get("patch", {})
+        if not isinstance(patch, Mapping):
+            raise ApiError("patch must be a JSON object")
+        return self._baseline_writer_or_start().submit_clone(
+            baseline_id,
+            patch,
+            reason=str(payload.get("derived_reason", "")),
+        )
+
+    def create_baseline_from_evaluation(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        snapshot = self._evaluation_service.current()
+        if snapshot is None:
+            raise ApiError("No current evaluation is available to snapshot", HTTPStatus.CONFLICT)
+        name = payload.get("name")
+        if name is not None and not isinstance(name, str):
+            raise ApiError("name must be a string")
+        return self._baseline_writer_or_start().submit_create_from_evaluation(snapshot, name=name)
+
+    def baseline_diff(self, baseline_a: str, baseline_b: str) -> dict[str, Any]:
+        return self._baseline_service.diff(baseline_a, baseline_b).to_dict()
+
+    def compare_baselines(self, baseline_ids: tuple[str, ...]) -> dict[str, Any]:
+        return self._baseline_service.compare(baseline_ids)
+
+    def run_baseline(self, baseline_id: str) -> dict[str, Any]:
+        payload = self._baseline_service.prepare_evaluation_run(
+            baseline_id,
+            runtime_config=self._baseline_runtime_snapshot(),
+            git_commit=_git_commit(),
+        )
+        return self._evaluation_service.create(payload)
+
+    def attach_open_loop_baseline(self, baseline_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        result_dir = payload.get("result_dir")
+        if not result_dir:
+            raise ApiError("result_dir is required")
+        return self._baseline_writer_or_start().submit_open_loop(baseline_id, str(result_dir))
+
+    def _baseline_runtime_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            snapshot = self.get_config()
+            snapshot.update(_json_safe(self._profile.baseline_config_for_args(self._args)))
+            snapshot["policy_metadata"] = _json_safe(self._server_metadata or {})
+            snapshot["git_commit"] = _git_commit()
+            if self._recorded_start_context is not None:
+                snapshot["recorded_start"] = copy.deepcopy(self._recorded_start_context)
+            return snapshot
+
+    def shutdown_baselines(self) -> None:
+        with self._lock:
+            writer = self._baseline_writer
+            self._baseline_writer = None
+        if writer is not None:
+            writer.close()
+
+    def _baseline_writer_or_start(self) -> BaselineReferenceWriter:
+        with self._lock:
+            if self._baseline_writer is None:
+                self._baseline_writer = BaselineReferenceWriter(self._baseline_service)
+            return self._baseline_writer
+
+    def _submit_baseline_reference(self, snapshot: Mapping[str, Any]) -> None:
+        config = snapshot.get("config")
+        if not isinstance(config, Mapping) or not config.get("baseline_id"):
+            return
+        self._baseline_writer_or_start().submit_evaluation(snapshot)
 
     @property
     def resource_manager(self) -> ResourceLeaseManager:
@@ -3257,6 +3351,21 @@ class PiperWebHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "pose": self.server.runtime.pose_status()})
             elif path == "/api/evaluations/current":
                 self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.current()})
+            elif path == "/api/baselines":
+                self._send_json(
+                    {
+                        "ok": True,
+                        "baselines": [item.to_dict() for item in self.server.runtime.baseline_service.list()],
+                        "writer": self.server.runtime.baseline_status(),
+                    }
+                )
+            elif path.startswith("/api/baseline-jobs/"):
+                job_id = urllib.parse.unquote(path.removeprefix("/api/baseline-jobs/"))
+                self._send_json({"ok": True, "job": self.server.runtime.baseline_job_status(job_id)})
+            elif path.startswith("/api/baselines/"):
+                baseline_id = urllib.parse.unquote(path.removeprefix("/api/baselines/"))
+                baseline = self.server.runtime.baseline_service.get(baseline_id)
+                self._send_json({"ok": True, "baseline": baseline.to_dict()})
             elif path == "/api/replay/status":
                 self._send_json({"ok": True, "replay": self.server.runtime.replay_status()})
             elif path.startswith("/snapshot/") and path.endswith(".jpg"):
@@ -3285,7 +3394,43 @@ class PiperWebHandler(BaseHTTPRequestHandler):
         try:
             if not self.server.authorize(self.headers.get("X-Motrix-Key")):
                 raise ApiError("Invalid access key", HTTPStatus.UNAUTHORIZED)
-            if path == "/api/evaluations":
+            if path == "/api/baselines":
+                job = self.server.runtime.create_baseline(self._read_json())
+                self._send_json({"ok": True, "job": job}, HTTPStatus.ACCEPTED)
+            elif path == "/api/baselines/from-evaluation":
+                job = self.server.runtime.create_baseline_from_evaluation(self._read_json())
+                self._send_json({"ok": True, "job": job}, HTTPStatus.ACCEPTED)
+            elif path == "/api/baselines/compare":
+                payload = self._read_json()
+                baseline_ids = payload.get("baseline_ids")
+                if not isinstance(baseline_ids, list) or not all(isinstance(item, str) for item in baseline_ids):
+                    raise ApiError("baseline_ids must be a list of IDs")
+                self._send_json({"ok": True, "comparison": self.server.runtime.compare_baselines(tuple(baseline_ids))})
+            elif path.startswith("/api/baselines/"):
+                suffix = path.removeprefix("/api/baselines/")
+                baseline_id, separator, operation = suffix.partition("/")
+                if not separator or not baseline_id:
+                    raise ApiError("Baseline operation is required", HTTPStatus.NOT_FOUND)
+                baseline_id = urllib.parse.unquote(baseline_id)
+                payload = self._read_json()
+                if operation == "clone":
+                    job = self.server.runtime.clone_baseline(baseline_id, payload)
+                    self._send_json({"ok": True, "job": job}, HTTPStatus.ACCEPTED)
+                elif operation == "diff":
+                    other = str(payload.get("other_baseline_id", ""))
+                    if not other:
+                        raise ApiError("other_baseline_id is required")
+                    self._send_json({"ok": True, "diff": self.server.runtime.baseline_diff(baseline_id, other)})
+                elif operation == "run":
+                    self._send_json({"ok": True, "evaluation": self.server.runtime.run_baseline(baseline_id)})
+                elif operation == "attach-open-loop":
+                    self._send_json(
+                        {"ok": True, "job": self.server.runtime.attach_open_loop_baseline(baseline_id, payload)},
+                        HTTPStatus.ACCEPTED,
+                    )
+                else:
+                    raise ApiError("unknown Baseline operation", HTTPStatus.NOT_FOUND)
+            elif path == "/api/evaluations":
                 evaluation = self.server.runtime.evaluation_service.create(self._read_json())
                 self._send_json({"ok": True, "evaluation": evaluation})
             elif path == "/api/evaluations/current/warmup":
@@ -3365,6 +3510,8 @@ class PiperWebHandler(BaseHTTPRequestHandler):
                 {"ok": False, "error": str(exc), "legal_operations": list(exc.legal_operations)},
                 HTTPStatus.CONFLICT,
             )
+        except BaselineConfigurationConflict as exc:
+            self._send_json({"ok": False, "error": str(exc), "diff": exc.diff.to_dict()}, HTTPStatus.CONFLICT)
         except ApiError as exc:
             self._send_json({"ok": False, "error": str(exc)}, exc.status)
         except ValueError as exc:
@@ -3470,6 +3617,7 @@ class PiperWebServer(ThreadingHTTPServer):
             "aborted",
         }:
             raise ApiError("Finish the recorded-state pose session before changing robot", HTTPStatus.CONFLICT)
+        self.runtime.shutdown_baselines()
         profile = get_web_profile(name)
         self.runtime = RobotWebRuntime(
             profile=profile,
@@ -3478,6 +3626,7 @@ class PiperWebServer(ThreadingHTTPServer):
             recorded_data_roots=self.runtime._recorded_data_roots,
             pose_mapping_config=self.runtime._pose_mapping_config,
             replay_record_root=self.runtime._replay_record_root,
+            baseline_root=self.runtime._baseline_root,
         )
         return self.runtime.get_config()
 
@@ -3525,6 +3674,12 @@ def main() -> None:
         type=pathlib.Path,
         default=pathlib.Path("recordings/replay"),
         help="Directory for atomic, explicit real-robot replay records.",
+    )
+    parser.add_argument(
+        "--baseline-root",
+        type=pathlib.Path,
+        default=pathlib.Path("recordings/baselines"),
+        help="Directory for immutable Baseline JSON documents and compact run references.",
     )
     cli_args = parser.parse_args()
 
@@ -3574,6 +3729,7 @@ def main() -> None:
         recorded_data_roots=tuple(cli_args.recorded_data_root),
         pose_mapping_config=pose_mapping_config,
         replay_record_root=cli_args.replay_record_root,
+        baseline_root=cli_args.baseline_root,
     )
     access_key = cli_args.access_key or os.environ.get("MOTRIX_WEB_ACCESS_KEY")
     server = PiperWebServer((cli_args.host, cli_args.port), PiperWebHandler, runtime, access_key=access_key)
@@ -3587,6 +3743,10 @@ def main() -> None:
             runtime.evaluation_service.shutdown()
         except Exception:
             logging.exception("Failed to stop evaluation workers during shutdown")
+        try:
+            runtime.shutdown_baselines()
+        except Exception:
+            logging.exception("Failed to stop Baseline writer during shutdown")
         try:
             runtime.disconnect()
         except Exception:

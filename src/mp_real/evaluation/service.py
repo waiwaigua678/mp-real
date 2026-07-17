@@ -68,7 +68,13 @@ class EvaluationService(RuntimeEventSink):
     remains unaware that an evaluation session exists.
     """
 
-    def __init__(self, broker: EvaluationRuntimeBroker, *, recording_root: pathlib.Path | str = "recordings") -> None:
+    def __init__(
+        self,
+        broker: EvaluationRuntimeBroker,
+        *,
+        recording_root: pathlib.Path | str = "recordings",
+        terminal_sink: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> None:
         self._broker = broker
         self._recording_root = pathlib.Path(recording_root).expanduser().resolve(strict=False)
         self._lock = threading.RLock()
@@ -88,6 +94,8 @@ class EvaluationService(RuntimeEventSink):
         self._recording_has_completed_episode = False
         self._recording_episode_active = False
         self._policy_warmed_up = False
+        self._terminal_sink = terminal_sink
+        self._terminal_notified_session_ids: set[str] = set()
 
     @property
     def requires_observation_images(self) -> bool:
@@ -820,9 +828,27 @@ class EvaluationService(RuntimeEventSink):
         controller_status = self._lease.controller.status()
         if controller_status.running and not force:
             return
+        self._notify_terminal_locked()
         lease = self._lease
         self._lease = None
         lease.release()
+
+    def _notify_terminal_locked(self) -> None:
+        """Queue a terminal snapshot without doing disk work on the control path."""
+        session = self._session
+        sink = self._terminal_sink
+        if session is None or sink is None or not session.is_terminal:
+            return
+        if session.session_id in self._terminal_notified_session_ids:
+            return
+        self._terminal_notified_session_ids.add(session.session_id)
+        try:
+            sink(self._snapshot_locked())
+        except BaseException:
+            # The evaluator's lifecycle is more important than a secondary
+            # Baseline reference.  The sink is responsible for exposing its
+            # own failure channel.
+            pass
 
     @staticmethod
     def _conflict_from_state(exc: EvaluationStateConflict) -> EvaluationConflict:

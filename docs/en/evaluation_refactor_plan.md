@@ -202,3 +202,19 @@ uv run ruff check .
 
 Then review the diff for unrelated changes and state what still needs
 real-hardware verification.
+
+## Stage 12 — reproducible Baselines and A/B reports
+
+Stage 12 adds a filesystem-backed Baseline store, categorized configuration
+diff, compact links to evaluation/open-loop outputs, and an A/B report that
+always retains numerator, denominator and invalid handling. It reuses
+`EvaluationService`, `ActionSpec`, the shared runtime and existing resource
+leases; it adds no database, policy client, robot adapter or independent
+control loop.
+
+Baseline writes are queued to a bounded non-daemon writer. Creating or running
+a Baseline from Web never starts an episode. A terminal Baseline-backed
+evaluation is attached asynchronously. A compatibility mismatch requires an
+explicit derived Baseline. The stage also records the remaining Web profile
+Piper assumptions and requires fake Piper/RM2 regression coverage before any
+hardware validation.

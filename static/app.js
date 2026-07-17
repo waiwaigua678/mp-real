@@ -22,6 +22,8 @@ const labelFailureBtn = document.querySelector("#labelFailureBtn");
 const labelInvalidBtn = document.querySelector("#labelInvalidBtn");
 const failureReason = document.querySelector("#failureReason");
 const operatorNote = document.querySelector("#operatorNote");
+const baselineForm = document.querySelector("#baselineForm");
+const baselineSelect = document.querySelector("#baselineSelect");
 
 let currentStatus = null;
 let firstLoad = true;
@@ -32,6 +34,7 @@ let evaluation = null;
 let evaluationRequestInFlight = false;
 let poseStatus = null;
 let replayStatus = null;
+let baselines = [];
 accessKeyInput.value = accessKey;
 
 function setMessage(text, kind = "") {
@@ -49,7 +52,9 @@ async function requestJson(url, options = {}) {
   });
   const data = await response.json();
   if (!response.ok || data.ok === false) {
-    throw new Error(data.error || `${response.status} ${response.statusText}`);
+    const error = new Error(data.error || `${response.status} ${response.statusText}`);
+    error.payload = data;
+    throw error;
   }
   return data;
 }
@@ -186,6 +191,175 @@ function labelEvaluation(result) {
     payload.failure_reason = failureReason.value;
   }
   evaluationRequest("/api/evaluations/current/label", payload);
+}
+
+function selectedBaselineId() {
+  return baselineSelect.value || "";
+}
+
+function collectBaselineForm() {
+  const value = {};
+  for (const field of baselineForm.elements) {
+    if (!field.name) continue;
+    if (field.type === "number") value[field.name] = Number(field.value);
+    else value[field.name] = field.value.trim();
+  }
+  return value;
+}
+
+function renderBaselines(payload) {
+  baselines = payload.baselines || [];
+  const previous = baselineSelect.value;
+  for (const selector of [baselineSelect, document.querySelector("#baselineCompareA"), document.querySelector("#baselineCompareB")]) {
+    selector.replaceChildren();
+    for (const baseline of baselines) {
+      const option = document.createElement("option");
+      option.value = baseline.baseline_id;
+      option.textContent = `${baseline.name} · ${baseline.policy_label} · ${baseline.baseline_id.slice(0, 8)}`;
+      selector.appendChild(option);
+    }
+  }
+  if (baselines.some((item) => item.baseline_id === previous)) baselineSelect.value = previous;
+  if (baselines.length > 1) document.querySelector("#baselineCompareB").selectedIndex = 1;
+  document.querySelector("#baselineCount").textContent = String(baselines.length);
+  document.querySelector("#baselineWriterState").textContent = JSON.stringify(payload.writer || {});
+  renderBaselineDetails();
+}
+
+function renderBaselineDetails() {
+  const selected = baselines.find((item) => item.baseline_id === selectedBaselineId());
+  document.querySelector("#baselineDetails").textContent = JSON.stringify(selected || { message: "尚未创建 Baseline" }, null, 2);
+}
+
+async function loadBaselines() {
+  const data = await requestJson("/api/baselines");
+  renderBaselines(data);
+}
+
+async function waitBaselineJob(jobId) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const data = await requestJson(`/api/baseline-jobs/${encodeURIComponent(jobId)}`);
+    if (data.job.finished) {
+      if (data.job.state !== "complete") throw new Error(data.job.error || "Baseline 后台任务失败");
+      return data.job.result;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("等待 Baseline 后台任务超时");
+}
+
+async function createBaseline() {
+  try {
+    const data = await requestJson("/api/baselines", { method: "POST", body: JSON.stringify(collectBaselineForm()) });
+    await waitBaselineJob(data.job.job_id);
+    await loadBaselines();
+    setMessage("Baseline 已保存", "ok");
+  } catch (error) {
+    setMessage(error.message, "bad");
+  }
+}
+
+async function createBaselineFromEvaluation() {
+  try {
+    const data = await requestJson("/api/baselines/from-evaluation", {
+      method: "POST",
+      body: JSON.stringify({ name: baselineForm.elements.name.value.trim() || undefined }),
+    });
+    await waitBaselineJob(data.job.job_id);
+    await loadBaselines();
+    setMessage("已从当前评测创建 Baseline", "ok");
+  } catch (error) {
+    setMessage(error.message, "bad");
+  }
+}
+
+async function cloneBaseline() {
+  const baselineId = selectedBaselineId();
+  const reason = document.querySelector("#baselineCloneReason").value.trim();
+  const name = document.querySelector("#baselineCloneName").value.trim();
+  if (!baselineId || !reason || !name) {
+    setMessage("克隆需要选择 Baseline、名称和派生原因", "bad");
+    return;
+  }
+  try {
+    const data = await requestJson(`/api/baselines/${encodeURIComponent(baselineId)}/clone`, {
+      method: "POST",
+      body: JSON.stringify({ patch: { name }, derived_reason: reason }),
+    });
+    const created = await waitBaselineJob(data.job.job_id);
+    await loadBaselines();
+    baselineSelect.value = created.baseline_id;
+    renderBaselineDetails();
+    setMessage("Derived Baseline 已保存", "ok");
+  } catch (error) {
+    setMessage(error.message, "bad");
+  }
+}
+
+async function runBaseline() {
+  const baselineId = selectedBaselineId();
+  if (!baselineId) return;
+  try {
+    const data = await requestJson(`/api/baselines/${encodeURIComponent(baselineId)}/run`, {
+      method: "POST",
+      body: "{}",
+    });
+    applyEvaluation(data.evaluation);
+    showPage("evaluationPage");
+    setMessage("已创建评测；仍需人工预热、复位和开始本轮", "ok");
+  } catch (error) {
+    const detail = error.payload?.diff || error.message;
+    document.querySelector("#baselineComparison").textContent =
+      typeof detail === "string" ? detail : JSON.stringify(detail, null, 2);
+    setMessage(error.message, "bad");
+  }
+}
+
+async function attachOpenLoop() {
+  const baselineId = selectedBaselineId();
+  const resultDir = document.querySelector("#baselineOpenLoopDir").value.trim();
+  if (!baselineId || !resultDir) return;
+  try {
+    const data = await requestJson(`/api/baselines/${encodeURIComponent(baselineId)}/attach-open-loop`, {
+      method: "POST",
+      body: JSON.stringify({ result_dir: resultDir }),
+    });
+    await waitBaselineJob(data.job.job_id);
+    await loadBaselines();
+    setMessage("已关联开环结果", "ok");
+  } catch (error) {
+    setMessage(error.message, "bad");
+  }
+}
+
+async function diffBaselines() {
+  const a = document.querySelector("#baselineCompareA").value;
+  const b = document.querySelector("#baselineCompareB").value;
+  if (!a || !b) return;
+  try {
+    const data = await requestJson(`/api/baselines/${encodeURIComponent(a)}/diff`, {
+      method: "POST",
+      body: JSON.stringify({ other_baseline_id: b }),
+    });
+    document.querySelector("#baselineComparison").textContent = JSON.stringify(data.diff, null, 2);
+  } catch (error) {
+    setMessage(error.message, "bad");
+  }
+}
+
+async function compareBaselines() {
+  const a = document.querySelector("#baselineCompareA").value;
+  const b = document.querySelector("#baselineCompareB").value;
+  if (!a || !b) return;
+  try {
+    const data = await requestJson("/api/baselines/compare", {
+      method: "POST",
+      body: JSON.stringify({ baseline_ids: [a, b] }),
+    });
+    document.querySelector("#baselineComparison").textContent = JSON.stringify(data.comparison, null, 2);
+  } catch (error) {
+    setMessage(error.message, "bad");
+  }
 }
 
 function ensureCameraPanels(roles) {
@@ -670,10 +844,20 @@ stopEpisodeBtn.addEventListener("click", () => evaluationRequest("/api/evaluatio
 labelSuccessBtn.addEventListener("click", () => labelEvaluation("SUCCESS"));
 labelFailureBtn.addEventListener("click", () => labelEvaluation("FAILURE"));
 labelInvalidBtn.addEventListener("click", () => labelEvaluation("INVALID"));
+document.querySelector("#refreshBaselinesBtn").addEventListener("click", () => loadBaselines().catch((error) => setMessage(error.message, "bad")));
+document.querySelector("#createBaselineBtn").addEventListener("click", createBaseline);
+document.querySelector("#createBaselineFromEvaluationBtn").addEventListener("click", createBaselineFromEvaluation);
+baselineSelect.addEventListener("change", renderBaselineDetails);
+document.querySelector("#cloneBaselineBtn").addEventListener("click", cloneBaseline);
+document.querySelector("#runBaselineBtn").addEventListener("click", runBaseline);
+document.querySelector("#attachOpenLoopBtn").addEventListener("click", attachOpenLoop);
+document.querySelector("#diffBaselineBtn").addEventListener("click", diffBaselines);
+document.querySelector("#compareBaselineBtn").addEventListener("click", compareBaselines);
 
 loadConfig()
   .then(() => refreshStatus())
   .then(() => initStreams())
+  .then(() => loadBaselines())
   .catch((error) => setMessage(error.message, "bad"));
 
 setInterval(refreshStatus, 500);

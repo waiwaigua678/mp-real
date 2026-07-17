@@ -7,7 +7,9 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import av
 import numpy as np
 import pyarrow.parquet as pq
 
@@ -180,6 +182,25 @@ class LeRobotV21Tests(unittest.TestCase):
             self.assertFalse(source.get_dataset_metadata().is_mp_real)
             self.assertEqual(source.get_sample(0, 0).telemetry, {})
             self.assertTrue(validate_lerobot_v21_dataset(external).valid)
+
+    def test_reader_reuses_a_video_decoder_for_sequential_camera_frames(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._write_dataset(Path(directory) / "sequential")
+            source = LeRobotV21EpisodeSource(root)
+            try:
+                with mock.patch("mp_real.data.lerobot_v21.av.open", wraps=av.open) as open_video:
+                    for frame_index in range(3):
+                        frame, rendered = source.get_camera_frame_with_index(0, "head", frame_index)
+                        self.assertIsNotNone(frame)
+                        self.assertEqual(rendered, frame_index)
+                    self.assertEqual(open_video.call_count, 1)
+
+                    frame, rendered = source.get_camera_frame_with_index(0, "head", 1)
+                    self.assertIsNotNone(frame)
+                    self.assertEqual(rendered, 1)
+                    self.assertEqual(open_video.call_count, 2)
+            finally:
+                source.close()
 
     def test_piper_and_rm2_action_schemas_are_dynamic_and_ordered(self) -> None:
         piper = PIPER_WEB_PROFILE.action_spec_for_args(PIPER_WEB_PROFILE.default_args())

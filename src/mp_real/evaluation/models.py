@@ -74,6 +74,7 @@ class EvaluationConfig:
     storage_root: str | None
     runtime_config_snapshot: Mapping[str, Any]
     action_spec_snapshot: Mapping[str, Any]
+    baseline_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.evaluation_id:
@@ -139,6 +140,7 @@ class EvaluationConfig:
             storage_root=optional_text("storage_root"),
             runtime_config_snapshot=runtime_config_snapshot,
             action_spec_snapshot=action_spec_snapshot,
+            baseline_id=optional_text("baseline_id"),
         )
 
     def to_dict(self) -> dict[str, Any]:

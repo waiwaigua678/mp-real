@@ -15,6 +15,7 @@
       <nav class="tabs">
         <button class="tab active" type="button" data-page="runPage">运行</button>
         <button class="tab" type="button" data-page="evaluationPage">评测</button>
+        <button class="tab" type="button" data-page="baselinePage">Baseline</button>
         <button class="tab" type="button" data-page="settingsPage">参数</button>
       </nav>
       <div class="status-strip">
@@ -232,6 +233,61 @@
             <label class="wide"><span>Operator Note</span><input id="operatorNote" type="text" /></label>
             <div class="button-row"><button id="labelSuccessBtn" type="button" class="primary">标记成功</button><button id="labelFailureBtn" type="button" class="danger">标记失败</button><button id="labelInvalidBtn" type="button">标记无效</button></div>
           </div>
+        </section>
+      </section>
+
+      <section class="page" id="baselinePage">
+        <section class="settings-head">
+          <div>
+            <h2>可复现实验 Baseline</h2>
+            <div class="subline">配置由后端持久化。运行前会比较当前部署参数；关键差异必须先创建 derived Baseline。</div>
+          </div>
+          <div class="button-row">
+            <button id="refreshBaselinesBtn" type="button">刷新</button>
+            <button id="createBaselineBtn" type="button" class="primary">从当前配置创建</button>
+            <button id="createBaselineFromEvaluationBtn" type="button">从当前评测创建</button>
+          </div>
+        </section>
+        <section class="evaluation-grid">
+          <form id="baselineForm" class="form-section">
+            <h3>Baseline 元数据</h3>
+            <label><span>名称</span><input name="name" type="text" value="baseline" required /></label>
+            <label><span>任务</span><input name="task_name" type="text" value="unnamed-task" required /></label>
+            <label><span>Policy Label</span><input name="policy_label" type="text" required /></label>
+            <label><span>Checkpoint hash（可选）</span><input name="checkpoint_hash" type="text" /></label>
+            <label class="wide"><span>Prompt</span><input name="prompt" type="text" /></label>
+            <label><span>计划轮次</span><input name="planned_episodes" type="number" min="1" value="3" /></label>
+            <label><span>单轮上限（秒）</span><input name="max_episode_duration_s" type="number" min="0.1" value="60" /></label>
+            <label><span>操作员</span><input name="operator" type="text" /></label>
+            <label><span>Tags</span><input name="tags" type="text" /></label>
+            <label class="wide"><span>备注</span><input name="notes" type="text" /></label>
+          </form>
+          <section class="panel evaluation-status">
+            <div class="panel-title"><h2>已保存 Baseline</h2><span id="baselineCount">0</span></div>
+            <label><span>选择</span><select id="baselineSelect"></select></label>
+            <pre class="metadata" id="baselineDetails">尚未加载</pre>
+          </section>
+        </section>
+        <section class="panel evaluation-actions">
+          <div class="panel-title"><h2>派生、运行和关联</h2><span id="baselineWriterState">-</span></div>
+          <div class="button-row">
+            <label>Derived 名称 <input id="baselineCloneName" type="text" /></label>
+            <label>原因 <input id="baselineCloneReason" type="text" placeholder="仅改变一个主要变量" /></label>
+            <button id="cloneBaselineBtn" type="button">克隆为 derived</button>
+            <button id="runBaselineBtn" type="button" class="primary">从 Baseline 创建评测</button>
+            <label>开环结果目录 <input id="baselineOpenLoopDir" type="text" placeholder="open_loop_results/..." /></label>
+            <button id="attachOpenLoopBtn" type="button">关联开环结果</button>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel-title"><h2>A/B 对比</h2><span>始终显示分子、分母与样本量</span></div>
+          <div class="button-row">
+            <label>A <select id="baselineCompareA"></select></label>
+            <label>B <select id="baselineCompareB"></select></label>
+            <button id="diffBaselineBtn" type="button">配置 diff</button>
+            <button id="compareBaselineBtn" type="button">比较结果</button>
+          </div>
+          <pre class="metadata" id="baselineComparison">请选择两个 Baseline</pre>
         </section>
       </section>
 

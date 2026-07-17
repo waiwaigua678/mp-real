@@ -54,6 +54,7 @@ class RobotWebProfile:
     make_loop_config: Callable[[Any], InferenceLoopConfig]
     validate_args: Callable[[Any], None]
     configure_reset: Callable[[Any], Any]
+    baseline_config_for_args: Callable[[Any], Mapping[str, Mapping[str, Any]]]
     include_camera_params: bool
     capabilities: RobotWebCapabilities
 
@@ -88,6 +89,12 @@ def _piper_action_spec(args: infer_piper.Args) -> ActionSpec:
         camera_roles=("cam_head", "cam_left_wrist", "cam_right_wrist"),
         state_fields=fields,
         action_fields=fields,
+        capabilities={
+            "supports_reset": True,
+            "supports_move_to_recorded_state": True,
+            "supports_trajectory_replay": False,
+            "supports_gripper": True,
+        },
     )
 
 
@@ -152,6 +159,54 @@ def _piper_reset_args(args: infer_piper.Args) -> infer_piper.Args:
     )
 
 
+def _piper_baseline_config(args: infer_piper.Args) -> Mapping[str, Mapping[str, Any]]:
+    """Piper-owned Baseline categories; shared evaluation code stays vendor-neutral."""
+    return {
+        "camera_config": {
+            "roles": _piper_action_spec(args).camera_roles,
+            "backends": {
+                "cam_head": args.cam_head_backend,
+                "cam_left_wrist": args.cam_left_wrist_backend,
+                "cam_right_wrist": args.cam_right_wrist_backend,
+            },
+            "selectors": {
+                "cam_head": args.cam_head,
+                "cam_left_wrist": args.cam_left_wrist,
+                "cam_right_wrist": args.cam_right_wrist,
+            },
+            "width": args.camera_width,
+            "height": args.camera_height,
+            "fps": args.camera_fps,
+            "timeout_s": args.camera_timeout,
+        },
+        "robot_config": {
+            "transports": {"left": args.left_can, "right": args.right_can},
+            "enable_on_start": args.enable_on_start,
+            "reset_on_start": args.reset_on_start,
+            "speed_percent": args.speed_percent,
+            "command": args.arm_command,
+            "initial_joints": {"left": args.init_left_joints, "right": args.init_right_joints},
+            "initial_grippers": {"left": args.init_left_gripper, "right": args.init_right_gripper},
+        },
+        "safety_config": {
+            "max_joint_step": args.max_joint_step,
+            "max_action_step": args.max_action_step,
+            "joint_deadband": args.joint_deadband,
+            "action_smoothing": args.action_smoothing,
+            "gripper_smoothing": args.gripper_smoothing,
+            "interpolate_actions": args.interpolate_actions,
+            "command_rate_hz": args.command_rate_hz,
+            "command_gripper_every_step": args.command_gripper_every_step,
+            "hold_last_action": args.hold_last_action,
+            "gripper": {
+                "closed_deg": args.gripper_closed_deg,
+                "open_deg": args.gripper_open_deg,
+                "force": args.gripper_force,
+            },
+        },
+    }
+
+
 def _rm2_action_spec(args: infer_rm2.Args) -> ActionSpec:
     dimension = infer_rm2.action_dim(args)
     fields = tuple(
@@ -176,6 +231,12 @@ def _rm2_action_spec(args: infer_rm2.Args) -> ActionSpec:
         camera_roles=("left_color", "right_color", "head_color"),
         state_fields=fields,
         action_fields=fields,
+        capabilities={
+            "supports_reset": True,
+            "supports_move_to_recorded_state": True,
+            "supports_trajectory_replay": False,
+            "supports_gripper": True,
+        },
     )
 
 
@@ -219,6 +280,48 @@ def _rm2_reset_args(args: infer_rm2.Args) -> infer_rm2.Args:
     return dataclasses.replace(args, reset_on_start=True)
 
 
+def _rm2_baseline_config(args: infer_rm2.Args) -> Mapping[str, Mapping[str, Any]]:
+    """RM2-owned Baseline categories; no Piper layout leaks into shared code."""
+    return {
+        "camera_config": {
+            "roles": _rm2_action_spec(args).camera_roles,
+            "backend": args.camera_backend,
+            "topics": {
+                "left": args.cam_left_topic,
+                "right": args.cam_right_topic,
+                "head": args.cam_head_topic,
+            },
+            "serials": {"left": args.cam_left_serial, "right": args.cam_right_serial, "head": args.cam_head_serial},
+            "width": args.camera_width,
+            "height": args.camera_height,
+            "fps": args.camera_fps,
+            "timeout_s": args.camera_timeout,
+        },
+        "robot_config": {
+            "backend": args.robot_backend,
+            "connection": {"left_ip": args.left_ip, "right_ip": args.right_ip, "port": args.arm_port},
+            "joint_dof": args.joint_dof,
+            "policy_joint_unit": args.policy_joint_unit,
+            "reset_on_start": args.reset_on_start,
+            "speed_percent": args.speed_percent,
+            "command": args.arm_command,
+            "initial_joints": {"left": args.init_left_joints, "right": args.init_right_joints},
+            "initial_grippers": {"left": args.init_left_gripper, "right": args.init_right_gripper},
+        },
+        "safety_config": {
+            "max_joint_step_deg": args.max_joint_step_deg,
+            "max_action_step_deg": args.max_action_step_deg,
+            "action_smoothing": args.action_smoothing,
+            "gripper_smoothing": args.gripper_smoothing,
+            "interpolate_actions": args.interpolate_actions,
+            "command_rate_hz": args.command_rate_hz,
+            "command_gripper_every_step": args.command_gripper_every_step,
+            "hold_last_action": args.hold_last_action,
+            "gripper": {"min": args.gripper_min, "max": args.gripper_max, "timeout": args.gripper_timeout},
+        },
+    }
+
+
 PIPER_WEB_PROFILE = RobotWebProfile(
     robot_name="piper",
     default_args=_piper_default_args,
@@ -230,6 +333,7 @@ PIPER_WEB_PROFILE = RobotWebProfile(
     make_loop_config=_piper_loop_config,
     validate_args=_piper_validate,
     configure_reset=_piper_reset_args,
+    baseline_config_for_args=_piper_baseline_config,
     include_camera_params=False,
     capabilities=RobotWebCapabilities(True, True, False, True, ("sync", "rtc", "infer_only")),
 )
@@ -245,6 +349,7 @@ RM2_WEB_PROFILE = RobotWebProfile(
     make_loop_config=InferenceLoopConfig.from_args,
     validate_args=infer_rm2.validate_args,
     configure_reset=_rm2_reset_args,
+    baseline_config_for_args=_rm2_baseline_config,
     include_camera_params=True,
     capabilities=RobotWebCapabilities(True, True, False, True, ("sync", "rtc", "infer_only")),
 )

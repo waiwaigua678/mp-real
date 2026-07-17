@@ -45,8 +45,9 @@ button:disabled { cursor: not-allowed; opacity: 0.48; }
 .camera { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--card); }
 .camera h3 { margin: 0; padding: 10px 12px 2px; font-size: 14px; }
 .camera .camera-meta { padding: 2px 12px 10px; color: var(--muted); font-size: 11px; min-height: 30px; }
-.camera img, .camera .missing { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: contain; background: #12181d; }
+.camera canvas, .camera .missing { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: contain; background: #12181d; }
 .camera .missing { display: grid; place-items: center; color: #d5e0e5; font-size: 13px; }
+.camera canvas[hidden], .camera .missing[hidden] { display: none; }
 .two-column { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(320px, 0.75fr); gap: 14px; margin-top: 14px; }
 .sample-details, .metrics { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 0; margin: 10px 0; }
 .sample-details dt, .sample-details dd, .metrics dt, .metrics dd { margin: 0; padding: 7px 4px; border-bottom: 1px solid #edf0f2; font-size: 12px; overflow-wrap: anywhere; }

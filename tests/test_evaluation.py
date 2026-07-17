@@ -186,10 +186,10 @@ def _wait_for_state(service: EvaluationService, expected: str, *, timeout: float
 
 class EvaluationServiceTests(unittest.TestCase):
     def _service(
-        self, *, policy: _Policy | None = None, robot_name: str = "fake"
+        self, *, policy: _Policy | None = None, robot_name: str = "fake", terminal_sink: Any | None = None
     ) -> tuple[EvaluationService, _Broker]:
         broker = _Broker(policy or _Policy(), robot_name=robot_name)
-        service = EvaluationService(broker)
+        service = EvaluationService(broker, terminal_sink=terminal_sink)
         broker.service = service
         self.addCleanup(broker.close)
         self.addCleanup(service.shutdown)
@@ -202,6 +202,7 @@ class EvaluationServiceTests(unittest.TestCase):
         robot_name: str | None = None,
         planned_episodes: int = 3,
         max_episode_seconds: float = 1.0,
+        baseline_id: str | None = None,
     ) -> None:
         service.create(
             {
@@ -211,6 +212,7 @@ class EvaluationServiceTests(unittest.TestCase):
                 "max_episode_seconds": max_episode_seconds,
                 "reset_mode": "manual",
                 "result_mode": "manual",
+                **({"baseline_id": baseline_id} if baseline_id is not None else {}),
                 **({"robot_name": robot_name} if robot_name is not None else {}),
             }
         )
@@ -324,6 +326,19 @@ class EvaluationServiceTests(unittest.TestCase):
         self.assertEqual(status["state"], "COMPLETED")
         self.assertEqual(status["summary"]["success_rate_denominator"], 1)
         self.assertEqual(status["summary"]["success_rate"], 1.0)
+
+    def test_terminal_sink_receives_a_baseline_backed_terminal_snapshot_once(self) -> None:
+        received: list[dict[str, Any]] = []
+        service, _ = self._service(terminal_sink=received.append)
+        self._create(service, planned_episodes=1, baseline_id="baseline-123")
+        self._warm_and_reset(service)
+        self._run_and_stop(service)
+        status = service.label({"result": "SUCCESS"})
+
+        self.assertEqual(status["state"], "COMPLETED")
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]["config"]["baseline_id"], "baseline-123")
+        self.assertEqual(received[0]["summary"]["result_counts"], {"SUCCESS": 1})
 
     def test_duplicate_label_is_rejected(self) -> None:
         service, _ = self._service()
