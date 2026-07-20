@@ -6,7 +6,7 @@ import os
 import queue
 import threading
 import time
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Iterator, Mapping
 from fractions import Fraction
 from pathlib import Path
@@ -25,6 +25,7 @@ from mp_real.data.models import (
     RecordedEpisodeSource,
     RecordedSample,
     RecorderConfig,
+    RecorderMetrics,
 )
 from mp_real.runtime.events import (
     ActionExecuted,
@@ -40,8 +41,8 @@ from mp_real.runtime.events import (
 from mp_real.runtime.models import ActionSpec, VectorField
 
 CODEBASE_VERSION = "v2.1"
-MP_REAL_SCHEMA_VERSION = 2
-RECORDER_VERSION = "h1-control-step-v2"
+MP_REAL_SCHEMA_VERSION = 3
+RECORDER_VERSION = "h2-telemetry-parts-v3"
 DEFAULT_CHUNK_SIZE = 1000
 TIMESTAMP_TOLERANCE_S = 1e-4
 _STOP = object()
@@ -175,6 +176,22 @@ def _telemetry_path(episode_index: int) -> Path:
     return Path("telemetry") / f"chunk-{_episode_chunk(episode_index):03d}" / f"episode_{episode_index:06d}.npz"
 
 
+def _telemetry_dir_path(episode_index: int) -> Path:
+    return Path("telemetry") / f"chunk-{_episode_chunk(episode_index):03d}" / f"episode_{episode_index:06d}"
+
+
+def _telemetry_index_path(episode_index: int) -> Path:
+    return _telemetry_dir_path(episode_index) / "index.json"
+
+
+def _telemetry_part_name(part_index: int) -> str:
+    return f"part_{part_index:06d}.npz"
+
+
+def _telemetry_part_path(episode_index: int, part_index: int) -> Path:
+    return _telemetry_dir_path(episode_index) / _telemetry_part_name(part_index)
+
+
 def _field_names(fields: tuple[VectorField, ...], dimension: int, prefix: str) -> list[str]:
     return list(field.name for field in fields) if fields else [f"{prefix}_{index}" for index in range(dimension)]
 
@@ -271,6 +288,11 @@ def _build_info(
             "operator": config.operator,
             "policy_label": config.policy_label,
             "runtime_config": dict(config.runtime_config),
+            "telemetry": {
+                "enabled": config.save_telemetry,
+                "layout": "parts" if config.save_telemetry else "disabled",
+                "part_size_steps": config.telemetry_part_size_steps if config.save_telemetry else 0,
+            },
             # The standard LeRobot ``action`` field is populated only from
             # ActionExecuted events.  Naming that provenance explicitly is
             # required before a future real-robot command replay may consume
@@ -294,6 +316,290 @@ def _arrow_schema(features: Mapping[str, Mapping[str, object]]) -> pa.Schema:
         arrow_type = scalar if shape == [1] else pa.list_(scalar, list_size=int(shape[0]))
         fields.append(pa.field(name, arrow_type))
     return pa.schema(fields)
+
+
+@dataclasses.dataclass(frozen=True)
+class _QueuedEvent:
+    event: RuntimeEvent
+    image_bytes: int
+    telemetry_bytes: int
+
+
+class _BoundedCache:
+    def __init__(self, capacity: int) -> None:
+        if capacity <= 0:
+            raise ValueError("cache capacity must be positive")
+        self.capacity = capacity
+        self._items: OrderedDict[object, object] = OrderedDict()
+        self.evictions = 0
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._items
+
+    def get(self, key: object) -> object | None:
+        value = self._items.get(key)
+        if value is not None:
+            self._items.move_to_end(key)
+        return value
+
+    def put(self, key: object, value: object) -> None:
+        if key in self._items:
+            self._items.move_to_end(key)
+        self._items[key] = value
+        while len(self._items) > self.capacity:
+            self._items.popitem(last=False)
+            self.evictions += 1
+
+    def pop(self, key: object, default: object | None = None) -> object | None:
+        return self._items.pop(key, default)
+
+    def discard_where(self, predicate: Callable[[object], bool]) -> None:
+        for key in tuple(self._items):
+            if predicate(key):
+                self._items.pop(key, None)
+
+    def clear(self) -> None:
+        self._items.clear()
+
+
+def _payload_array_bytes(value: object) -> int:
+    if isinstance(value, np.ndarray):
+        return int(value.nbytes)
+    if isinstance(value, np.generic):
+        return int(value.nbytes)
+    if isinstance(value, Mapping):
+        return sum(_payload_array_bytes(item) for item in value.values())
+    if isinstance(value, (tuple, list, set)):
+        return sum(_payload_array_bytes(item) for item in value)
+    return 0
+
+
+def _event_image_bytes(event: RuntimeEvent) -> int:
+    images = event.payload.get("images")
+    return _payload_array_bytes(images) if isinstance(images, Mapping) else 0
+
+
+def _event_telemetry_bytes(event: RuntimeEvent) -> int:
+    return max(0, _payload_array_bytes(event.payload) - _event_image_bytes(event))
+
+
+def _percentile(values: tuple[int, ...], fraction: float) -> int:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * fraction)))
+    return int(ordered[index])
+
+
+class _TelemetryPartWriter:
+    """Incremental mp-real telemetry writer with bounded in-memory buffers."""
+
+    _INDEX_VERSION = 1
+
+    def __init__(self, root: Path, config: RecorderConfig, context: EpisodeRecordingContext) -> None:
+        self.root = root
+        self.config = config
+        self.context = context
+        self.directory = root / _telemetry_dir_path(context.episode_index)
+        self._part_size_steps = config.telemetry_part_size_steps
+        self._part_index = 0
+        self._parts: list[dict[str, object]] = []
+        self._next_frame_start = 0
+        self._buffered_bytes = 0
+        self._dropped_frame_count = 0
+        self._dropped_event_count = 0
+        self._camera_frame_ids: list[list[int]] = []
+        self._camera_timestamps: list[list[int]] = []
+        self._camera_reused: list[list[bool]] = []
+        self._camera_ages: list[list[int]] = []
+        self._control_step_ids: list[int] = []
+        self._policy_observation_ids: list[int] = []
+        self._policy_request_ids: list[int] = []
+        self._control_chunk_ids: list[int] = []
+        self._control_chunk_cursors: list[int] = []
+        self._action_sent_timestamps: list[int] = []
+        self._raw_chunks: list[np.ndarray] = []
+        self._raw_chunk_request_ids: list[int] = []
+        self._raw_chunk_ids: list[int] = []
+        self._raw_chunk_cursors: list[int] = []
+        self._raw_chunk_observation_ids: list[int] = []
+        self._policy_generation_ids: list[int] = []
+        self._safety_flags: list[str] = []
+
+    @property
+    def buffered_bytes(self) -> int:
+        return self._buffered_bytes
+
+    @property
+    def part_count(self) -> int:
+        return len(self._parts)
+
+    def set_drop_counts(self, *, dropped_frame_count: int, dropped_event_count: int) -> None:
+        self._dropped_frame_count = int(dropped_frame_count)
+        self._dropped_event_count = int(dropped_event_count)
+
+    def record_chunk(self, event: RuntimeEvent) -> bool:
+        raw_chunk = event.payload.get("raw_action_chunk")
+        if raw_chunk is None:
+            return True
+        array = np.asarray(raw_chunk, dtype=np.float32)
+        if array.ndim != 2 or array.shape[1] != self.config.action_spec.action_dim:
+            return False
+        copied = array.copy()
+        self._raw_chunks.append(copied)
+        self._raw_chunk_request_ids.append(-1 if event.request_id is None else event.request_id)
+        self._raw_chunk_ids.append(-1 if event.chunk_id is None else event.chunk_id)
+        self._raw_chunk_cursors.append(_integer(event.payload.get("chunk_cursor"), -1))
+        self._raw_chunk_observation_ids.append(_integer(event.payload.get("observation_id"), -1))
+        self._buffered_bytes += int(copied.nbytes) + 32
+        return True
+
+    def record_frame(
+        self,
+        *,
+        frame_index: int,
+        event: RuntimeEvent,
+        current_ids: list[int],
+        current_timestamps: list[int],
+        reused: list[bool],
+        ages: list[int],
+        control_step_id: int,
+        policy_observation_id: int,
+        policy_request_id: int,
+        control_chunk_id: int,
+        chunk_cursor: int,
+        action_sent_timestamp_ns: int,
+        safety_flags: str,
+    ) -> None:
+        if frame_index != self._next_frame_start + len(self._control_step_ids):
+            self.flush()
+            self._next_frame_start = frame_index
+        self._camera_frame_ids.append(current_ids)
+        self._camera_timestamps.append(current_timestamps)
+        self._camera_reused.append(reused)
+        self._camera_ages.append(ages)
+        self._control_step_ids.append(control_step_id)
+        self._policy_observation_ids.append(policy_observation_id)
+        self._policy_request_ids.append(policy_request_id)
+        self._control_chunk_ids.append(control_chunk_id)
+        self._control_chunk_cursors.append(chunk_cursor)
+        self._action_sent_timestamps.append(action_sent_timestamp_ns)
+        self._policy_generation_ids.append(event.generation_id)
+        self._safety_flags.append(safety_flags)
+        camera_count = len(self.config.action_spec.camera_roles)
+        self._buffered_bytes += 8 * (5 * camera_count + 8) + len(safety_flags.encode("utf-8"))
+        if len(self._control_step_ids) >= self._part_size_steps:
+            self.flush()
+
+    def flush(self) -> None:
+        frame_count = len(self._control_step_ids)
+        if frame_count == 0 and not self._raw_chunks:
+            self._write_index()
+            return
+        self.directory.mkdir(parents=True, exist_ok=True)
+        part_name = _telemetry_part_name(self._part_index)
+        part_path = self.directory / part_name
+        chunk_count = len(self._raw_chunks)
+        max_chunk_length = max((len(chunk) for chunk in self._raw_chunks), default=0)
+        action_dim = self.config.action_spec.action_dim
+        raw_chunks = np.full((chunk_count, max_chunk_length, action_dim), np.nan, dtype=np.float32)
+        for index, chunk in enumerate(self._raw_chunks):
+            raw_chunks[index, : len(chunk)] = chunk
+        temporary = part_path.with_name(part_path.name + ".tmp")
+        with temporary.open("wb") as stream:
+            np.savez_compressed(
+                stream,
+                start_control_step=np.asarray(self._control_step_ids[:1] or [-1], dtype=np.int64),
+                end_control_step=np.asarray(self._control_step_ids[-1:] or [-1], dtype=np.int64),
+                raw_action_chunk=raw_chunks,
+                raw_action_chunk_length=np.asarray([len(chunk) for chunk in self._raw_chunks], dtype=np.int64),
+                request_id=np.asarray(self._raw_chunk_request_ids, dtype=np.int64),
+                chunk_id=np.asarray(self._raw_chunk_ids, dtype=np.int64),
+                chunk_cursor=np.asarray(self._raw_chunk_cursors, dtype=np.int64),
+                observation_id=np.asarray(self._raw_chunk_observation_ids, dtype=np.int64),
+                camera_roles=np.asarray(self.config.action_spec.camera_roles),
+                camera_frame_ids=np.asarray(self._camera_frame_ids, dtype=np.int64),
+                camera_timestamps_ns=np.asarray(self._camera_timestamps, dtype=np.int64),
+                camera_frame_reused=np.asarray(self._camera_reused, dtype=np.bool_),
+                camera_age_ns=np.asarray(self._camera_ages, dtype=np.int64),
+                control_step_id=np.asarray(self._control_step_ids, dtype=np.int64),
+                policy_observation_id=np.asarray(self._policy_observation_ids, dtype=np.int64),
+                policy_request_id=np.asarray(self._policy_request_ids, dtype=np.int64),
+                control_chunk_id=np.asarray(self._control_chunk_ids, dtype=np.int64),
+                control_chunk_cursor=np.asarray(self._control_chunk_cursors, dtype=np.int64),
+                action_sent_timestamp_ns=np.asarray(self._action_sent_timestamps, dtype=np.int64),
+                policy_generation_id=np.asarray(self._policy_generation_ids, dtype=np.int64),
+                safety_flags=np.asarray(self._safety_flags, dtype=str),
+                dropped_frame_count=np.asarray(self._dropped_frame_count, dtype=np.int64),
+                dropped_event_count=np.asarray(self._dropped_event_count, dtype=np.int64),
+            )
+        os.replace(temporary, part_path)
+        start_frame = self._next_frame_start
+        end_frame = self._next_frame_start + frame_count
+        self._parts.append(
+            {
+                "path": part_name,
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "frame_count": frame_count,
+                "start_control_step": self._control_step_ids[0] if self._control_step_ids else None,
+                "end_control_step": self._control_step_ids[-1] if self._control_step_ids else None,
+                "raw_chunk_count": chunk_count,
+                "raw_observation_ids": list(self._raw_chunk_observation_ids),
+                "raw_chunk_ids": list(self._raw_chunk_ids),
+            }
+        )
+        self._part_index += 1
+        self._next_frame_start = end_frame
+        self._clear_buffers()
+        self._write_index()
+
+    def close(self) -> None:
+        self.flush()
+
+    def _clear_buffers(self) -> None:
+        self._camera_frame_ids.clear()
+        self._camera_timestamps.clear()
+        self._camera_reused.clear()
+        self._camera_ages.clear()
+        self._control_step_ids.clear()
+        self._policy_observation_ids.clear()
+        self._policy_request_ids.clear()
+        self._control_chunk_ids.clear()
+        self._control_chunk_cursors.clear()
+        self._action_sent_timestamps.clear()
+        self._raw_chunks.clear()
+        self._raw_chunk_request_ids.clear()
+        self._raw_chunk_ids.clear()
+        self._raw_chunk_cursors.clear()
+        self._raw_chunk_observation_ids.clear()
+        self._policy_generation_ids.clear()
+        self._safety_flags.clear()
+        self._buffered_bytes = 0
+
+    def _write_index(self) -> None:
+        if not self.directory.exists():
+            return
+        _write_json(
+            self.directory / "index.json",
+            {
+                "schema_version": MP_REAL_SCHEMA_VERSION,
+                "index_version": self._INDEX_VERSION,
+                "layout": "parts",
+                "episode_index": self.context.episode_index,
+                "camera_roles": list(self.config.action_spec.camera_roles),
+                "action_dim": self.config.action_spec.action_dim,
+                "part_size_steps": self._part_size_steps,
+                "total_parts": len(self._parts),
+                "total_frames": sum(int(part["frame_count"]) for part in self._parts),
+                "dropped_frame_count": self._dropped_frame_count,
+                "dropped_event_count": self._dropped_event_count,
+                "parts": list(self._parts),
+            },
+        )
 
 
 class _VideoWriter:
@@ -411,27 +717,12 @@ class _EpisodeWriter:
         self._video_writers: dict[str, _VideoWriter] = {}
         self._stats: dict[str, _OnlineStats] = defaultdict(_OnlineStats)
         self._last_camera_ids: dict[str, int] = {}
-        self._camera_frame_ids: list[list[int]] = []
-        self._camera_timestamps: list[list[int]] = []
-        self._camera_reused: list[list[bool]] = []
-        self._camera_ages: list[list[int]] = []
-        self._control_step_ids: list[int] = []
-        self._policy_observation_ids: list[int] = []
-        self._policy_request_ids: list[int] = []
-        self._control_chunk_ids: list[int] = []
-        self._control_chunk_cursors: list[int] = []
-        self._action_sent_timestamps: list[int] = []
         self._control_step_frame_count = 0
-        self._raw_chunks: list[np.ndarray] = []
-        self._raw_chunk_request_ids: list[int] = []
-        self._raw_chunk_ids: list[int] = []
-        self._raw_chunk_cursors: list[int] = []
-        self._raw_chunk_observation_ids: list[int] = []
-        self._policy_generation_ids: list[int] = []
-        self._safety_flags: list[str] = []
+        self._telemetry = _TelemetryPartWriter(root, config, context) if config.save_telemetry else None
         self._invalid_reason: str | None = None
         self._dropped_frame_count = 0
         self._dropped_event_count = 0
+        self._closed = False
 
     @property
     def camera_shapes(self) -> Mapping[str, tuple[int, int, int]]:
@@ -441,22 +732,26 @@ class _EpisodeWriter:
     def control_step_aligned(self) -> bool:
         return self.frame_count > 0 and self._control_step_frame_count == self.frame_count
 
+    @property
+    def telemetry_part_count(self) -> int:
+        return 0 if self._telemetry is None else self._telemetry.part_count
+
+    @property
+    def buffered_telemetry_bytes(self) -> int:
+        return 0 if self._telemetry is None else self._telemetry.buffered_bytes
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
     def set_global_start(self, value: int) -> None:
         self._global_start = value
 
     def record_chunk(self, event: RuntimeEvent) -> None:
-        raw_chunk = event.payload.get("raw_action_chunk")
-        if raw_chunk is None:
+        if self._telemetry is None:
             return
-        array = np.asarray(raw_chunk, dtype=np.float32)
-        if array.ndim != 2 or array.shape[1] != self.config.action_spec.action_dim:
+        if not self._telemetry.record_chunk(event):
             self._dropped_event_count += 1
-            return
-        self._raw_chunks.append(array.copy())
-        self._raw_chunk_request_ids.append(-1 if event.request_id is None else event.request_id)
-        self._raw_chunk_ids.append(-1 if event.chunk_id is None else event.chunk_id)
-        self._raw_chunk_cursors.append(_integer(event.payload.get("chunk_cursor"), -1))
-        self._raw_chunk_observation_ids.append(_integer(event.payload.get("observation_id"), -1))
 
     def record_frame(
         self,
@@ -589,23 +884,26 @@ class _EpisodeWriter:
         for role, image in converted_images.items():
             self._stats[f"observation.images.{role}"].update(image, channel_stats=True)
             self._last_camera_ids[role] = int(camera_ids[role])
-        self._camera_frame_ids.append(current_ids)
-        self._camera_timestamps.append(current_timestamps)
-        self._camera_reused.append(reused)
-        self._camera_ages.append(ages)
-        self._control_step_ids.append(control_step_id)
-        self._policy_observation_ids.append(policy_observation_id)
-        self._policy_request_ids.append(policy_request_id)
-        self._control_chunk_ids.append(control_chunk_id)
-        self._control_chunk_cursors.append(chunk_cursor)
-        self._action_sent_timestamps.append(action_sent_timestamp_ns)
         if isinstance(event, ControlStepRecorded):
             self._control_step_frame_count += 1
-        self._policy_generation_ids.append(event.generation_id)
         safety_flags = event.payload.get("safety_flags", ())
-        self._safety_flags.append(
-            json.dumps(safety_flags, ensure_ascii=False, sort_keys=True, default=_json_default)
-        )
+        encoded_safety_flags = json.dumps(safety_flags, ensure_ascii=False, sort_keys=True, default=_json_default)
+        if self._telemetry is not None:
+            self._telemetry.record_frame(
+                frame_index=frame_index,
+                event=event,
+                current_ids=current_ids,
+                current_timestamps=current_timestamps,
+                reused=reused,
+                ages=ages,
+                control_step_id=control_step_id,
+                policy_observation_id=policy_observation_id,
+                policy_request_id=policy_request_id,
+                control_chunk_id=control_chunk_id,
+                chunk_cursor=chunk_cursor,
+                action_sent_timestamp_ns=action_sent_timestamp_ns,
+                safety_flags=encoded_safety_flags,
+            )
         self.frame_count += 1
 
     def note_drop(self, *, frame: bool = False) -> None:
@@ -613,45 +911,40 @@ class _EpisodeWriter:
         if frame:
             self._dropped_frame_count += 1
 
+    def flush(self) -> None:
+        if self._telemetry is not None:
+            self._telemetry.set_drop_counts(
+                dropped_frame_count=self._dropped_frame_count,
+                dropped_event_count=self._dropped_event_count,
+            )
+            self._telemetry.flush()
+
+    def abort(self) -> tuple[dict[str, object], dict[str, object], str | None]:
+        video_info = self._close_resources(finalize_telemetry=True)
+        return ({name: stats.to_json() for name, stats in self._stats.items()}, video_info, self._invalid_reason)
+
     def close(self) -> tuple[dict[str, object], dict[str, object], str | None]:
+        video_info = self._close_resources(finalize_telemetry=True)
+        return ({name: stats.to_json() for name, stats in self._stats.items()}, video_info, self._invalid_reason)
+
+    def _close_resources(self, *, finalize_telemetry: bool) -> dict[str, object]:
+        if self._closed:
+            return {}
         if self._parquet_writer is not None:
             self._parquet_writer.close()
+            self._parquet_writer = None
         video_info: dict[str, object] = {}
-        for role, writer in self._video_writers.items():
+        for role, writer in tuple(self._video_writers.items()):
             video_info[role] = writer.close()
-        telemetry_path = self.root / _telemetry_path(self.context.episode_index)
-        telemetry_path.parent.mkdir(parents=True, exist_ok=True)
-        chunk_count = len(self._raw_chunks)
-        max_chunk_length = max((len(chunk) for chunk in self._raw_chunks), default=0)
-        action_dim = self.config.action_spec.action_dim
-        raw_chunks = np.full((chunk_count, max_chunk_length, action_dim), np.nan, dtype=np.float32)
-        for index, chunk in enumerate(self._raw_chunks):
-            raw_chunks[index, : len(chunk)] = chunk
-        np.savez_compressed(
-            telemetry_path,
-            raw_action_chunk=raw_chunks,
-            raw_action_chunk_length=np.asarray([len(chunk) for chunk in self._raw_chunks], dtype=np.int64),
-            request_id=np.asarray(self._raw_chunk_request_ids, dtype=np.int64),
-            chunk_id=np.asarray(self._raw_chunk_ids, dtype=np.int64),
-            chunk_cursor=np.asarray(self._raw_chunk_cursors, dtype=np.int64),
-            observation_id=np.asarray(self._raw_chunk_observation_ids, dtype=np.int64),
-            camera_roles=np.asarray(self.config.action_spec.camera_roles),
-            camera_frame_ids=np.asarray(self._camera_frame_ids, dtype=np.int64),
-            camera_timestamps_ns=np.asarray(self._camera_timestamps, dtype=np.int64),
-            camera_frame_reused=np.asarray(self._camera_reused, dtype=np.bool_),
-            camera_age_ns=np.asarray(self._camera_ages, dtype=np.int64),
-            control_step_id=np.asarray(self._control_step_ids, dtype=np.int64),
-            policy_observation_id=np.asarray(self._policy_observation_ids, dtype=np.int64),
-            policy_request_id=np.asarray(self._policy_request_ids, dtype=np.int64),
-            control_chunk_id=np.asarray(self._control_chunk_ids, dtype=np.int64),
-            control_chunk_cursor=np.asarray(self._control_chunk_cursors, dtype=np.int64),
-            action_sent_timestamp_ns=np.asarray(self._action_sent_timestamps, dtype=np.int64),
-            policy_generation_id=np.asarray(self._policy_generation_ids, dtype=np.int64),
-            safety_flags=np.asarray(self._safety_flags),
-            dropped_frame_count=np.asarray(self._dropped_frame_count, dtype=np.int64),
-            dropped_event_count=np.asarray(self._dropped_event_count, dtype=np.int64),
-        )
-        return ({name: stats.to_json() for name, stats in self._stats.items()}, video_info, self._invalid_reason)
+        self._video_writers.clear()
+        if finalize_telemetry and self._telemetry is not None:
+            self._telemetry.set_drop_counts(
+                dropped_frame_count=self._dropped_frame_count,
+                dropped_event_count=self._dropped_event_count,
+            )
+            self._telemetry.close()
+        self._closed = True
+        return video_info
 
 
 class LeRobotV21EpisodeRecorder(RuntimeEventSink):
@@ -672,11 +965,22 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
         self._thread: threading.Thread | None = None
         self._started = False
         self._stopping = False
+        self._stop_event = threading.Event()
         self._failure: BaseException | None = None
         self._active: EpisodeRecordingContext | None = None
         self._dropped_event_count = 0
         self._dropped_frame_count = 0
         self._queue_high_watermark = 0
+        self._cache_entry_count = 0
+        self._cache_high_watermark = 0
+        self._cache_eviction_count = 0
+        self._buffered_image_bytes = 0
+        self._buffered_telemetry_bytes = 0
+        self._writer_buffered_telemetry_bytes = 0
+        self._written_frame_count = 0
+        self._telemetry_part_count = 0
+        self._active_writer_count = 0
+        self._writer_latency_ns: deque[int] = deque(maxlen=2048)
         self._final_root = config.dataset_root.resolve()
         self._work_root = self._final_root.with_name(self._final_root.name + ".inprogress")
 
@@ -703,6 +1007,30 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
     def queue_capacity(self) -> int:
         return self.config.queue_size
 
+    def metrics(self) -> RecorderMetrics:
+        with self._lock:
+            latencies = tuple(self._writer_latency_ns)
+            buffered_image_bytes = self._buffered_image_bytes
+            buffered_telemetry_bytes = self._buffered_telemetry_bytes + self._writer_buffered_telemetry_bytes
+            return RecorderMetrics(
+                queue_size=self._queue.qsize(),
+                queue_capacity=self.config.queue_size,
+                queue_high_watermark=self._queue_high_watermark,
+                cache_entry_count=self._cache_entry_count,
+                cache_high_watermark=self._cache_high_watermark,
+                cache_eviction_count=self._cache_eviction_count,
+                buffered_image_bytes=buffered_image_bytes,
+                buffered_telemetry_bytes=buffered_telemetry_bytes,
+                written_frame_count=self._written_frame_count,
+                dropped_frame_count=self._dropped_frame_count,
+                dropped_event_count=self._dropped_event_count,
+                writer_latency_p50_ns=_percentile(latencies, 0.50),
+                writer_latency_p95_ns=_percentile(latencies, 0.95),
+                current_memory_estimate_bytes=buffered_image_bytes + buffered_telemetry_bytes,
+                telemetry_part_count=self._telemetry_part_count,
+                active_writer_count=self._active_writer_count,
+            )
+
     @property
     def failure(self) -> BaseException | None:
         with self._lock:
@@ -723,6 +1051,7 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
             if self._final_root.exists() or self._work_root.exists():
                 raise FileExistsError(f"Recording dataset already exists: {self._final_root}")
             self._started = True
+            self._stop_event.clear()
             self._thread = threading.Thread(
                 target=self._run,
                 name=f"recording-{self.config.dataset_name}",
@@ -755,11 +1084,25 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
             active = self._active
         if active is None or event.episode_id != active.episode_id:
             return
-        if not self._put(("event", event), block=False):
+        queued = _QueuedEvent(event, _event_image_bytes(event), _event_telemetry_bytes(event))
+        if self._put(("event", queued), block=False):
             with self._lock:
-                self._dropped_event_count += 1
-                if isinstance(event, (ObservationCaptured, ActionExecuted, ControlStepRecorded)):
-                    self._dropped_frame_count += 1
+                self._buffered_image_bytes += queued.image_bytes
+                self._buffered_telemetry_bytes += queued.telemetry_bytes
+            return
+        abort_error: RuntimeError | None = None
+        with self._lock:
+            self._dropped_event_count += 1
+            if isinstance(event, (ObservationCaptured, ActionExecuted, ControlStepRecorded)):
+                self._dropped_frame_count += 1
+            if self.config.drop_policy == "abort" and self._failure is None:
+                abort_error = RuntimeError("Recorder queue is full")
+                self._failure = abort_error
+        if abort_error is not None and self._on_failure is not None:
+            try:
+                self._on_failure(abort_error)
+            except BaseException:
+                pass
 
     def flush(self, *, timeout: float | None = 5.0) -> bool:
         marker = threading.Event()
@@ -771,6 +1114,7 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
             if not self._started or self._stopping:
                 return self.join(timeout=timeout, raise_on_error=False)
             self._stopping = True
+            self._stop_event.set()
         self._put(("stop", finalize), block=True)
         return self.join(timeout=timeout, raise_on_error=False)
 
@@ -801,6 +1145,32 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
         except queue.Full:
             return False
 
+    def _release_queued_event(self, queued: _QueuedEvent) -> None:
+        with self._lock:
+            self._buffered_image_bytes = max(0, self._buffered_image_bytes - queued.image_bytes)
+            self._buffered_telemetry_bytes = max(0, self._buffered_telemetry_bytes - queued.telemetry_bytes)
+
+    def _note_writer_latency(self, started_ns: int) -> None:
+        with self._lock:
+            self._writer_latency_ns.append(max(0, time.monotonic_ns() - started_ns))
+
+    def _set_cache_metrics(self, caches: tuple[_BoundedCache, ...]) -> None:
+        entry_count = sum(len(cache) for cache in caches)
+        eviction_count = sum(cache.evictions for cache in caches)
+        with self._lock:
+            self._cache_entry_count = entry_count
+            self._cache_high_watermark = max(self._cache_high_watermark, entry_count)
+            self._cache_eviction_count = eviction_count
+
+    def _set_writer_metrics(self, episodes: Mapping[int, _EpisodeWriter]) -> None:
+        with self._lock:
+            self._active_writer_count = sum(not writer.closed for writer in episodes.values())
+            self._written_frame_count = sum(writer.frame_count for writer in episodes.values())
+            self._writer_buffered_telemetry_bytes = sum(
+                writer.buffered_telemetry_bytes for writer in episodes.values()
+            )
+            self._telemetry_part_count = sum(writer.telemetry_part_count for writer in episodes.values())
+
     def _run(self) -> None:
         episodes: dict[int, _EpisodeWriter] = {}
         contexts: dict[int, EpisodeRecordingContext] = {}
@@ -808,17 +1178,27 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
         video_info: dict[str, object] = {}
         labels: dict[int, dict[str, object]] = {}
         persisted_labels: set[int] = set()
-        observations: dict[int, Mapping[str, object]] = {}
-        selected_actions: dict[tuple[int, int], np.ndarray] = {}
-        stabilized_actions: dict[tuple[int, int], np.ndarray] = {}
-        control_step_recorded_steps: set[tuple[int, int]] = set()
-        inference_latency_ns: dict[int, int] = {}
+        observations = _BoundedCache(self.config.max_observation_cache_entries)
+        selected_actions = _BoundedCache(self.config.max_incomplete_event_entries)
+        stabilized_actions = _BoundedCache(self.config.max_incomplete_event_entries)
+        control_step_recorded_steps = _BoundedCache(self.config.max_incomplete_event_entries)
+        inference_latency_ns = _BoundedCache(self.config.max_inference_latency_entries)
+        caches = (
+            observations,
+            selected_actions,
+            stabilized_actions,
+            control_step_recorded_steps,
+            inference_latency_ns,
+        )
         global_index = 0
         tasks: dict[str, int] = {}
         try:
             while True:
                 item = self._queue.get()
                 try:
+                    event_started_ns = time.monotonic_ns()
+                    queued_event: _QueuedEvent | None = None
+                    event: RuntimeEvent | None = None
                     kind = item[0]  # type: ignore[index]
                     if kind == "start":
                         self._work_root.mkdir(parents=True, exist_ok=False)
@@ -845,6 +1225,13 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
                                 ),
                                 "camera_roles": list(self.config.action_spec.camera_roles),
                                 "max_camera_age_ns": self.config.max_camera_age_ns,
+                                "telemetry": {
+                                    "enabled": self.config.save_telemetry,
+                                    "layout": "parts" if self.config.save_telemetry else "disabled",
+                                    "part_size_steps": (
+                                        self.config.telemetry_part_size_steps if self.config.save_telemetry else 0
+                                    ),
+                                },
                             },
                         )
                         _append_jsonl(
@@ -870,8 +1257,9 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
                         episodes[context.episode_index] = writer
                         contexts[context.episode_index] = context
                     elif kind == "event":
-                        event = item[1]  # type: ignore[index]
-                        assert isinstance(event, RuntimeEvent)
+                        queued_event = item[1]  # type: ignore[index]
+                        assert isinstance(queued_event, _QueuedEvent)
+                        event = queued_event.event
                         event_episode = next(
                             (context for context in contexts.values() if context.episode_id == event.episode_id), None
                         )
@@ -900,36 +1288,42 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
                         )
                         if isinstance(event, ControlStepRecorded):
                             step_key = (event_episode.episode_index, int(event.step or -1))
-                            control_step_recorded_steps.add(step_key)
+                            control_step_recorded_steps.put(step_key, True)
                             selected_actions.pop(step_key, None)
                             stabilized_actions.pop(step_key, None)
                             policy_observation_id = _integer(event.payload.get("policy_observation_id"), -1)
+                            control_observation_id = _integer(event.payload.get("observation_id"), -1)
                             writer.record_frame(
                                 event,
                                 event.payload,
                                 None,
                                 None,
-                                inference_latency_ns.get(policy_observation_id, 0),
+                                int(inference_latency_ns.pop(policy_observation_id, 0) or 0),
                             )
+                            observations.pop(policy_observation_id, None)
+                            observations.pop(control_observation_id, None)
                         elif isinstance(event, ObservationCaptured):
                             observation_id = _integer(event.payload.get("observation_id"), -1)
                             if observation_id >= 0:
-                                observations[observation_id] = event.payload
+                                observations.put(observation_id, event.payload)
                         elif isinstance(event, InferenceFinished):
                             observation_id = _integer(event.payload.get("observation_id"), -1)
                             if observation_id >= 0:
-                                inference_latency_ns[observation_id] = _integer(
-                                    event.payload.get("inference_latency_ns")
+                                inference_latency_ns.put(
+                                    observation_id,
+                                    _integer(event.payload.get("inference_latency_ns")),
                                 )
                         elif isinstance(event, ChunkReceived):
                             writer.record_chunk(event)
                         elif isinstance(event, ActionSelected):
-                            selected_actions[(event_episode.episode_index, int(event.step or -1))] = np.asarray(
-                                event.payload.get("selected_raw_action"), dtype=np.float32
+                            selected_actions.put(
+                                (event_episode.episode_index, int(event.step or -1)),
+                                np.asarray(event.payload.get("selected_raw_action"), dtype=np.float32),
                             )
                         elif isinstance(event, ActionStabilized):
-                            stabilized_actions[(event_episode.episode_index, int(event.step or -1))] = np.asarray(
-                                event.payload.get("stabilized_target_action"), dtype=np.float32
+                            stabilized_actions.put(
+                                (event_episode.episode_index, int(event.step or -1)),
+                                np.asarray(event.payload.get("stabilized_target_action"), dtype=np.float32),
                             )
                         elif isinstance(event, ActionExecuted):
                             step_key = (event_episode.episode_index, int(event.step or -1))
@@ -938,17 +1332,19 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
                                 stabilized_actions.pop(step_key, None)
                                 continue
                             observation_id = _integer(event.payload.get("observation_id"), -1)
-                            observation = observations.get(observation_id)
+                            observation = observations.pop(observation_id, None)
                             if observation is None:
                                 writer.note_drop(frame=True)
                             else:
+                                assert isinstance(observation, Mapping)
                                 writer.record_frame(
                                     event,
                                     observation,
-                                    selected_actions.pop(step_key, None),
-                                    stabilized_actions.pop(step_key, None),
-                                    inference_latency_ns.get(observation_id, 0),
+                                    selected_actions.pop(step_key, None),  # type: ignore[arg-type]
+                                    stabilized_actions.pop(step_key, None),  # type: ignore[arg-type]
+                                    int(inference_latency_ns.pop(observation_id, 0) or 0),
                                 )
+                                observation = None
                     elif kind == "end":
                         context, label = item[1], item[2]  # type: ignore[index]
                         assert isinstance(context, EpisodeRecordingContext)
@@ -961,6 +1357,23 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
                         if invalid_reason:
                             labels[context.episode_index].setdefault("result", "INVALID")
                             labels[context.episode_index].setdefault("failure_reason", invalid_reason)
+                        observations.clear()
+                        inference_latency_ns.clear()
+                        selected_actions.discard_where(
+                            lambda key, episode_index=context.episode_index: (
+                                isinstance(key, tuple) and key[:1] == (episode_index,)
+                            )
+                        )
+                        stabilized_actions.discard_where(
+                            lambda key, episode_index=context.episode_index: (
+                                isinstance(key, tuple) and key[:1] == (episode_index,)
+                            )
+                        )
+                        control_step_recorded_steps.discard_where(
+                            lambda key, episode_index=context.episode_index: (
+                                isinstance(key, tuple) and key[:1] == (episode_index,)
+                            )
+                        )
                     elif kind == "label":
                         episode_index = int(item[1])  # type: ignore[index]
                         context = contexts.get(episode_index)
@@ -979,6 +1392,8 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
                         )
                         persisted_labels.add(episode_index)
                     elif kind == "flush":
+                        for writer in episodes.values():
+                            writer.flush()
                         item[1].set()  # type: ignore[index]
                     elif kind == "stop":
                         if item[1]:
@@ -992,13 +1407,43 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
                                 tasks,
                             )
                         else:
+                            for episode_index, writer in episodes.items():
+                                stats, episode_video_info, invalid_reason = writer.abort()
+                                if writer.frame_count > 0 and episode_index not in episode_stats:
+                                    episode_stats[episode_index] = stats
+                                video_info.update(episode_video_info)
+                                if invalid_reason:
+                                    labels.setdefault(episode_index, {})
+                                    labels[episode_index].setdefault("result", "INVALID")
+                                    labels[episode_index].setdefault("failure_reason", invalid_reason)
+                            self._write_incomplete_dataset(
+                                episodes,
+                                contexts,
+                                episode_stats,
+                                video_info,
+                                labels,
+                                persisted_labels,
+                                tasks,
+                            )
                             self._write_recovery("Recorder stopped without finalization")
                         return
                     else:
                         raise RuntimeError(f"Unknown recorder command: {kind!r}")
                 finally:
+                    if queued_event is not None:
+                        self._release_queued_event(queued_event)
+                        self._note_writer_latency(event_started_ns)
+                    event = None
+                    queued_event = None
+                    self._set_cache_metrics(caches)
+                    self._set_writer_metrics(episodes)
                     self._queue.task_done()
         except BaseException as exc:
+            for writer in episodes.values():
+                try:
+                    writer.abort()
+                except BaseException:
+                    pass
             self._write_recovery(f"{type(exc).__name__}: {exc}")
             with self._lock:
                 self._failure = exc
@@ -1024,6 +1469,67 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
                 )
         except BaseException:
             return
+
+    def _write_incomplete_dataset(
+        self,
+        episodes: Mapping[int, _EpisodeWriter],
+        contexts: Mapping[int, EpisodeRecordingContext],
+        episode_stats: Mapping[int, Mapping[str, object]],
+        video_info: Mapping[str, object],
+        labels: Mapping[int, Mapping[str, object]],
+        persisted_labels: set[int],
+        tasks: Mapping[str, int],
+    ) -> None:
+        non_empty = {index: writer for index, writer in episodes.items() if writer.frame_count > 0}
+        if not non_empty:
+            return
+        camera_shapes: dict[str, tuple[int, int, int]] = {}
+        for writer in non_empty.values():
+            camera_shapes.update(writer.camera_shapes)
+        control_step_aligned = all(writer.control_step_aligned for writer in non_empty.values())
+        info = _build_info(
+            self.config,
+            camera_shapes,
+            require_camera_shapes=False,
+            control_step_aligned=control_step_aligned,
+        )
+        info["total_episodes"] = len(non_empty)
+        info["total_frames"] = sum(writer.frame_count for writer in non_empty.values())
+        info["total_tasks"] = len(tasks)
+        info["total_videos"] = (
+            len(non_empty) * len(self.config.action_spec.camera_roles) if self.config.save_video else 0
+        )
+        info["total_chunks"] = len({_episode_chunk(index) for index in non_empty})
+        info["splits"] = {"train": f"0:{len(non_empty)}"}
+        if self.config.save_video:
+            for role, metadata in video_info.items():
+                if f"observation.images.{role}" in info["features"]:
+                    info["features"][f"observation.images.{role}"]["info"] = metadata  # type: ignore[index]
+        _write_json(self._work_root / "meta" / "info.json", info)
+        for task, task_index in sorted(tasks.items(), key=lambda item: item[1]):
+            _append_jsonl(self._work_root / "meta" / "tasks.jsonl", {"task_index": task_index, "task": task})
+        for episode_index, writer in sorted(non_empty.items()):
+            context = contexts[episode_index]
+            _append_jsonl(
+                self._work_root / "meta" / "episodes.jsonl",
+                {"episode_index": episode_index, "tasks": [context.task], "length": writer.frame_count},
+            )
+            _append_jsonl(
+                self._work_root / "meta" / "episodes_stats.jsonl",
+                {"episode_index": episode_index, "stats": episode_stats.get(episode_index, {})},
+            )
+            if episode_index not in persisted_labels:
+                _append_jsonl(
+                    self._work_root / "meta" / "mp_real" / "episode_labels.jsonl",
+                    {
+                        "session_id": context.session_id or self.config.session_id,
+                        "episode_index": episode_index,
+                        "source_episode_id": context.episode_id,
+                        "created_at": time.time(),
+                        **dict(labels.get(episode_index, {})),
+                    },
+                )
+        _write_json(self._work_root / "meta" / "stats.json", _aggregate_stats(episode_stats.values()))
 
     def _finalize(
         self,
@@ -1073,6 +1579,11 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
                 ),
                 "camera_roles": list(self.config.action_spec.camera_roles),
                 "max_camera_age_ns": self.config.max_camera_age_ns,
+                "telemetry": {
+                    "enabled": self.config.save_telemetry,
+                    "layout": "parts" if self.config.save_telemetry else "disabled",
+                    "part_size_steps": self.config.telemetry_part_size_steps if self.config.save_telemetry else 0,
+                },
             },
         )
         for task, task_index in sorted(tasks.items(), key=lambda item: item[1]):
@@ -1104,6 +1615,7 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
                 "dropped_frame_count": self.dropped_frame_count,
                 "queue_high_watermark": self.queue_high_watermark,
                 "queue_capacity": self.queue_capacity,
+                "metrics": dataclasses.asdict(self.metrics()),
             },
         )
         self._write_recovery("finalization complete")
@@ -1139,6 +1651,50 @@ def _aggregate_stats(values: Iterator[Mapping[str, object]]) -> dict[str, object
             "count": [int(total_count)],
         }
     return result
+
+
+_FRAME_TELEMETRY_KEYS = frozenset(
+    {
+        "camera_frame_ids",
+        "camera_timestamps_ns",
+        "camera_frame_reused",
+        "camera_age_ns",
+        "control_step_id",
+        "policy_observation_id",
+        "policy_request_id",
+        "control_chunk_id",
+        "control_chunk_cursor",
+        "action_sent_timestamp_ns",
+        "policy_generation_id",
+        "safety_flags",
+    }
+)
+_RAW_CHUNK_TELEMETRY_KEYS = frozenset(
+    {
+        "raw_action_chunk",
+        "raw_action_chunk_length",
+        "request_id",
+        "chunk_id",
+        "chunk_cursor",
+        "observation_id",
+    }
+)
+
+
+def _concat_raw_action_chunks(chunks: list[np.ndarray], action_dim: int) -> np.ndarray:
+    chunk_count = sum(int(chunk.shape[0]) for chunk in chunks)
+    max_horizon = max((int(chunk.shape[1]) for chunk in chunks if chunk.ndim == 3), default=0)
+    result = np.full((chunk_count, max_horizon, action_dim), np.nan, dtype=np.float32)
+    offset = 0
+    for chunk in chunks:
+        if chunk.ndim != 3:
+            continue
+        count, horizon, width = chunk.shape
+        if width != action_dim:
+            continue
+        result[offset : offset + count, :horizon] = chunk
+        offset += count
+    return result[:offset]
 
 
 class LeRobotV21EpisodeSource(RecordedEpisodeSource):
@@ -1345,12 +1901,61 @@ class LeRobotV21EpisodeSource(RecordedEpisodeSource):
         self, episode_index: int, *, keys: tuple[str, ...] | None = None
     ) -> dict[str, np.ndarray]:
         """Read optional mp-real telemetry without requiring it for standard data."""
+        index = self._telemetry_index(episode_index)
+        if index is not None:
+            return self._read_episode_telemetry_parts(episode_index, index, keys=keys)
         path = self._root / _telemetry_path(episode_index)
         if not path.is_file():
             return {}
         with np.load(path, allow_pickle=False) as archive:
             names = archive.files if keys is None else (name for name in keys if name in archive.files)
             return {name: np.asarray(archive[name]) for name in names}
+
+    def get_sample_telemetry(
+        self,
+        episode_index: int,
+        sample_index: int,
+        *,
+        keys: tuple[str, ...] | None = None,
+        raw_observation_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Read one sample's telemetry from at most the relevant part files."""
+
+        index = self._telemetry_index(episode_index)
+        if index is None:
+            telemetry = self.get_episode_telemetry(episode_index, keys=keys)
+            return self._slice_legacy_sample_telemetry(
+                telemetry,
+                sample_index,
+                keys=keys,
+                raw_observation_id=raw_observation_id,
+            )
+        requested = set(keys) if keys is not None else None
+        result: dict[str, Any] = {}
+        if requested is None or "camera_roles" in requested:
+            result["camera_roles"] = np.asarray(index.get("camera_roles", ()))
+        if requested is None or "dropped_frame_count" in requested:
+            result["dropped_frame_count"] = np.asarray(index.get("dropped_frame_count", 0), dtype=np.int64)
+        if requested is None or "dropped_event_count" in requested:
+            result["dropped_event_count"] = np.asarray(index.get("dropped_event_count", 0), dtype=np.int64)
+
+        sample_part = self._part_for_sample(index, sample_index)
+        if sample_part is not None:
+            local_index = sample_index - int(sample_part["start_frame"])
+            with np.load(self._telemetry_part_file(episode_index, sample_part), allow_pickle=False) as archive:
+                for name in _FRAME_TELEMETRY_KEYS:
+                    if requested is not None and name not in requested:
+                        continue
+                    if name in archive.files and local_index < len(archive[name]):
+                        result[name] = np.asarray(archive[name][local_index])
+        raw_part = self._part_for_raw_observation(index, raw_observation_id)
+        if raw_part is not None:
+            with np.load(self._telemetry_part_file(episode_index, raw_part), allow_pickle=False) as archive:
+                for name in _RAW_CHUNK_TELEMETRY_KEYS:
+                    if requested is None or name in requested:
+                        if name in archive.files:
+                            result[name] = np.asarray(archive[name])
+        return result
 
     def _parquet_file(self, episode_index: int) -> pq.ParquetFile:
         file = self._parquet_files.get(episode_index)
@@ -1389,6 +1994,104 @@ class LeRobotV21EpisodeSource(RecordedEpisodeSource):
                 _, evicted = self._video_readers.popitem(last=False)
                 evicted.close()
             return reader
+
+    def _telemetry_index(self, episode_index: int) -> dict[str, Any] | None:
+        path = self._root / _telemetry_index_path(episode_index)
+        if not path.is_file():
+            return None
+        return _load_json(path)
+
+    def _telemetry_part_file(self, episode_index: int, part: Mapping[str, object]) -> Path:
+        return self._root / _telemetry_dir_path(episode_index) / str(part["path"])
+
+    def _read_episode_telemetry_parts(
+        self,
+        episode_index: int,
+        index: Mapping[str, Any],
+        *,
+        keys: tuple[str, ...] | None,
+    ) -> dict[str, np.ndarray]:
+        requested = set(keys) if keys is not None else None
+        result: dict[str, np.ndarray] = {}
+        if requested is None or "camera_roles" in requested:
+            result["camera_roles"] = np.asarray(index.get("camera_roles", ()))
+        if requested is None or "dropped_frame_count" in requested:
+            result["dropped_frame_count"] = np.asarray(index.get("dropped_frame_count", 0), dtype=np.int64)
+        if requested is None or "dropped_event_count" in requested:
+            result["dropped_event_count"] = np.asarray(index.get("dropped_event_count", 0), dtype=np.int64)
+        if requested is None or "telemetry_part_count" in requested:
+            result["telemetry_part_count"] = np.asarray(index.get("total_parts", 0), dtype=np.int64)
+        arrays: dict[str, list[np.ndarray]] = defaultdict(list)
+        for part in index.get("parts", ()):
+            if not isinstance(part, Mapping):
+                continue
+            path = self._telemetry_part_file(episode_index, part)
+            if not path.is_file():
+                continue
+            with np.load(path, allow_pickle=False) as archive:
+                names = archive.files if requested is None else (name for name in requested if name in archive.files)
+                for name in names:
+                    if name in {"camera_roles", "dropped_frame_count", "dropped_event_count"}:
+                        continue
+                    arrays[name].append(np.asarray(archive[name]))
+        for name, values in arrays.items():
+            if name == "raw_action_chunk":
+                result[name] = _concat_raw_action_chunks(values, self._action_spec.action_dim)
+            elif name in {"start_control_step", "end_control_step"}:
+                result[name] = np.concatenate([value.reshape(-1) for value in values], axis=0)
+            else:
+                result[name] = np.concatenate(values, axis=0) if values else np.asarray([])
+        return result
+
+    @staticmethod
+    def _part_for_sample(index: Mapping[str, Any], sample_index: int) -> Mapping[str, object] | None:
+        for part in index.get("parts", ()):
+            if not isinstance(part, Mapping):
+                continue
+            if int(part.get("start_frame", -1)) <= sample_index < int(part.get("end_frame", -1)):
+                return part
+        return None
+
+    @staticmethod
+    def _part_for_raw_observation(
+        index: Mapping[str, Any],
+        raw_observation_id: int | None,
+    ) -> Mapping[str, object] | None:
+        if raw_observation_id is None or raw_observation_id < 0:
+            return None
+        for part in index.get("parts", ()):
+            if not isinstance(part, Mapping):
+                continue
+            raw_ids = part.get("raw_observation_ids", ())
+            if isinstance(raw_ids, list) and int(raw_observation_id) in {int(value) for value in raw_ids}:
+                return part
+        return None
+
+    @staticmethod
+    def _slice_legacy_sample_telemetry(
+        telemetry: Mapping[str, np.ndarray],
+        sample_index: int,
+        *,
+        keys: tuple[str, ...] | None,
+        raw_observation_id: int | None,
+    ) -> dict[str, Any]:
+        requested = set(keys) if keys is not None else None
+        result: dict[str, Any] = {}
+        for name, value in telemetry.items():
+            if requested is not None and name not in requested:
+                continue
+            if name in _FRAME_TELEMETRY_KEYS and sample_index < len(value):
+                result[name] = np.asarray(value[sample_index])
+            elif name in {"camera_roles", "dropped_frame_count", "dropped_event_count"}:
+                result[name] = np.asarray(value)
+        if raw_observation_id is not None:
+            raw_ids = telemetry.get("observation_id")
+            if raw_ids is not None and np.any(np.asarray(raw_ids) == int(raw_observation_id)):
+                for name in _RAW_CHUNK_TELEMETRY_KEYS:
+                    if requested is None or name in requested:
+                        if name in telemetry:
+                            result[name] = np.asarray(telemetry[name])
+        return result
 
 
 def _action_spec_from_recording_schema(root: Path, info: Mapping[str, Any]) -> ActionSpec:
@@ -1543,7 +2246,11 @@ def validate_lerobot_v21_dataset(root: Path | str, *, check_videos: bool = True)
         errors.append("Missing meta/episodes_stats.jsonl")
     if not (path / "meta" / "stats.json").is_file():
         errors.append("Missing meta/stats.json")
-    if (path / "meta" / "mp_real" / "schema.json").is_file() and not (path / "telemetry").is_dir():
+    schema_path = path / "meta" / "mp_real" / "schema.json"
+    schema_payload = _load_json(schema_path) if schema_path.is_file() else {}
+    telemetry_config = schema_payload.get("telemetry", {}) if isinstance(schema_payload, Mapping) else {}
+    telemetry_enabled = not isinstance(telemetry_config, Mapping) or telemetry_config.get("enabled", True)
+    if schema_path.is_file() and telemetry_enabled and not (path / "telemetry").is_dir():
         warnings.append("mp-real schema is present but telemetry directory is missing")
     mp_real_info = info.get("mp_real", {})
     if isinstance(mp_real_info, Mapping):

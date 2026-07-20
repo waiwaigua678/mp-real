@@ -410,6 +410,7 @@ class EvaluationService(RuntimeEventSink):
         assert self._session is not None
         snapshot = self._session.snapshot()
         recorder = self._recorder
+        recorder_metrics = dataclasses.asdict(recorder.metrics()) if recorder is not None else {}
         snapshot["recording"] = {
             "enabled": recorder is not None,
             "dataset_root": str(
@@ -424,6 +425,7 @@ class EvaluationService(RuntimeEventSink):
             "queue_high_watermark": recorder.queue_high_watermark if recorder is not None else 0,
             "queue_depth": recorder.queue_depth if recorder is not None else 0,
             "queue_capacity": recorder.queue_capacity if recorder is not None else 0,
+            "metrics": recorder_metrics,
             "failure": self._recording_failure,
         }
         active = snapshot["current_episode"]

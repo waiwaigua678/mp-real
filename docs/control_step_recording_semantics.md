@@ -60,15 +60,21 @@ Camera frame reuse is allowed and is recorded as telemetry, not treated as autom
 
 ## Metadata
 
-Finalized H1-aligned recordings set:
+Finalized H2-aligned recordings set:
 
-- `mp_real.schema_version = 2`
-- `mp_real.recorder_version = h1-control-step-v2`
+- `mp_real.schema_version = 3`
+- `mp_real.recorder_version = h2-telemetry-parts-v3`
 - `mp_real.recording_semantics = control_step_observation_action`
 - `mp_real.control_step_aligned = true`
 - `mp_real.policy_observation_reuse_possible = false`
+- `mp_real.telemetry.layout = parts`
 
 Datasets produced through the legacy observation/action event assembler are finalized with unknown control-step semantics and must be audited before training.
+
+Schema v2 single-file telemetry remains readable for compatibility. Schema v3
+streams telemetry under `telemetry/chunk-*/episode_*/part_*.npz` with an
+`index.json` file so raw chunks and camera timing do not accumulate for the
+whole episode before durability.
 
 ## Non-Goals
 

@@ -4,7 +4,7 @@ import dataclasses
 import enum
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import numpy as np
 
@@ -15,6 +15,9 @@ class EpisodeStatus(enum.StrEnum):
     COMPLETE = "complete"
     INCOMPLETE = "incomplete"
     CORRUPTED = "corrupted"
+
+
+RecorderDropPolicy = Literal["continue", "abort"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -33,6 +36,12 @@ class RecorderConfig:
     operator: str | None = None
     policy_label: str | None = None
     runtime_config: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    save_telemetry: bool = True
+    telemetry_part_size_steps: int = 1000
+    max_observation_cache_entries: int = 64
+    max_inference_latency_entries: int = 1024
+    max_incomplete_event_entries: int = 2048
+    drop_policy: RecorderDropPolicy = "continue"
 
     def __post_init__(self) -> None:
         if not self.dataset_name.strip():
@@ -43,6 +52,36 @@ class RecorderConfig:
             raise ValueError("queue_size must be positive")
         if self.max_camera_age_ns < 0:
             raise ValueError("max_camera_age_ns must be non-negative")
+        if self.telemetry_part_size_steps <= 0:
+            raise ValueError("telemetry_part_size_steps must be positive")
+        if self.max_observation_cache_entries <= 0:
+            raise ValueError("max_observation_cache_entries must be positive")
+        if self.max_inference_latency_entries <= 0:
+            raise ValueError("max_inference_latency_entries must be positive")
+        if self.max_incomplete_event_entries <= 0:
+            raise ValueError("max_incomplete_event_entries must be positive")
+        if self.drop_policy not in {"continue", "abort"}:
+            raise ValueError("drop_policy must be either 'continue' or 'abort'")
+
+
+@dataclasses.dataclass(frozen=True)
+class RecorderMetrics:
+    queue_size: int = 0
+    queue_capacity: int = 0
+    queue_high_watermark: int = 0
+    cache_entry_count: int = 0
+    cache_high_watermark: int = 0
+    cache_eviction_count: int = 0
+    buffered_image_bytes: int = 0
+    buffered_telemetry_bytes: int = 0
+    written_frame_count: int = 0
+    dropped_frame_count: int = 0
+    dropped_event_count: int = 0
+    writer_latency_p50_ns: int = 0
+    writer_latency_p95_ns: int = 0
+    current_memory_estimate_bytes: int = 0
+    telemetry_part_count: int = 0
+    active_writer_count: int = 0
 
 
 @dataclasses.dataclass(frozen=True)

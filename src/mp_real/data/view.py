@@ -668,8 +668,15 @@ class DataViewSession:
         sample_index: int,
         row_telemetry: Mapping[str, Any],
     ) -> dict[str, Any]:
-        telemetry = source.get_episode_telemetry(
+        policy_observation_id = _integer_or_none(row_telemetry.get("policy_observation_id"))
+        observation_id = (
+            policy_observation_id
+            if policy_observation_id is not None and policy_observation_id >= 0
+            else row_telemetry.get("observation_id")
+        )
+        telemetry = source.get_sample_telemetry(
             episode_index,
+            sample_index,
             keys=(
                 "camera_roles",
                 "camera_frame_ids",
@@ -684,6 +691,7 @@ class DataViewSession:
                 "chunk_id",
                 "control_chunk_id",
             ),
+            raw_observation_id=_integer_or_none(observation_id),
         )
         if not telemetry:
             return {}
@@ -696,23 +704,18 @@ class DataViewSession:
             ("camera_age_ns", "age_ns"),
         ):
             values = telemetry.get(key)
-            if values is None or sample_index >= len(values):
+            if values is None:
                 continue
             camera = result.setdefault("camera", {})
-            for role, value in zip(roles, values[sample_index]):
+            for role, value in zip(roles, np.asarray(values).reshape(-1)):
                 camera.setdefault(role, {})[target] = _json_scalar(value)
         flags = telemetry.get("safety_flags")
-        if flags is not None and sample_index < len(flags):
+        if flags is not None:
+            flag_value = np.asarray(flags).item() if np.asarray(flags).ndim == 0 else flags
             try:
-                result["safety_flags"] = json.loads(str(flags[sample_index]))
+                result["safety_flags"] = json.loads(str(flag_value))
             except json.JSONDecodeError:
-                result["safety_flags"] = [str(flags[sample_index])]
-        policy_observation_id = _integer_or_none(row_telemetry.get("policy_observation_id"))
-        observation_id = (
-            policy_observation_id
-            if policy_observation_id is not None and policy_observation_id >= 0
-            else row_telemetry.get("observation_id")
-        )
+                result["safety_flags"] = [str(flag_value)]
         raw_observations = telemetry.get("observation_id")
         raw_chunks = telemetry.get("raw_action_chunk")
         raw_lengths = telemetry.get("raw_action_chunk_length")
@@ -730,8 +733,12 @@ class DataViewSession:
                 if 0 <= cursor < length:
                     result["raw_action"] = np.asarray(raw_chunks[chunk_index][cursor]).tolist()
                     chunk_ids = telemetry.get("control_chunk_id", telemetry.get("chunk_id"))
-                    if chunk_ids is not None and chunk_index < len(chunk_ids):
-                        result["chunk_id"] = _json_scalar(chunk_ids[chunk_index])
+                    if chunk_ids is not None:
+                        chunk_ids_array = np.asarray(chunk_ids)
+                        if chunk_ids_array.ndim == 0:
+                            result["chunk_id"] = _json_scalar(chunk_ids_array)
+                        elif chunk_index < len(chunk_ids_array):
+                            result["chunk_id"] = _json_scalar(chunk_ids_array[chunk_index])
         return result
 
 

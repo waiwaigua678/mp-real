@@ -579,32 +579,31 @@ class HardeningLeRobotSemanticsTests(unittest.TestCase):
             recorder.start()
             recorder.begin_episode(EpisodeRecordingContext(0, "episode", "task", "session", 1))
             now_ns = 2_000_000_000
-            recorder.emit(
-                ObservationCaptured(
-                    runtime_id="runtime",
-                    session_id="session",
-                    episode_id="episode",
-                    generation_id=1,
-                    monotonic_timestamp_ns=now_ns,
-                    payload={
-                        "observation_id": 1,
-                        "state": np.asarray([1.0, 1.0], dtype=np.float32),
-                        "images": {"head": np.full((8, 10, 3), 7, dtype=np.uint8)},
-                        "camera_frame_ids": {"head": 1},
-                        "camera_timestamps_ns": {"head": now_ns},
-                        "max_camera_skew_ns": 0,
-                    },
-                )
-            )
             for step in range(3):
-                _emit_action_events(
-                    recorder,
-                    episode_id="episode",
-                    observation_id=1,
-                    step=step,
-                    action=np.asarray([0.25 + step, 1.0], dtype=np.float32),
-                    now_ns=now_ns + step * 100,
-                    chunk_cursor=step,
+                action = np.asarray([0.25 + step, 1.0], dtype=np.float32)
+                recorder.emit(
+                    ControlStepRecorded(
+                        runtime_id="runtime",
+                        session_id="session",
+                        episode_id="episode",
+                        generation_id=1,
+                        step=step,
+                        monotonic_timestamp_ns=now_ns + step * 100,
+                        payload={
+                            "control_step_id": step,
+                            "observation_id": 1,
+                            "policy_observation_id": 1,
+                            "state": np.asarray([1.0, 1.0], dtype=np.float32),
+                            "images": {"head": np.full((8, 10, 3), 7, dtype=np.uint8)},
+                            "camera_frame_ids": {"head": 1},
+                            "camera_timestamps_ns": {"head": now_ns},
+                            "max_camera_skew_ns": 0,
+                            "chunk_cursor": step,
+                            "selected_raw_action": action,
+                            "stabilized_target_action": action,
+                            "executed_action": action,
+                        },
+                    )
                 )
             recorder.end_episode(labels={"result": "SUCCESS"})
             self.assertTrue(recorder.stop(timeout=20))
@@ -621,9 +620,8 @@ class HardeningLeRobotSemanticsTests(unittest.TestCase):
             finally:
                 source.close()
 
-    @unittest.expectedFailure
-    def test_h4_telemetry_should_be_durable_before_episode_end(self) -> None:
-        """Expected to pass after H4 streams telemetry instead of writing one NPZ at close."""
+    def test_h2_telemetry_should_be_durable_before_episode_end(self) -> None:
+        """H2 streams telemetry parts instead of writing one dense NPZ only at close."""
 
         with tempfile.TemporaryDirectory() as directory:
             spec = _spec()
@@ -635,14 +633,19 @@ class HardeningLeRobotSemanticsTests(unittest.TestCase):
                 recorder.begin_episode(EpisodeRecordingContext(0, "episode", "task", "session", 1))
                 _emit_one_recorded_frame(recorder, episode_id="episode", spec=spec, observation_id=1, step=0)
                 self.assertTrue(recorder.flush(timeout=5.0))
-                telemetry_path = recorder.work_root / "telemetry" / "chunk-000" / "episode_000000.npz"
+                telemetry_path = (
+                    recorder.work_root
+                    / "telemetry"
+                    / "chunk-000"
+                    / "episode_000000"
+                    / "part_000000.npz"
+                )
                 self.assertTrue(telemetry_path.is_file())
             finally:
                 recorder.stop(finalize=False, timeout=20)
 
-    @unittest.expectedFailure
-    def test_h4_recorder_should_release_matched_observation_images(self) -> None:
-        """Expected to pass after H4 prunes observation cache entries once actions are recorded."""
+    def test_h2_recorder_should_release_matched_observation_images(self) -> None:
+        """H2 prunes observation cache entries once actions are recorded."""
 
         with tempfile.TemporaryDirectory() as directory:
             spec = _spec()
@@ -673,6 +676,7 @@ class HardeningLeRobotSemanticsTests(unittest.TestCase):
                     )
                     image_refs.append(weakref.ref(observation.payload["images"]["head"]))
                     recorder.emit(observation)
+                    observation = None  # type: ignore[assignment]
                     _emit_action_events(
                         recorder,
                         episode_id="episode",
@@ -774,8 +778,8 @@ class HardeningPoseReplaySafetyTests(unittest.TestCase):
         self.assertIsNone(cursor.acknowledged_sample_index)
 
     @unittest.expectedFailure
-    def test_h2_replay_planner_should_not_apply_arm_limits_to_gripper_only_changes(self) -> None:
-        """Expected to pass after H2 splits arm and gripper kinematic safety semantics."""
+    def test_h3_replay_planner_should_not_apply_arm_limits_to_gripper_only_changes(self) -> None:
+        """Expected to pass after H3 splits arm and gripper kinematic safety semantics."""
 
         samples = tuple(
             RecordedSample(
