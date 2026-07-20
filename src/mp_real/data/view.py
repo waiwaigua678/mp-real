@@ -317,8 +317,12 @@ class DataViewSession:
             "inference_latency_ns": _integer_or_none(telemetry.get("inference_latency_ns")),
             "control_cycle_ns": _integer_or_none(telemetry.get("control_cycle_ns")),
             "camera_skew_ns": _integer_or_none(telemetry.get("camera_skew_ns")),
+            "control_step_id": _integer_or_none(telemetry.get("control_step_id")),
+            "policy_observation_id": _integer_or_none(telemetry.get("policy_observation_id")),
+            "policy_request_id": _integer_or_none(telemetry.get("policy_request_id")),
             "chunk_cursor": _integer_or_none(telemetry.get("chunk_cursor")),
             "chunk_id": _integer_or_none(telemetry.get("chunk_id")),
+            "action_sent_timestamp_ns": _integer_or_none(telemetry.get("action_sent_timestamp_ns")),
             "safety_flags": telemetry.get("safety_flags", []),
             "labels": metadata.labels,
             "cameras": cameras,
@@ -674,9 +678,11 @@ class DataViewSession:
                 "camera_age_ns",
                 "safety_flags",
                 "observation_id",
+                "policy_observation_id",
                 "raw_action_chunk",
                 "raw_action_chunk_length",
                 "chunk_id",
+                "control_chunk_id",
             ),
         )
         if not telemetry:
@@ -701,19 +707,29 @@ class DataViewSession:
                 result["safety_flags"] = json.loads(str(flags[sample_index]))
             except json.JSONDecodeError:
                 result["safety_flags"] = [str(flags[sample_index])]
-        observation_id = row_telemetry.get("observation_id")
+        policy_observation_id = _integer_or_none(row_telemetry.get("policy_observation_id"))
+        observation_id = (
+            policy_observation_id
+            if policy_observation_id is not None and policy_observation_id >= 0
+            else row_telemetry.get("observation_id")
+        )
         raw_observations = telemetry.get("observation_id")
         raw_chunks = telemetry.get("raw_action_chunk")
         raw_lengths = telemetry.get("raw_action_chunk_length")
-        if observation_id is not None and raw_observations is not None and raw_chunks is not None:
-            matches = np.flatnonzero(np.asarray(raw_observations) == int(observation_id))
+        if observation_id is not None and raw_chunks is not None:
+            raw_lookup = raw_observations
+            matches = (
+                np.flatnonzero(np.asarray(raw_lookup) == int(observation_id))
+                if raw_lookup is not None
+                else np.asarray([], dtype=np.int64)
+            )
             if matches.size:
                 chunk_index = int(matches[-1])
                 cursor = int(row_telemetry.get("chunk_cursor", 0))
                 length = int(raw_lengths[chunk_index]) if raw_lengths is not None else len(raw_chunks[chunk_index])
                 if 0 <= cursor < length:
                     result["raw_action"] = np.asarray(raw_chunks[chunk_index][cursor]).tolist()
-                    chunk_ids = telemetry.get("chunk_id")
+                    chunk_ids = telemetry.get("control_chunk_id", telemetry.get("chunk_id"))
                     if chunk_ids is not None and chunk_index < len(chunk_ids):
                         result["chunk_id"] = _json_scalar(chunk_ids[chunk_index])
         return result

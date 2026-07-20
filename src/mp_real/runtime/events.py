@@ -15,7 +15,7 @@ import numpy as np
 
 from mp_real.runtime.config import InferenceLoopConfig
 from mp_real.runtime.inference import InferenceHooks
-from mp_real.runtime.models import ActionProvenance, ObservationSnapshot
+from mp_real.runtime.models import ActionProvenance, ControlStepRecord, ObservationSnapshot
 
 
 def _wall_timestamp_iso() -> str:
@@ -111,6 +111,10 @@ class ActionStabilized(RuntimeEvent):
 
 
 class ActionExecuted(RuntimeEvent):
+    pass
+
+
+class ControlStepRecorded(RuntimeEvent):
     pass
 
 
@@ -447,6 +451,56 @@ class RuntimeEventHooks(InferenceHooks):
             chunk_id=chunk_id,
             step=step,
             payload={"executed_action": action, **payload},
+        )
+
+    def on_control_step_recorded(self, record: ControlStepRecord) -> None:
+        provenance = ActionProvenance(
+            observation_id=record.policy_observation_id,
+            chunk_cursor=record.chunk_cursor,
+            source_observation_ids=record.source_observation_ids,
+            control_cycle_ns=record.control_cycle_ns,
+        )
+        request_id, chunk_id, _ = self._provenance_context(provenance)
+        if record.policy_request_id is not None:
+            request_id = record.policy_request_id
+        if record.chunk_id is not None:
+            chunk_id = record.chunk_id
+        payload: dict[str, Any] = {
+            "control_step_id": record.control_step_id,
+            "observation_id": record.control_observation_id,
+            "policy_observation_id": record.policy_observation_id,
+            "policy_request_id": request_id,
+            "chunk_id": chunk_id,
+            "chunk_cursor": record.chunk_cursor,
+            "source_observation_ids": list(record.source_observation_ids),
+            "control_step_monotonic_timestamp_ns": record.monotonic_timestamp_ns,
+            "scheduled_timestamp_ns": record.scheduled_timestamp_ns,
+            "observation_capture_started_ns": record.observation_capture_started_ns,
+            "observation_capture_finished_ns": record.observation_capture_finished_ns,
+            "state_timestamp_ns": record.robot_state_timestamp_ns,
+            "camera_frame_ids": dict(record.camera_frame_ids),
+            "camera_timestamps_ns": dict(record.camera_timestamps_ns),
+            "camera_age_ns": dict(record.camera_age_ns),
+            "max_camera_skew_ns": record.max_camera_skew_ns,
+            "state": record.robot_state_before_action,
+            "selected_raw_action": record.selected_raw_action,
+            "stabilized_target_action": record.stabilized_action,
+            "executed_action": record.executed_action,
+            "action_sent_timestamp_ns": record.action_sent_timestamp_ns,
+            "control_cycle_ns": record.control_cycle_ns,
+            "safety_flags": list(record.safety_flags),
+        }
+        if record.feedback_state is not None:
+            payload["feedback_state"] = record.feedback_state
+            payload["feedback_state_timestamp_ns"] = record.feedback_state_timestamp_ns
+        if self._include_observation_images:
+            payload["images"] = {name: sample.image for name, sample in record.camera_samples.items()}
+        self._emit(
+            ControlStepRecorded,
+            request_id=request_id,
+            chunk_id=chunk_id,
+            step=record.control_step_id,
+            payload=payload,
         )
 
     def on_safety_rejected(self, step: int | None, action: np.ndarray | None, error: BaseException) -> None:

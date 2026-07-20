@@ -25,7 +25,7 @@ from mp_real.runtime.inference import (
     PolicyClient,
     run_policy_loop,
 )
-from mp_real.runtime.models import ActionProvenance, ObservationSnapshot
+from mp_real.runtime.models import ActionProvenance, ControlStepRecord, ObservationSnapshot
 
 
 class ControllerAlreadyRunningError(RuntimeError):
@@ -117,6 +117,10 @@ class _GenerationHooks(InferenceHooks):
     def on_action_executed_context(self, step: int, action: np.ndarray, provenance: ActionProvenance | None) -> None:
         if self._is_current():
             self._delegate.on_action_executed_context(step, action, provenance)
+
+    def on_control_step_recorded(self, record: ControlStepRecord) -> None:
+        if self._is_current():
+            self._delegate.on_control_step_recorded(record)
 
     def on_safety_rejected(self, step: int | None, action: np.ndarray | None, error: BaseException) -> None:
         if self._is_current():

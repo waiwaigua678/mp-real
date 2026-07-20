@@ -275,3 +275,37 @@ class ObservationSnapshot:
         if self.camera_params is not None:
             observation["camera_params"] = dict(self.camera_params)
         return observation
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ControlStepRecord:
+    """Canonical observation/action record for one robot-bound control step."""
+
+    control_step_id: int
+    monotonic_timestamp_ns: int
+    scheduled_timestamp_ns: int
+    observation_capture_started_ns: int
+    observation_capture_finished_ns: int
+    control_observation_id: int
+    policy_observation_id: int | None
+    policy_request_id: int | None = None
+    chunk_id: int | None = None
+    chunk_cursor: int | None = None
+    source_observation_ids: tuple[int, ...] = ()
+    robot_state_before_action: np.ndarray = dataclasses.field(
+        default_factory=lambda: np.empty(0, dtype=np.float32)
+    )
+    robot_state_timestamp_ns: int = 0
+    camera_samples: Mapping[str, CameraSample] = dataclasses.field(default_factory=dict)
+    camera_frame_ids: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    camera_timestamps_ns: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    selected_raw_action: np.ndarray = dataclasses.field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    stabilized_action: np.ndarray = dataclasses.field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    executed_action: np.ndarray = dataclasses.field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    action_sent_timestamp_ns: int = 0
+    control_cycle_ns: int = 0
+    max_camera_skew_ns: int = 0
+    camera_age_ns: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    safety_flags: tuple[str, ...] = ()
+    feedback_state: np.ndarray | None = None
+    feedback_state_timestamp_ns: int | None = None

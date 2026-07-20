@@ -29,6 +29,9 @@ class CachedFrameObservationSource:
     last_observation_snapshot: ObservationSnapshot | None = dataclasses.field(default=None, init=False)
 
     def observe(self) -> dict[str, Any]:
+        return self.capture_observation_snapshot().to_policy_observation()
+
+    def capture_observation_snapshot(self) -> ObservationSnapshot:
         result = self.read_images()
         images, camera_params = result[0], result[1]
         frame_metadata = result[2] if len(result) > 2 else {}
@@ -62,15 +65,7 @@ class CachedFrameObservationSource:
             camera_frame_ids={name: sample.frame_id for name, sample in samples.items()},
             camera_timestamps_ns={name: sample.timestamp_monotonic_ns for name, sample in samples.items()},
         )
-        observation: dict[str, Any] = {
-            "images": {name: sample.image for name, sample in samples.items()},
-            "image_masks": dict(self.image_masks),
-            "state": state.values,
-            "prompt": self.prompt,
-        }
-        if camera_params is not None:
-            observation["camera_params"] = dict(camera_params)
-        return observation
+        return self.last_observation_snapshot
 
 
 @dataclasses.dataclass
@@ -90,6 +85,18 @@ class WebInferenceAdapter:
     @property
     def last_observation_snapshot(self) -> ObservationSnapshot | None:
         return getattr(self.observation_source, "last_observation_snapshot", None)
+
+    def capture_observation_snapshot(self) -> ObservationSnapshot:
+        capture_snapshot = getattr(self.observation_source, "capture_observation_snapshot", None)
+        if callable(capture_snapshot):
+            snapshot = capture_snapshot()
+            if isinstance(snapshot, ObservationSnapshot):
+                return snapshot
+        self.observe()
+        snapshot = self.last_observation_snapshot
+        if snapshot is None:
+            raise RuntimeError("Web observation source did not provide an ObservationSnapshot")
+        return snapshot
 
     def decode_action_chunk(self, response: dict[str, Any], replan_steps: int) -> np.ndarray:
         return self.decode_chunk(response, replan_steps)

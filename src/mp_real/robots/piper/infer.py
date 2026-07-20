@@ -781,6 +781,9 @@ class PiperInferenceAdapter:
     last_observation_snapshot: ObservationSnapshot | None = dataclasses.field(default=None, init=False, repr=False)
 
     def observe(self) -> dict[str, Any]:
+        return self.capture_observation_snapshot().to_policy_observation()
+
+    def capture_observation_snapshot(self) -> ObservationSnapshot:
         self.last_observation_snapshot = capture_observation_snapshot(
             self.cameras,
             self.robot.left,
@@ -788,7 +791,7 @@ class PiperInferenceAdapter:
             self.args,
             robot_lock=self.robot.robot_lock,
         )
-        return self.last_observation_snapshot.to_policy_observation()
+        return self.last_observation_snapshot
 
     def decode_action_chunk(self, response: dict[str, Any], replan_steps: int) -> np.ndarray:
         if replan_steps != self.args.replan_steps:

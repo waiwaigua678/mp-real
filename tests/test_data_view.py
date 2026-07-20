@@ -46,7 +46,7 @@ def _write_dataset(
             root,
             root.name,
             robot_name,
-            10,
+            10.0,
             action_spec,
             save_video=save_video,
             queue_size=max(256, frames * 8),

@@ -24,6 +24,7 @@ extra。
 # Piper + RealSense + 更快的 Web JPEG 编码 + 本地 lint 工具
 uv sync --extra piper --extra realsense --extra web --extra dev
 uv pip install -e /home/server/prj/pyAgxArm
+uv pip install   --python /home/server/prj/mp-real/.venv/bin/python   --editable /home/server/prj/pyAgxArm
 ```
 
 若控制器也需要 RM2 和 V4L2 支持，请在同一个 `uv sync` 调用中包含它们：

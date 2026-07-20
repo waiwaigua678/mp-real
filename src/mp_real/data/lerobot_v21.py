@@ -8,6 +8,7 @@ import threading
 import time
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Iterator, Mapping
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from mp_real.runtime.events import (
     ActionSelected,
     ActionStabilized,
     ChunkReceived,
+    ControlStepRecorded,
     InferenceFinished,
     ObservationCaptured,
     RuntimeEvent,
@@ -38,6 +40,8 @@ from mp_real.runtime.events import (
 from mp_real.runtime.models import ActionSpec, VectorField
 
 CODEBASE_VERSION = "v2.1"
+MP_REAL_SCHEMA_VERSION = 2
+RECORDER_VERSION = "h1-control-step-v2"
 DEFAULT_CHUNK_SIZE = 1000
 TIMESTAMP_TOLERANCE_S = 1e-4
 _STOP = object()
@@ -208,8 +212,13 @@ def _build_features(
         "mp_real.inference_latency_ns": _feature("int64", [1], None),
         "mp_real.control_cycle_ns": _feature("int64", [1], None),
         "mp_real.camera_skew_ns": _feature("int64", [1], None),
+        "mp_real.control_step_id": _feature("int64", [1], None),
         "mp_real.observation_id": _feature("int64", [1], None),
+        "mp_real.policy_observation_id": _feature("int64", [1], None),
+        "mp_real.policy_request_id": _feature("int64", [1], None),
+        "mp_real.chunk_id": _feature("int64", [1], None),
         "mp_real.chunk_cursor": _feature("int64", [1], None),
+        "mp_real.action_sent_timestamp_ns": _feature("int64", [1], None),
     }
     if config.save_video:
         for role in spec.camera_roles:
@@ -229,7 +238,13 @@ def _build_info(
     camera_shapes: Mapping[str, tuple[int, int, int]],
     *,
     require_camera_shapes: bool = True,
+    control_step_aligned: bool = False,
 ) -> dict[str, object]:
+    semantics = (
+        "control_step_observation_action"
+        if control_step_aligned
+        else "legacy_observation_action_provenance_unknown"
+    )
     return {
         "codebase_version": CODEBASE_VERSION,
         "robot_type": config.robot_name,
@@ -247,7 +262,11 @@ def _build_info(
         else None,
         "features": _build_features(config, camera_shapes, require_camera_shapes=require_camera_shapes),
         "mp_real": {
-            "schema_version": 1,
+            "schema_version": MP_REAL_SCHEMA_VERSION,
+            "recorder_version": RECORDER_VERSION,
+            "recording_semantics": semantics,
+            "control_step_aligned": control_step_aligned,
+            "policy_observation_reuse_possible": not control_step_aligned,
             "session_id": config.session_id,
             "operator": config.operator,
             "policy_label": config.policy_label,
@@ -258,7 +277,7 @@ def _build_info(
             # the dataset; raw model chunks remain telemetry only.
             "replay": {
                 "action_source": "executed_action",
-                "action_mode": "joint_position_target",
+                "action_mode": config.action_spec.action_mode,
             },
         },
     }
@@ -285,10 +304,11 @@ class _VideoWriter:
             raise DatasetValidationError(f"Only RGB cameras are supported, got {channels} channels")
         self.path = path
         self._container = av.open(str(path), mode="w")
+        frame_rate = Fraction(str(fps)).limit_denominator(1_000_000)
         try:
-            self._stream = self._container.add_stream("libx264", rate=fps)
+            self._stream = self._container.add_stream("libx264", rate=frame_rate)
         except av.error.FFmpegError:
-            self._stream = self._container.add_stream("mpeg4", rate=fps)
+            self._stream = self._container.add_stream("mpeg4", rate=frame_rate)
         self._stream.width = width
         self._stream.height = height
         self._stream.pix_fmt = "yuv420p"
@@ -395,6 +415,13 @@ class _EpisodeWriter:
         self._camera_timestamps: list[list[int]] = []
         self._camera_reused: list[list[bool]] = []
         self._camera_ages: list[list[int]] = []
+        self._control_step_ids: list[int] = []
+        self._policy_observation_ids: list[int] = []
+        self._policy_request_ids: list[int] = []
+        self._control_chunk_ids: list[int] = []
+        self._control_chunk_cursors: list[int] = []
+        self._action_sent_timestamps: list[int] = []
+        self._control_step_frame_count = 0
         self._raw_chunks: list[np.ndarray] = []
         self._raw_chunk_request_ids: list[int] = []
         self._raw_chunk_ids: list[int] = []
@@ -409,6 +436,10 @@ class _EpisodeWriter:
     @property
     def camera_shapes(self) -> Mapping[str, tuple[int, int, int]]:
         return self._camera_shapes
+
+    @property
+    def control_step_aligned(self) -> bool:
+        return self.frame_count > 0 and self._control_step_frame_count == self.frame_count
 
     def set_global_start(self, value: int) -> None:
         self._global_start = value
@@ -495,16 +526,33 @@ class _EpisodeWriter:
             self._last_camera_ids.get(role) == frame_id
             for role, frame_id in zip(self.config.action_spec.camera_roles, current_ids)
         ]
-        ages = [max(0, event.monotonic_timestamp_ns - timestamp) for timestamp in current_timestamps]
+        camera_age_payload = event.payload.get("camera_age_ns", {})
+        if isinstance(camera_age_payload, Mapping):
+            ages = [
+                max(0, int(camera_age_payload.get(role, event.monotonic_timestamp_ns - timestamp)))
+                for role, timestamp in zip(self.config.action_spec.camera_roles, current_timestamps)
+            ]
+        else:
+            ages = [max(0, event.monotonic_timestamp_ns - timestamp) for timestamp in current_timestamps]
         if any(age > self.config.max_camera_age_ns for age in ages):
             self._invalid_reason = "camera_age_exceeded"
 
-        selected = action if selected is None else np.asarray(selected, dtype=np.float32)
-        stabilized = action if stabilized is None else np.asarray(stabilized, dtype=np.float32)
+        selected_payload = event.payload.get("selected_raw_action", action)
+        stabilized_payload = event.payload.get("stabilized_target_action", action)
+        selected = selected_payload if selected is None else selected
+        stabilized = stabilized_payload if stabilized is None else stabilized
+        selected = np.asarray(selected, dtype=np.float32)
+        stabilized = np.asarray(stabilized, dtype=np.float32)
         if selected.shape != action.shape or stabilized.shape != action.shape:
             self._dropped_frame_count += 1
             self._invalid_reason = "action_telemetry_shape_mismatch"
             return
+        control_step_id = _integer(event.payload.get("control_step_id"), -1)
+        policy_observation_id = _integer(event.payload.get("policy_observation_id"), -1)
+        policy_request_id = _integer(event.payload.get("policy_request_id", event.request_id), -1)
+        control_chunk_id = _integer(event.payload.get("chunk_id", event.chunk_id), -1)
+        chunk_cursor = _integer(event.payload.get("chunk_cursor"), -1)
+        action_sent_timestamp_ns = _integer(event.payload.get("action_sent_timestamp_ns"), 0)
         row = {
             "observation.state": [state.tolist()],
             "action": [action.tolist()],
@@ -519,8 +567,13 @@ class _EpisodeWriter:
             "mp_real.inference_latency_ns": [inference_latency_ns],
             "mp_real.control_cycle_ns": [_integer(event.payload.get("control_cycle_ns"))],
             "mp_real.camera_skew_ns": [_integer(observation.get("max_camera_skew_ns"))],
+            "mp_real.control_step_id": [control_step_id],
             "mp_real.observation_id": [_integer(observation.get("observation_id"), -1)],
-            "mp_real.chunk_cursor": [_integer(event.payload.get("chunk_cursor"), -1)],
+            "mp_real.policy_observation_id": [policy_observation_id],
+            "mp_real.policy_request_id": [policy_request_id],
+            "mp_real.chunk_id": [control_chunk_id],
+            "mp_real.chunk_cursor": [chunk_cursor],
+            "mp_real.action_sent_timestamp_ns": [action_sent_timestamp_ns],
         }
         assert self._schema is not None and self._parquet_writer is not None
         table = pa.Table.from_pydict(row, schema=self._schema)
@@ -540,6 +593,14 @@ class _EpisodeWriter:
         self._camera_timestamps.append(current_timestamps)
         self._camera_reused.append(reused)
         self._camera_ages.append(ages)
+        self._control_step_ids.append(control_step_id)
+        self._policy_observation_ids.append(policy_observation_id)
+        self._policy_request_ids.append(policy_request_id)
+        self._control_chunk_ids.append(control_chunk_id)
+        self._control_chunk_cursors.append(chunk_cursor)
+        self._action_sent_timestamps.append(action_sent_timestamp_ns)
+        if isinstance(event, ControlStepRecorded):
+            self._control_step_frame_count += 1
         self._policy_generation_ids.append(event.generation_id)
         safety_flags = event.payload.get("safety_flags", ())
         self._safety_flags.append(
@@ -579,6 +640,12 @@ class _EpisodeWriter:
             camera_timestamps_ns=np.asarray(self._camera_timestamps, dtype=np.int64),
             camera_frame_reused=np.asarray(self._camera_reused, dtype=np.bool_),
             camera_age_ns=np.asarray(self._camera_ages, dtype=np.int64),
+            control_step_id=np.asarray(self._control_step_ids, dtype=np.int64),
+            policy_observation_id=np.asarray(self._policy_observation_ids, dtype=np.int64),
+            policy_request_id=np.asarray(self._policy_request_ids, dtype=np.int64),
+            control_chunk_id=np.asarray(self._control_chunk_ids, dtype=np.int64),
+            control_chunk_cursor=np.asarray(self._control_chunk_cursors, dtype=np.int64),
+            action_sent_timestamp_ns=np.asarray(self._action_sent_timestamps, dtype=np.int64),
             policy_generation_id=np.asarray(self._policy_generation_ids, dtype=np.int64),
             safety_flags=np.asarray(self._safety_flags),
             dropped_frame_count=np.asarray(self._dropped_frame_count, dtype=np.int64),
@@ -691,7 +758,7 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
         if not self._put(("event", event), block=False):
             with self._lock:
                 self._dropped_event_count += 1
-                if isinstance(event, (ObservationCaptured, ActionExecuted)):
+                if isinstance(event, (ObservationCaptured, ActionExecuted, ControlStepRecorded)):
                     self._dropped_frame_count += 1
 
     def flush(self, *, timeout: float | None = 5.0) -> bool:
@@ -744,6 +811,7 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
         observations: dict[int, Mapping[str, object]] = {}
         selected_actions: dict[tuple[int, int], np.ndarray] = {}
         stabilized_actions: dict[tuple[int, int], np.ndarray] = {}
+        control_step_recorded_steps: set[tuple[int, int]] = set()
         inference_latency_ns: dict[int, int] = {}
         global_index = 0
         tasks: dict[str, int] = {}
@@ -761,7 +829,11 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
                         _write_json(
                             self._work_root / "meta" / "mp_real" / "schema.json",
                             {
-                                "schema_version": 1,
+                                "schema_version": MP_REAL_SCHEMA_VERSION,
+                                "recorder_version": RECORDER_VERSION,
+                                "recording_semantics": "legacy_observation_action_provenance_unknown",
+                                "control_step_aligned": False,
+                                "policy_observation_reuse_possible": True,
                                 "action_source": "executed_action",
                                 "robot_name": self.config.robot_name,
                                 "action_spec": dataclasses.asdict(self.config.action_spec),
@@ -826,7 +898,20 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
                                 "payload": event.payload,
                             },
                         )
-                        if isinstance(event, ObservationCaptured):
+                        if isinstance(event, ControlStepRecorded):
+                            step_key = (event_episode.episode_index, int(event.step or -1))
+                            control_step_recorded_steps.add(step_key)
+                            selected_actions.pop(step_key, None)
+                            stabilized_actions.pop(step_key, None)
+                            policy_observation_id = _integer(event.payload.get("policy_observation_id"), -1)
+                            writer.record_frame(
+                                event,
+                                event.payload,
+                                None,
+                                None,
+                                inference_latency_ns.get(policy_observation_id, 0),
+                            )
+                        elif isinstance(event, ObservationCaptured):
                             observation_id = _integer(event.payload.get("observation_id"), -1)
                             if observation_id >= 0:
                                 observations[observation_id] = event.payload
@@ -847,12 +932,16 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
                                 event.payload.get("stabilized_target_action"), dtype=np.float32
                             )
                         elif isinstance(event, ActionExecuted):
+                            step_key = (event_episode.episode_index, int(event.step or -1))
+                            if step_key in control_step_recorded_steps:
+                                selected_actions.pop(step_key, None)
+                                stabilized_actions.pop(step_key, None)
+                                continue
                             observation_id = _integer(event.payload.get("observation_id"), -1)
                             observation = observations.get(observation_id)
                             if observation is None:
                                 writer.note_drop(frame=True)
                             else:
-                                step_key = (event_episode.episode_index, int(event.step or -1))
                                 writer.record_frame(
                                     event,
                                     observation,
@@ -951,7 +1040,8 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
         camera_shapes: dict[str, tuple[int, int, int]] = {}
         for writer in episodes.values():
             camera_shapes.update(writer.camera_shapes)
-        info = _build_info(self.config, camera_shapes)
+        control_step_aligned = all(writer.control_step_aligned for writer in episodes.values())
+        info = _build_info(self.config, camera_shapes, control_step_aligned=control_step_aligned)
         info["total_episodes"] = len(episodes)
         info["total_frames"] = sum(writer.frame_count for writer in episodes.values())
         info["total_tasks"] = len(tasks)
@@ -964,6 +1054,27 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
             for role, metadata in video_info.items():
                 info["features"][f"observation.images.{role}"]["info"] = metadata  # type: ignore[index]
         _write_json(self._work_root / "meta" / "info.json", info)
+        _write_json(
+            self._work_root / "meta" / "mp_real" / "schema.json",
+            {
+                "schema_version": MP_REAL_SCHEMA_VERSION,
+                "recorder_version": RECORDER_VERSION,
+                "recording_semantics": info["mp_real"]["recording_semantics"],  # type: ignore[index]
+                "control_step_aligned": control_step_aligned,
+                "policy_observation_reuse_possible": not control_step_aligned,
+                "action_source": "executed_action",
+                "robot_name": self.config.robot_name,
+                "action_spec": dataclasses.asdict(self.config.action_spec),
+                "state_field_order": _field_names(
+                    self.config.action_spec.state_fields, self.config.action_spec.state_dim, "state"
+                ),
+                "action_field_order": _field_names(
+                    self.config.action_spec.action_fields, self.config.action_spec.action_dim, "action"
+                ),
+                "camera_roles": list(self.config.action_spec.camera_roles),
+                "max_camera_age_ns": self.config.max_camera_age_ns,
+            },
+        )
         for task, task_index in sorted(tasks.items(), key=lambda item: item[1]):
             _append_jsonl(self._work_root / "meta" / "tasks.jsonl", {"task_index": task_index, "task": task})
         for episode_index, writer in sorted(episodes.items()):
@@ -1434,4 +1545,13 @@ def validate_lerobot_v21_dataset(root: Path | str, *, check_videos: bool = True)
         errors.append("Missing meta/stats.json")
     if (path / "meta" / "mp_real" / "schema.json").is_file() and not (path / "telemetry").is_dir():
         warnings.append("mp-real schema is present but telemetry directory is missing")
+    mp_real_info = info.get("mp_real", {})
+    if isinstance(mp_real_info, Mapping):
+        schema_version = int(mp_real_info.get("schema_version", 0) or 0)
+        if schema_version and schema_version < MP_REAL_SCHEMA_VERSION:
+            warnings.append("mp-real recording schema predates control-step-aligned semantics")
+        if schema_version >= MP_REAL_SCHEMA_VERSION and not bool(mp_real_info.get("control_step_aligned", False)):
+            warnings.append(
+                "mp-real recording is not marked control_step_aligned; observation/action semantics are unknown"
+            )
     return ValidationReport(path, not errors, tuple(errors), tuple(warnings), len(episodes))

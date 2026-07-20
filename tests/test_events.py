@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import threading
 import unittest
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from mp_real.runtime.events import (
     ActionStabilized,
     ChunkReceived,
     CompositeRuntimeEventSink,
+    ControlStepRecorded,
     InMemoryRuntimeEventSink,
     ObservationCaptured,
     PolicyReady,
@@ -27,7 +29,7 @@ from mp_real.runtime.events import (
     RuntimeStarted,
     RuntimeStopped,
 )
-from mp_real.runtime.inference import run_rtc_loop, run_sync_loop
+from mp_real.runtime.inference import run_infer_only, run_rtc_loop, run_sync_loop
 from mp_real.runtime.models import ActionSpec, CameraSample, RobotState
 from mp_real.runtime.observation import capture_observation
 from mp_real.runtime.startup import PolicyStartupConfig, PolicyStartupCoordinator
@@ -230,6 +232,7 @@ class RuntimeEventTests(unittest.TestCase):
         self.assertLess(event_types.index(PolicyWarmupFinished.__name__), event_types.index(PolicyReady.__name__))
         self.assertEqual(event_types.count(ObservationCaptured.__name__), 2)
         self.assertEqual(event_types.count(ChunkReceived.__name__), 2)
+        self.assertEqual(event_types.count(ControlStepRecorded.__name__), 0)
         self.assertIsNotNone(prepared.initial_chunk)
         timestamps = [event.monotonic_timestamp_ns for event in events]
         self.assertEqual(timestamps, sorted(timestamps))
@@ -259,19 +262,37 @@ class RuntimeEventTests(unittest.TestCase):
                 selected = event_types.index(ActionSelected.__name__)
                 stabilized = event_types.index(ActionStabilized.__name__)
                 executed = event_types.index(ActionExecuted.__name__)
+                control_step = event_types.index(ControlStepRecorded.__name__)
                 self.assertLess(selected, stabilized)
+                self.assertLess(stabilized, control_step)
+                self.assertLess(control_step, executed)
                 self.assertLess(stabilized, executed)
                 self.assertEqual(event_types[-1], RuntimeStopped.__name__)
                 events = sink.snapshot()
                 selected_event = next(event for event in events if isinstance(event, ActionSelected))
                 stabilized_event = next(event for event in events if isinstance(event, ActionStabilized))
                 executed_event = next(event for event in events if isinstance(event, ActionExecuted))
+                control_step_event = next(event for event in events if isinstance(event, ControlStepRecorded))
                 self.assertIn("selected_raw_action", selected_event.payload)
                 self.assertIn(
                     "stabilized_target_action",
                     stabilized_event.payload,
                 )
                 self.assertIn("executed_action", executed_event.payload)
+                self.assertEqual(control_step_event.step, executed_event.step)
+                self.assertIn("control_step_id", control_step_event.payload)
+                self.assertIn("executed_action", control_step_event.payload)
+
+    def test_infer_only_does_not_emit_control_step_records(self) -> None:
+        sink = InMemoryRuntimeEventSink()
+        hooks = RuntimeEventHooks(sink, RuntimeEventIdentity("infer-only-runtime", generation_id=1))
+        config = dataclasses.replace(_config(), infer_only=True, infer_only_chunks=2, max_steps=None)
+
+        run_infer_only(_Policy(), _Adapter(), config, hooks=hooks, print_chunks=False)
+
+        event_types = [event.event_type for event in sink.snapshot()]
+        self.assertEqual(event_types.count(ObservationCaptured.__name__), 2)
+        self.assertEqual(event_types.count(ControlStepRecorded.__name__), 0)
 
     def test_generation_gate_rejects_stale_event_hook(self) -> None:
         sink = InMemoryRuntimeEventSink()

@@ -26,19 +26,34 @@ class ActionAlignment:
         self._timestamps = tuple(float(sample.timestamp) for sample in samples)
         self._control_to_local: dict[int, int] = {}
         if config.alignment_mode is AlignmentMode.ABSOLUTE_CONTROL_STEP_ALIGNMENT:
-            if not config.allow_frame_index_as_control_step:
+            explicit_steps = [
+                _optional_integer(sample.telemetry.get("control_step_id"))
+                for sample in samples
+            ]
+            has_explicit_steps = any(step is not None and step >= 0 for step in explicit_steps)
+            if has_explicit_steps and any(step is None or step < 0 for step in explicit_steps):
+                raise OpenLoopInputError(
+                    "absolute_control_step alignment requires every sample to carry mp_real.control_step_id"
+                )
+            if not has_explicit_steps and not config.allow_frame_index_as_control_step:
                 raise OpenLoopInputError(
                     "absolute_control_step alignment requires explicit allow_frame_index_as_control_step"
                 )
             for local_index, sample in enumerate(samples):
-                cursor = _optional_integer(sample.telemetry.get("chunk_cursor"))
-                if cursor is None or cursor < 0:
+                control_step = explicit_steps[local_index] if has_explicit_steps else sample.frame_index
+                assert control_step is not None
+                if not has_explicit_steps:
+                    cursor = _optional_integer(sample.telemetry.get("chunk_cursor"))
+                    if cursor is None or cursor < 0:
+                        raise OpenLoopInputError(
+                            "absolute_control_step alignment requires recorded non-negative "
+                            "mp_real.chunk_cursor telemetry"
+                        )
+                if control_step in self._control_to_local:
                     raise OpenLoopInputError(
-                        "absolute_control_step alignment requires recorded non-negative mp_real.chunk_cursor telemetry"
+                        f"duplicate control step {control_step}"
                     )
-                if sample.frame_index in self._control_to_local:
-                    raise OpenLoopInputError(f"duplicate control step/frame_index {sample.frame_index}")
-                self._control_to_local[sample.frame_index] = local_index
+                self._control_to_local[control_step] = local_index
 
     def align(self, source_local_index: int, horizon_index: int) -> AlignedAction:
         if source_local_index < 0 or source_local_index >= len(self._samples) or horizon_index < 0:
@@ -69,7 +84,10 @@ class ActionAlignment:
 
     def _control_alignment(self, index: int, horizon: int) -> AlignedAction:
         source = self._samples[index]
-        control_step = source.frame_index + horizon
+        source_control_step = _optional_integer(source.telemetry.get("control_step_id"))
+        if source_control_step is None or source_control_step < 0:
+            source_control_step = source.frame_index
+        control_step = source_control_step + horizon
         target = self._control_to_local.get(control_step)
         if target is None:
             return self._invalid(index, horizon, "missing_control_step", control_step=control_step)

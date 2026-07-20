@@ -18,10 +18,8 @@ from mp_real.data.lerobot_v21 import LeRobotV21EpisodeRecorder, LeRobotV21Episod
 from mp_real.data.models import EpisodeRecordingContext, EpisodeStatus, RecorderConfig
 from mp_real.runtime.config import InferenceLoopConfig
 from mp_real.runtime.events import (
-    ActionExecuted,
-    ActionSelected,
-    ActionStabilized,
     ChunkReceived,
+    ControlStepRecorded,
     ObservationCaptured,
     RuntimeEventHooks,
     RuntimeEventIdentity,
@@ -65,7 +63,7 @@ class LeRobotV21Tests(unittest.TestCase):
                 dataset_root=root,
                 dataset_name="golden",
                 robot_name=robot_name,
-                fps=10,
+                fps=10.0,
                 action_spec=action_spec,
                 queue_size=256,
                 session_id="session-1",
@@ -83,13 +81,27 @@ class LeRobotV21Tests(unittest.TestCase):
                 selected_action = np.linspace(0.1, 0.9, action_spec.action_dim, dtype=np.float32)
                 stabilized_action = selected_action - 0.05
                 executed_action = stabilized_action - 0.05
-                observation_id = episode_index * 10 + frame_index
+                policy_observation_id = episode_index * 10 + frame_index + 1
+                control_observation_id = episode_index * 100 + frame_index + 1
                 recorder.emit(
                     _event(
-                        ObservationCaptured,
+                        ChunkReceived,
                         episode_id=episode_id,
                         payload={
-                            "observation_id": observation_id,
+                            "observation_id": policy_observation_id,
+                            "raw_action_chunk": selected_action.reshape(1, -1),
+                        },
+                    )
+                )
+                recorder.emit(
+                    _event(
+                        ControlStepRecorded,
+                        episode_id=episode_id,
+                        step=frame_index,
+                        payload={
+                            "control_step_id": frame_index,
+                            "observation_id": control_observation_id,
+                            "policy_observation_id": policy_observation_id,
                             "state": np.full(action_spec.state_dim, frame_index, dtype=np.float32),
                             "images": images,
                             "camera_frame_ids": {
@@ -99,41 +111,12 @@ class LeRobotV21Tests(unittest.TestCase):
                                 role: 1_000_000_000 for role in action_spec.camera_roles
                             },
                             "max_camera_skew_ns": 0,
+                            "chunk_cursor": 0,
+                            "selected_raw_action": selected_action,
+                            "stabilized_target_action": stabilized_action,
+                            "executed_action": executed_action,
+                            "action_sent_timestamp_ns": 1_000_000_000 + frame_index,
                         },
-                    )
-                )
-                recorder.emit(
-                    _event(
-                        ChunkReceived,
-                        episode_id=episode_id,
-                        payload={
-                            "observation_id": observation_id,
-                            "raw_action_chunk": selected_action.reshape(1, -1),
-                        },
-                    )
-                )
-                recorder.emit(
-                    _event(
-                        ActionSelected,
-                        episode_id=episode_id,
-                        step=frame_index,
-                        payload={"observation_id": observation_id, "selected_raw_action": selected_action},
-                    )
-                )
-                recorder.emit(
-                    _event(
-                        ActionStabilized,
-                        episode_id=episode_id,
-                        step=frame_index,
-                        payload={"observation_id": observation_id, "stabilized_target_action": stabilized_action},
-                    )
-                )
-                recorder.emit(
-                    _event(
-                        ActionExecuted,
-                        episode_id=episode_id,
-                        step=frame_index,
-                        payload={"observation_id": observation_id, "executed_action": executed_action},
                     )
                 )
             recorder.end_episode(labels={"result": "SUCCESS", "operator": "tester"})
@@ -326,7 +309,7 @@ assert 'observation.images.head' in sample
         class Policy:
             def infer(self, observation: dict) -> dict:
                 del observation
-                return {"actions": np.asarray([[0.5, 0.25]], dtype=np.float32)}
+                return {"actions": np.asarray([[0.5, 0.25], [0.75, 0.5]], dtype=np.float32)}
 
         with tempfile.TemporaryDirectory() as directory:
             recorder = LeRobotV21EpisodeRecorder(
@@ -337,7 +320,7 @@ assert 'observation.images.head' in sample
             run_sync_loop(
                 Policy(),
                 Adapter(),
-                InferenceLoopConfig(10, 1, 2, False, 0, 0, 0.0, False, False, 1, None, "record", False),
+                InferenceLoopConfig(10, 2, 2, False, 0, 0, 0.0, False, False, 1, None, "record", False),
                 hooks=RuntimeEventHooks(recorder, RuntimeEventIdentity("runtime", 1, "session", "episode")),
             )
             recorder.end_episode()
@@ -345,9 +328,15 @@ assert 'observation.images.head' in sample
             source = LeRobotV21EpisodeSource(Path(directory) / "runtime")
             self.assertEqual(source.get_length(0), 2)
             self.assertTrue(np.allclose(source.get_sample(0, 0).action, [0.6, 0.25]))
-            first_observation_id = source.get_sample(0, 0).telemetry["observation_id"]
-            second_observation_id = source.get_sample(0, 1).telemetry["observation_id"]
-            self.assertGreater(second_observation_id, first_observation_id)
+            first = source.get_sample(0, 0, include_images=False)
+            second = source.get_sample(0, 1, include_images=False)
+            self.assertEqual(first.telemetry["policy_observation_id"], second.telemetry["policy_observation_id"])
+            self.assertNotEqual(first.telemetry["control_step_id"], second.telemetry["control_step_id"])
+            self.assertGreater(second.telemetry["observation_id"], first.telemetry["observation_id"])
+            self.assertFalse(np.array_equal(first.state, second.state))
+            metadata = source.get_dataset_metadata().info["mp_real"]
+            self.assertTrue(metadata["control_step_aligned"])
+            self.assertEqual(metadata["recording_semantics"], "control_step_observation_action")
 
 
 if __name__ == "__main__":

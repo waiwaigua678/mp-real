@@ -18,7 +18,14 @@ from mp_real.common.runtime import (
     sleep_remaining,
 )
 from mp_real.runtime.config import InferenceLoopConfig
-from mp_real.runtime.models import ActionProvenance, ActionSpec, ObservationSnapshot
+from mp_real.runtime.models import (
+    ActionProvenance,
+    ActionSpec,
+    CameraSample,
+    ControlStepRecord,
+    ObservationSnapshot,
+    RobotState,
+)
 
 
 class PolicyClient(Protocol):
@@ -151,6 +158,9 @@ class InferenceHooks:
         del provenance
         self.on_action_executed(step, action)
 
+    def on_control_step_recorded(self, record: ControlStepRecord) -> None:
+        del record
+
     def on_safety_rejected(self, step: int | None, action: np.ndarray | None, error: BaseException) -> None:
         del step, action, error
 
@@ -227,6 +237,10 @@ class CompositeInferenceHooks(InferenceHooks):
         for delegate in self._delegates:
             delegate.on_action_executed_context(step, action, provenance)
 
+    def on_control_step_recorded(self, record: ControlStepRecord) -> None:
+        for delegate in self._delegates:
+            delegate.on_control_step_recorded(record)
+
     def on_safety_rejected(self, step: int | None, action: np.ndarray | None, error: BaseException) -> None:
         for delegate in self._delegates:
             delegate.on_safety_rejected(step, action, error)
@@ -269,12 +283,7 @@ def fetch_action_chunk(
     profile_stage: str = "inference",
     event_stage: str = "live",
 ) -> FetchedActionChunk:
-    observation_started_ns = time.monotonic_ns()
-    observation = adapter.observe()
-    adapter.profile("observation", (time.monotonic_ns() - observation_started_ns) / 1e9)
-    snapshot = getattr(adapter, "last_observation_snapshot", None)
-    if callable(snapshot):
-        snapshot = snapshot()
+    observation, snapshot = _observe_with_snapshot(adapter, profile_stage="observation")
     if isinstance(snapshot, ObservationSnapshot):
         hooks.on_observation_captured(snapshot)
         provenance = ActionProvenance(observation_id=snapshot.observation_id)
@@ -303,6 +312,130 @@ def fetch_action_chunk(
         inference_elapsed_s=infer_elapsed_s,
         provenance=provenance,
     )
+
+
+def _last_observation_snapshot(adapter: InferenceAdapter) -> ObservationSnapshot | None:
+    snapshot = getattr(adapter, "last_observation_snapshot", None)
+    if callable(snapshot):
+        snapshot = snapshot()
+    return snapshot if isinstance(snapshot, ObservationSnapshot) else None
+
+
+def _adapter_observation_snapshot(adapter: InferenceAdapter) -> ObservationSnapshot | None:
+    capture_snapshot = getattr(adapter, "capture_observation_snapshot", None)
+    if not callable(capture_snapshot):
+        return None
+    snapshot = capture_snapshot()
+    return snapshot if isinstance(snapshot, ObservationSnapshot) else None
+
+
+def _snapshot_from_observation(
+    observation: Mapping[str, Any],
+    *,
+    started_ns: int,
+    finished_ns: int,
+) -> ObservationSnapshot:
+    state = np.asarray(observation.get("state", ()), dtype=np.float32).reshape(-1).copy()
+    prompt = str(observation.get("prompt", ""))
+    raw_images = observation.get("images", {})
+    images: dict[str, CameraSample] = {}
+    if isinstance(raw_images, Mapping):
+        for name, image in raw_images.items():
+            images[str(name)] = CameraSample(
+                np.asarray(image, dtype=np.uint8).copy(),
+                finished_ns / 1e9,
+                frame_id=0,
+                timestamp_monotonic_ns=finished_ns,
+            )
+    masks_payload = observation.get("image_masks", {})
+    image_masks = {
+        name: np.bool_(masks_payload.get(name, True) if isinstance(masks_payload, Mapping) else True)
+        for name in images
+    }
+    return ObservationSnapshot(
+        images=images,
+        image_masks=image_masks,
+        state=RobotState(state, finished_ns / 1e9, finished_ns),
+        prompt=prompt,
+        capture_started_ns=started_ns,
+        capture_finished_ns=finished_ns,
+    )
+
+
+def _observe_with_snapshot(
+    adapter: InferenceAdapter,
+    *,
+    profile_stage: str,
+) -> tuple[dict[str, Any], ObservationSnapshot]:
+    started_ns = time.monotonic_ns()
+    snapshot = _adapter_observation_snapshot(adapter)
+    if snapshot is not None:
+        observation = snapshot.to_policy_observation()
+    else:
+        observation = adapter.observe()
+        snapshot = _last_observation_snapshot(adapter)
+    finished_ns = time.monotonic_ns()
+    adapter.profile(profile_stage, (finished_ns - started_ns) / 1e9)
+    if snapshot is None:
+        snapshot = _snapshot_from_observation(observation, started_ns=started_ns, finished_ns=finished_ns)
+    return observation, snapshot
+
+
+def _capture_control_step_snapshot(adapter: InferenceAdapter) -> ObservationSnapshot:
+    _, snapshot = _observe_with_snapshot(adapter, profile_stage="control_observation")
+    return snapshot
+
+
+def _camera_age_ns(snapshot: ObservationSnapshot, timestamp_ns: int) -> dict[str, int]:
+    return {
+        name: max(0, timestamp_ns - int(camera_timestamp_ns))
+        for name, camera_timestamp_ns in snapshot.camera_timestamps_ns.items()
+    }
+
+
+def _record_control_step(
+    hooks: InferenceHooks,
+    *,
+    step: int,
+    scheduled_timestamp_ns: int,
+    cycle_started_ns: int,
+    snapshot: ObservationSnapshot,
+    selected_raw_action: np.ndarray,
+    stabilized_action: np.ndarray,
+    executed_action: np.ndarray,
+    action_sent_timestamp_ns: int,
+    provenance: ActionProvenance | None,
+    safety_flags: tuple[str, ...] = (),
+) -> ActionProvenance:
+    recorded_ns = time.monotonic_ns()
+    source_ids = provenance.source_observation_ids if provenance is not None else ()
+    policy_observation_id = provenance.observation_id if provenance is not None else None
+    record = ControlStepRecord(
+        control_step_id=step,
+        monotonic_timestamp_ns=recorded_ns,
+        scheduled_timestamp_ns=scheduled_timestamp_ns,
+        observation_capture_started_ns=snapshot.capture_started_ns,
+        observation_capture_finished_ns=snapshot.capture_finished_ns,
+        control_observation_id=snapshot.observation_id,
+        policy_observation_id=policy_observation_id,
+        chunk_cursor=provenance.chunk_cursor if provenance is not None else None,
+        source_observation_ids=source_ids,
+        robot_state_before_action=snapshot.state.values.copy(),
+        robot_state_timestamp_ns=snapshot.state_timestamp_ns,
+        camera_samples=dict(snapshot.images),
+        camera_frame_ids=dict(snapshot.camera_frame_ids),
+        camera_timestamps_ns=dict(snapshot.camera_timestamps_ns),
+        selected_raw_action=np.asarray(selected_raw_action, dtype=np.float32).copy(),
+        stabilized_action=np.asarray(stabilized_action, dtype=np.float32).copy(),
+        executed_action=np.asarray(executed_action, dtype=np.float32).copy(),
+        action_sent_timestamp_ns=action_sent_timestamp_ns,
+        control_cycle_ns=recorded_ns - cycle_started_ns,
+        max_camera_skew_ns=snapshot.max_camera_skew_ns,
+        camera_age_ns=_camera_age_ns(snapshot, recorded_ns),
+        safety_flags=safety_flags,
+    )
+    hooks.on_control_step_recorded(record)
+    return dataclasses.replace(provenance or ActionProvenance(), control_cycle_ns=record.control_cycle_ns)
 
 
 def _fetch_chunk(
@@ -389,7 +522,10 @@ def run_sync_loop(
         if prepared_chunk.ndim != 2 or len(prepared_chunk) == 0:
             raise ValueError(f"initial_chunk must be a non-empty [T, action_dim] array, got {prepared_chunk.shape}")
         provenance = initial_provenance or ActionProvenance()
-        plan.extend(ScheduledAction(action.copy(), provenance) for action in prepared_chunk)
+        plan.extend(
+            ScheduledAction(action.copy(), dataclasses.replace(provenance, chunk_cursor=cursor))
+            for cursor, action in enumerate(prepared_chunk)
+        )
     dt = 1.0 / config.fps
     step = 0
     mode = "sync"
@@ -420,6 +556,7 @@ def run_sync_loop(
             selected = scheduled.action
             cycle_started_ns = time.monotonic_ns()
             hooks.on_action_selected_context(step, selected.copy(), scheduled.provenance)
+            control_snapshot = _capture_control_step_snapshot(adapter)
             try:
                 action = adapter.stabilize_action(selected, previous)
             except BaseException as exc:
@@ -433,10 +570,22 @@ def run_sync_loop(
                 hooks.on_safety_rejected(step, action.copy(), exc)
                 raise
             adapter.profile("execution", (time.monotonic_ns() - execute_started_ns) / 1e9)
+            executed_provenance = _record_control_step(
+                hooks,
+                step=step,
+                scheduled_timestamp_ns=cycle_started_ns,
+                cycle_started_ns=cycle_started_ns,
+                snapshot=control_snapshot,
+                selected_raw_action=selected,
+                stabilized_action=action,
+                executed_action=previous,
+                action_sent_timestamp_ns=execute_started_ns,
+                provenance=scheduled.provenance,
+            )
             hooks.on_action_executed_context(
                 step,
                 previous.copy(),
-                dataclasses.replace(scheduled.provenance, control_cycle_ns=time.monotonic_ns() - cycle_started_ns),
+                executed_provenance,
             )
             step += 1
             if on_step is not None:
@@ -563,12 +712,33 @@ def run_rtc_loop(
                 break
             if action is None:
                 if previous is not None and config.hold_last_action:
+                    cycle_started_ns = time.monotonic_ns()
+                    control_snapshot = _capture_control_step_snapshot(adapter)
+                    hold_target = previous.copy()
+                    execute_started_ns = time.monotonic_ns()
                     try:
-                        previous = adapter.execute_transition(previous, previous)
+                        previous = adapter.execute_transition(previous, hold_target)
                     except BaseException as exc:
-                        hooks.on_safety_rejected(step, previous.copy(), exc)
+                        hooks.on_safety_rejected(step, hold_target.copy(), exc)
                         raise
+                    adapter.profile("execution", (time.monotonic_ns() - execute_started_ns) / 1e9)
+                    previous_provenance = _record_control_step(
+                        hooks,
+                        step=step,
+                        scheduled_timestamp_ns=cycle_started_ns,
+                        cycle_started_ns=cycle_started_ns,
+                        snapshot=control_snapshot,
+                        selected_raw_action=hold_target,
+                        stabilized_action=hold_target,
+                        executed_action=previous,
+                        action_sent_timestamp_ns=execute_started_ns,
+                        provenance=previous_provenance,
+                        safety_flags=("hold_last_action",),
+                    )
                     hooks.on_action_executed_context(step, previous.copy(), previous_provenance)
+                    step += 1
+                    if on_step is not None:
+                        on_step(step, 0)
                 now = time.monotonic()
                 if now - last_wait_log > 1.0:
                     logging.warning("Waiting for RTC action at control step %d", step)
@@ -581,7 +751,9 @@ def run_rtc_loop(
                 else None
             )
             cycle_started_ns = time.monotonic_ns()
-            hooks.on_action_selected_context(step, action.copy(), provenance)
+            selected = action.copy()
+            hooks.on_action_selected_context(step, selected.copy(), provenance)
+            control_snapshot = _capture_control_step_snapshot(adapter)
             try:
                 action = adapter.stabilize_action(action, previous)
             except BaseException as exc:
@@ -595,8 +767,17 @@ def run_rtc_loop(
                 hooks.on_safety_rejected(step, action.copy(), exc)
                 raise
             adapter.profile("execution", (time.monotonic_ns() - execute_started_ns) / 1e9)
-            previous_provenance = dataclasses.replace(
-                provenance or ActionProvenance(), control_cycle_ns=time.monotonic_ns() - cycle_started_ns
+            previous_provenance = _record_control_step(
+                hooks,
+                step=step,
+                scheduled_timestamp_ns=cycle_started_ns,
+                cycle_started_ns=cycle_started_ns,
+                snapshot=control_snapshot,
+                selected_raw_action=selected,
+                stabilized_action=action,
+                executed_action=previous,
+                action_sent_timestamp_ns=execute_started_ns,
+                provenance=provenance,
             )
             hooks.on_action_executed_context(step, previous.copy(), previous_provenance)
             step += 1
