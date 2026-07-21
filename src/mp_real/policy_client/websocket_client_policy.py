@@ -1,9 +1,10 @@
+from __future__ import annotations
+
 import logging
 import time
-from typing import Dict, Optional, Tuple
 
-from typing_extensions import override
 import websockets.sync.client
+from typing_extensions import override
 
 from mp_real.policy_client import base_policy as _base_policy
 from mp_real.policy_client import msgpack_numpy
@@ -15,7 +16,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
     See WebsocketPolicyServer for a corresponding server implementation.
     """
 
-    def __init__(self, host: str = "0.0.0.0", port: Optional[int] = None, api_key: Optional[str] = None) -> None:
+    def __init__(self, host: str = "0.0.0.0", port: int | None = None, api_key: str | None = None) -> None:
         if host.startswith("ws"):
             self._uri = host
         else:
@@ -26,10 +27,10 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         self._api_key = api_key
         self._ws, self._server_metadata = self._wait_for_server()
 
-    def get_server_metadata(self) -> Dict:
+    def get_server_metadata(self) -> dict:
         return self._server_metadata
 
-    def _wait_for_server(self) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
+    def _wait_for_server(self) -> tuple[websockets.sync.client.ClientConnection, dict]:
         logging.info(f"Waiting for server at {self._uri}...")
         while True:
             try:
@@ -44,7 +45,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                 time.sleep(5)
 
     @override
-    def infer(self, obs: Dict) -> Dict:  # noqa: UP006
+    def infer(self, obs: dict) -> dict:
         data = self._packer.pack(obs)
         self._ws.send(data)
         response = self._ws.recv()

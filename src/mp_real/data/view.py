@@ -9,15 +9,17 @@ import math
 import threading
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from mp_real.data.catalog import CatalogDataset, RecordedDataCatalog
-from mp_real.data.lerobot_v21 import LeRobotV21EpisodeSource
 from mp_real.data.models import EpisodeMetadata, RecordedSample
 from mp_real.data.pose import recorded_pose_target
 from mp_real.evaluation.metrics import compute_episode_metrics
+
+if TYPE_CHECKING:
+    from mp_real.data.lerobot_v21 import LeRobotV21EpisodeSource
 
 
 class DataViewError(ValueError):
@@ -612,6 +614,8 @@ class DataViewSession:
         with self._lock:
             source = self._sources.get(dataset_id)
             if source is None:
+                from mp_real.data.lerobot_v21 import LeRobotV21EpisodeSource
+
                 source = LeRobotV21EpisodeSource(dataset.root)
                 self._sources[dataset_id] = source
         return EpisodeReader(source)

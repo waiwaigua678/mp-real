@@ -8,7 +8,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-from mp_real.evaluation.open_loop.evaluator import OpenLoopEvaluator
 from mp_real.evaluation.open_loop.models import (
     AlignmentMode,
     EvaluationRequestMode,
@@ -58,6 +57,8 @@ def cli() -> None:
     parser.add_argument("--inference-timeout", type=float, default=3.0)
     parser.add_argument("--state-derived-config", type=Path)
     args = parser.parse_args()
+    from mp_real.evaluation.open_loop.evaluator import OpenLoopEvaluator
+
     episodes = None if args.session else _parse_episodes(args.episode)
     derived = _load_state_derived(args.state_derived_config) if args.state_derived_config else None
     base: dict[str, Any] = {

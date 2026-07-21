@@ -327,7 +327,7 @@ class ReplayActionSource:
     gripper_semantics: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if not self.action_source or not self.action_mode or self.arm_count <= 0:
+        if not self.action_source or not self.action_mode or self.arm_count < 0:
             raise ValueError("action source and action mode cannot be empty")
         object.__setattr__(self, "action_spec", freeze_action_spec(self.action_spec))
         object.__setattr__(self, "gripper_indices", tuple(int(index) for index in self.gripper_indices))
@@ -438,6 +438,8 @@ class ReplayPlan:
             raise ValueError("invalid replay plan indices")
         if not self.dataset_id or not self.dataset_hash or not self.robot_name:
             raise ValueError("replay plan identity cannot be empty")
+        if self.source.arm_count <= 0:
+            raise ValueError("replay plan source must declare at least one arm")
         if not 0 < self.speed_scale <= 1.0:
             raise ValueError("speed_scale must be in (0, 1]")
         if not self.steps:

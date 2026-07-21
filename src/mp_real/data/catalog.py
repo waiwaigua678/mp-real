@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from mp_real.data.lerobot_v21 import CODEBASE_VERSION
+from mp_real.data.constants import CODEBASE_VERSION
 from mp_real.data.models import EpisodeStatus
 
 

@@ -1,0 +1,49 @@
+name: No Hardware CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  core-only:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v5
+      - name: Install core dependencies only
+        run: uv sync --no-dev
+      - name: Validate core imports and CLI help
+        run: >
+          uv run --no-sync python -m unittest
+          tests.test_h6_optional_docs.H6OptionalDependencyAndDocsTests.test_core_imports_do_not_require_av_or_pyarrow
+          tests.test_h6_optional_docs.H6OptionalDependencyAndDocsTests.test_cli_help_does_not_require_recording_dependencies
+          tests.test_h6_optional_docs.H6OptionalDependencyAndDocsTests.test_readme_local_doc_links_exist
+          tests.test_h6_optional_docs.H6OptionalDependencyAndDocsTests.test_av_and_pyarrow_are_optional_extras_not_core_dependencies
+
+  recording-extra:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v5
+      - name: Install recording, data, evaluation, and dev extras
+        run: uv sync --extra recording --extra data --extra evaluation --extra dev
+      - name: Unit tests
+        run: uv run --no-sync python -m unittest discover -s tests -v
+      - name: Ruff
+        run: uv run --no-sync ruff check .
+      - name: Entrypoint help
+        run: |
+          uv run --no-sync mp-piper-infer --help
+          uv run --no-sync mp-rm2-infer --help
+          uv run --no-sync mp-camera-preview --help
+          uv run --no-sync mp-data-inspect --help
+          uv run --no-sync mp-data-validate --help
+          uv run --no-sync mp-data-audit --help
+          uv run --no-sync mp-robot-replay --help
+          uv run --no-sync mp-open-loop-eval --help

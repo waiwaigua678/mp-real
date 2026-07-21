@@ -17,11 +17,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "av>=14.2.0,<16.0.0",
     "msgpack>=1.0.5,<2.0.0",
     "numpy>=1.24.0,<2.0.0",
     "pillow>=9.0.0,<12.0.0",
-    "pyarrow>=17.0.0,<23.0.0",
     "typing-extensions>=4.12.2",
     "tyro>=0.9.5",
     "websockets>=11.0,<16.0",
@@ -49,7 +47,21 @@ v4l2 = [
 web = [
     "opencv-python-headless>=4.10.0.84,<5.0.0",
 ]
+recording = [
+    "av>=14.2.0,<16.0.0",
+    "pyarrow>=17.0.0,<23.0.0",
+]
+data = [
+    "av>=14.2.0,<16.0.0",
+    "pyarrow>=17.0.0,<23.0.0",
+]
+evaluation = [
+    "av>=14.2.0,<16.0.0",
+    "pyarrow>=17.0.0,<23.0.0",
+]
 dev = [
+    "av>=14.2.0,<16.0.0",
+    "pyarrow>=17.0.0,<23.0.0",
     "ruff>=0.9.0",
 ]
 
@@ -61,6 +73,7 @@ mp-real-web = "mp_real.web.server:main"
 mp-camera-preview = "mp_real.web.camera_preview:main"
 mp-data-inspect = "mp_real.data.cli:inspect_cli"
 mp-data-validate = "mp_real.data.cli:validate_cli"
+mp-data-audit = "mp_real.data.audit:cli"
 mp-data-view = "mp_real.data.view_server:main"
 mp-open-loop-eval = "mp_real.evaluation.open_loop.cli:cli"
 mp-baseline = "mp_real.evaluation.baseline.cli:cli"

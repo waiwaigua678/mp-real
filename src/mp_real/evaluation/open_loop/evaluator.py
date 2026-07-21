@@ -13,7 +13,6 @@ from typing import Any
 
 import numpy as np
 
-from mp_real.data.lerobot_v21 import LeRobotV21EpisodeSource
 from mp_real.data.models import RecordedEpisodeSource, RecordedSample
 from mp_real.evaluation.open_loop.alignment import ActionAlignment
 from mp_real.evaluation.open_loop.metrics import compute_open_loop_metrics
@@ -133,7 +132,7 @@ class OpenLoopEvaluator:
         explicitly excluded from formal open-loop metrics.
         """
 
-        source = self._source or LeRobotV21EpisodeSource(self.config.dataset)
+        source = self._source or _lerobot_source(self.config.dataset)
         owns_source = self._source is None
         try:
             samples = self._samples(source, episode_index)
@@ -156,7 +155,7 @@ class OpenLoopEvaluator:
                 source.close()
 
     def run(self) -> OpenLoopRunResult:
-        source = self._source or LeRobotV21EpisodeSource(self.config.dataset)
+        source = self._source or _lerobot_source(self.config.dataset)
         self._source = source
         writer = PredictionResultWriter(self.config.output_dir, resume=self.config.resume)
         metadata = source.get_dataset_metadata()
@@ -647,15 +646,13 @@ def _latency_summary(latency_ns: np.ndarray) -> dict[str, float | int | None]:
 
 
 def _action_spec_json(spec: ActionSpec) -> dict[str, Any]:
-    return {
-        "action_dim": spec.action_dim,
-        "state_dim": spec.state_dim,
-        "joint_dof_per_arm": spec.joint_dof_per_arm,
-        "joint_unit": spec.joint_unit,
-        "camera_roles": list(spec.camera_roles),
-        "state_fields": [dataclasses.asdict(field) for field in spec.state_fields],
-        "action_fields": [dataclasses.asdict(field) for field in spec.action_fields],
-    }
+    return spec.to_dict()
+
+
+def _lerobot_source(path: Path) -> RecordedEpisodeSource:
+    from mp_real.data.lerobot_v21 import LeRobotV21EpisodeSource
+
+    return LeRobotV21EpisodeSource(path)
 
 
 def _interpretation() -> list[str]:

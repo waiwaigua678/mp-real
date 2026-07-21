@@ -7,7 +7,6 @@ import json
 import sys
 from pathlib import Path
 
-from mp_real.data.lerobot_v21 import LeRobotV21EpisodeSource
 from mp_real.replay.controller import RobotReplayController
 from mp_real.replay.models import (
     ReplayAcknowledgementStrategy,
@@ -75,6 +74,8 @@ def cli(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.execute and args.dry_run:
         raise SystemExit("--dry-run and --execute are mutually exclusive")
+    from mp_real.data.lerobot_v21 import LeRobotV21EpisodeSource
+
     profile = get_web_profile(args.robot)
     robot_args = profile.default_args()
     source = LeRobotV21EpisodeSource(args.dataset)

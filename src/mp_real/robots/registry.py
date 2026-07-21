@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 import importlib
+from collections.abc import Callable
 from typing import Any
 
 from mp_real.robots.base import Robot

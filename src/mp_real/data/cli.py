@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
-from mp_real.data.lerobot_v21 import LeRobotV21EpisodeSource, validate_lerobot_v21_dataset
+from mp_real.data.deps import MissingOptionalDependencyError
 
 
 def inspect_cli() -> None:
     parser = argparse.ArgumentParser(description="Inspect a local LeRobot v2.1 dataset without hardware access")
     parser.add_argument("dataset", type=Path)
     args = parser.parse_args()
-    source = LeRobotV21EpisodeSource(args.dataset)
+    source = None
     try:
+        from mp_real.data.lerobot_v21 import LeRobotV21EpisodeSource
+
+        source = LeRobotV21EpisodeSource(args.dataset)
         metadata = source.get_dataset_metadata()
         info = metadata.info
         payload = {
@@ -30,8 +34,12 @@ def inspect_cli() -> None:
             "status": metadata.status.value,
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    except MissingOptionalDependencyError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2) from exc
     finally:
-        source.close()
+        if source is not None:
+            source.close()
 
 
 def validate_cli() -> None:
@@ -39,7 +47,13 @@ def validate_cli() -> None:
     parser.add_argument("dataset", type=Path)
     parser.add_argument("--skip-video-check", action="store_true")
     args = parser.parse_args()
-    report = validate_lerobot_v21_dataset(args.dataset, check_videos=not args.skip_video_check)
+    try:
+        from mp_real.data.lerobot_v21 import validate_lerobot_v21_dataset
+
+        report = validate_lerobot_v21_dataset(args.dataset, check_videos=not args.skip_video_check)
+    except MissingOptionalDependencyError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2) from exc
     print(
         json.dumps(
             {

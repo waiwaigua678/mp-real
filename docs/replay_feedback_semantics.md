@@ -44,7 +44,9 @@ Each feedback sample carries:
 - whether it acknowledged a command
 
 Replay record events include these records plus the cursor snapshot. The replay
-record manifest schema is version `2` and stores the acknowledgement strategy.
+record manifest schema is version `2` and stores the acknowledgement strategy
+plus final `tracking_cursors` for sent, feedback, acknowledged and displayed
+sample indices.
 
 ## Acknowledgement Strategies
 
@@ -103,4 +105,3 @@ continue from the sent cursor.
 If the robot has moved away from the acknowledged replay state, resume is
 rejected. A future operator flow may generate an explicit move-to-state plan,
 but H5 does not automatically move hardware from a Web handler.
-

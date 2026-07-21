@@ -8,6 +8,7 @@ from typing import Any, Literal, Protocol
 
 import numpy as np
 
+from mp_real.data.constants import MP_REAL_SCHEMA_VERSION
 from mp_real.runtime.models import ActionSpec
 
 
@@ -176,13 +177,28 @@ class FakeRecordedEpisodeSource:
     ) -> None:
         self._action_spec = action_spec
         self._episodes = {index: tuple(samples) for index, samples in episodes.items()}
+        mp_real_info: dict[str, Any] = {
+            "schema_version": MP_REAL_SCHEMA_VERSION,
+            "recording_semantics": "control_step_observation_action",
+            "control_step_aligned": True,
+            "action_spec": action_spec.to_dict(),
+            "replay": {
+                "action_source": "standard_action",
+                "action_mode": action_spec.action_mode,
+                "joint_unit": action_spec.joint_unit,
+                "arm_count": action_spec.arm_count,
+                "gripper_indices": list(action_spec.gripper_indices),
+                "state_names": list(action_spec.state_field_names),
+                "action_names": list(action_spec.action_field_names),
+            },
+        }
         self._metadata = DatasetMetadata(
             root=Path("<fake>"),
             info={
                 "codebase_version": "v2.1",
                 "robot_type": robot_name,
                 "fps": 1.0,
-                "mp_real": {"replay": {"action_source": "standard_action", "action_mode": "joint_position_target"}},
+                "mp_real": mp_real_info,
                 **dict(info or {}),
             },
             status=EpisodeStatus.COMPLETE,

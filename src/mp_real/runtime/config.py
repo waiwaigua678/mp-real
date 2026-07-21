@@ -23,7 +23,7 @@ class InferenceLoopConfig:
     log_timing: bool
 
     @classmethod
-    def from_args(cls, args: Any) -> "InferenceLoopConfig":
+    def from_args(cls, args: Any) -> InferenceLoopConfig:
         return cls(
             fps=args.fps,
             replan_steps=args.replan_steps,

@@ -839,9 +839,8 @@ class HardeningPoseReplaySafetyTests(unittest.TestCase):
 
 
 class HardeningDocsPackagingTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_h6_readme_local_doc_links_should_exist(self) -> None:
-        """Expected to pass after H6 fixes README doc paths or restores linked documents."""
+        """README safety/capability links must resolve in this repository."""
 
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         linked_paths = {
@@ -851,9 +850,8 @@ class HardeningDocsPackagingTests(unittest.TestCase):
         missing = sorted(path for path in linked_paths if not (REPO_ROOT / path).exists())
         self.assertEqual(missing, [])
 
-    @unittest.expectedFailure
     def test_h6_av_and_pyarrow_should_not_be_core_deployment_dependencies(self) -> None:
-        """Expected to pass after H6 moves data/video extras out of core deployment deps."""
+        """Data/video dependencies must be optional extras, not core deployment deps."""
 
         pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         dependencies = tuple(

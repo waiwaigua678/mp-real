@@ -8,6 +8,7 @@ import os
 import queue
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,12 @@ class ReplayRecordWriter:
         self._started = False
         self._stopped = False
         self._result: str | None = None
+        self._last_cursors: dict[str, Any] = {
+            "sent_sample_index": None,
+            "feedback_sample_index": None,
+            "acknowledged_sample_index": None,
+            "displayed_sample_index": None,
+        }
 
     @property
     def error(self) -> BaseException | None:
@@ -69,12 +76,22 @@ class ReplayRecordWriter:
                 raise ReplayRecordingError(f"replay recorder failed: {self._error}") from self._error
             if not self._started or self._stopped:
                 raise ReplayRecordingError("replay recorder is not active")
+        queued = dict(event)
         try:
-            self._queue.put_nowait(dict(event))
+            self._queue.put_nowait(queued)
         except queue.Full as exc:
             with self._lock:
                 self._dropped += 1
             raise ReplayRecordingError("replay recorder queue is full; safety abort required") from exc
+        cursors = queued.get("cursors")
+        if isinstance(cursors, Mapping):
+            with self._lock:
+                self._last_cursors = {
+                    "sent_sample_index": cursors.get("sent_sample_index"),
+                    "feedback_sample_index": cursors.get("feedback_sample_index"),
+                    "acknowledged_sample_index": cursors.get("acknowledged_sample_index"),
+                    "displayed_sample_index": cursors.get("displayed_sample_index"),
+                }
 
     def stop(self, *, result: str, timeout: float = 10.0) -> bool:
         with self._lock:
@@ -104,6 +121,8 @@ class ReplayRecordWriter:
                     stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())
+            with self._lock:
+                tracking_cursors = dict(self._last_cursors)
             manifest = {
                 "schema_version": 2,
                 "kind": "mp_real_robot_trajectory_replay",
@@ -119,6 +138,7 @@ class ReplayRecordWriter:
                 "plan_hash": self._plan.plan_hash,
                 "session_id": self._plan.session_id,
                 "generation_id": self._plan.generation_id,
+                "tracking_cursors": tracking_cursors,
                 "dropped_event_count": self._dropped,
                 "result": self._result,
                 "finalized_at_monotonic_ns": time.monotonic_ns(),

@@ -46,22 +46,34 @@ name = "mp-real"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "av" },
     { name = "msgpack" },
     { name = "numpy" },
     { name = "pillow" },
-    { name = "pyarrow" },
     { name = "typing-extensions" },
     { name = "tyro" },
     { name = "websockets" },
 ]
 
 [package.optional-dependencies]
+data = [
+    { name = "av" },
+    { name = "pyarrow" },
+]
 dev = [
+    { name = "av" },
+    { name = "pyarrow" },
     { name = "ruff" },
+]
+evaluation = [
+    { name = "av" },
+    { name = "pyarrow" },
 ]
 realsense = [
     { name = "pyrealsense2", marker = "sys_platform == 'linux'" },
+]
+recording = [
+    { name = "av" },
+    { name = "pyarrow" },
 ]
 v4l2 = [
     { name = "opencv-python-headless" },
@@ -72,20 +84,26 @@ web = [
 
 [package.metadata]
 requires-dist = [
-    { name = "av", specifier = ">=14.2.0,<16.0.0" },
+    { name = "av", marker = "extra == 'data'", specifier = ">=14.2.0,<16.0.0" },
+    { name = "av", marker = "extra == 'dev'", specifier = ">=14.2.0,<16.0.0" },
+    { name = "av", marker = "extra == 'evaluation'", specifier = ">=14.2.0,<16.0.0" },
+    { name = "av", marker = "extra == 'recording'", specifier = ">=14.2.0,<16.0.0" },
     { name = "msgpack", specifier = ">=1.0.5,<2.0.0" },
     { name = "numpy", specifier = ">=1.24.0,<2.0.0" },
     { name = "opencv-python-headless", marker = "extra == 'v4l2'", specifier = ">=4.10.0.84,<5.0.0" },
     { name = "opencv-python-headless", marker = "extra == 'web'", specifier = ">=4.10.0.84,<5.0.0" },
     { name = "pillow", specifier = ">=9.0.0,<12.0.0" },
-    { name = "pyarrow", specifier = ">=17.0.0,<23.0.0" },
+    { name = "pyarrow", marker = "extra == 'data'", specifier = ">=17.0.0,<23.0.0" },
+    { name = "pyarrow", marker = "extra == 'dev'", specifier = ">=17.0.0,<23.0.0" },
+    { name = "pyarrow", marker = "extra == 'evaluation'", specifier = ">=17.0.0,<23.0.0" },
+    { name = "pyarrow", marker = "extra == 'recording'", specifier = ">=17.0.0,<23.0.0" },
     { name = "pyrealsense2", marker = "sys_platform == 'linux' and extra == 'realsense'", specifier = ">=2.58.2.10647" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9.0" },
     { name = "typing-extensions", specifier = ">=4.12.2" },
     { name = "tyro", specifier = ">=0.9.5" },
     { name = "websockets", specifier = ">=11.0,<16.0" },
 ]
-provides-extras = ["piper", "rm2", "realsense", "v4l2", "web", "dev"]
+provides-extras = ["piper", "rm2", "realsense", "v4l2", "web", "recording", "data", "evaluation", "dev"]
 
 [[package]]
 name = "msgpack"

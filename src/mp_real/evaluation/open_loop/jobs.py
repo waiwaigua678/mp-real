@@ -12,10 +12,15 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from mp_real.data.lerobot_v21 import LeRobotV21EpisodeSource
 from mp_real.data.models import RecordedEpisodeSource
 from mp_real.evaluation.open_loop.evaluator import OpenLoopEvaluator
 from mp_real.evaluation.open_loop.models import OpenLoopEvaluationConfig
+
+
+def _default_source_factory(path: Path) -> RecordedEpisodeSource:
+    from mp_real.data.lerobot_v21 import LeRobotV21EpisodeSource
+
+    return LeRobotV21EpisodeSource(path)
 
 
 class OpenLoopJobState(enum.StrEnum):
@@ -54,7 +59,7 @@ class OpenLoopEvaluationJobManager:
         output_root: Path | str,
         *,
         queue_size: int = 8,
-        source_factory: Callable[[Path], RecordedEpisodeSource] = LeRobotV21EpisodeSource,
+        source_factory: Callable[[Path], RecordedEpisodeSource] | None = None,
         policy_factory: Callable[[str, str | None, float, float], Any] | None = None,
     ) -> None:
         if queue_size <= 0:
@@ -62,7 +67,7 @@ class OpenLoopEvaluationJobManager:
         self.output_root = Path(output_root).expanduser().resolve()
         self._queue: queue.Queue[str | None] = queue.Queue(maxsize=queue_size)
         self._jobs: dict[str, _Job] = {}
-        self._source_factory = source_factory
+        self._source_factory = source_factory or _default_source_factory
         self._policy_factory = policy_factory
         self._lock = threading.RLock()
         self._closed = False

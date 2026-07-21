@@ -215,6 +215,102 @@ class LeRobotV21Tests(unittest.TestCase):
                 source = LeRobotV21EpisodeSource(root)
                 self.assertEqual(source.get_action_spec().action_field_names, action_spec.action_field_names)
 
+    def test_h6_recording_metadata_round_trips_action_spec_and_action_source(self) -> None:
+        fields = (
+            VectorField("left_joint_1", "deg", "joint_position"),
+            VectorField("right_joint_1", "deg", "joint_position"),
+            VectorField("left_gripper", "raw_unit", "gripper_position"),
+            VectorField("right_gripper", "raw_unit", "gripper_position"),
+        )
+        spec = ActionSpec(
+            4,
+            4,
+            1,
+            "deg",
+            ("head",),
+            state_fields=fields,
+            action_fields=fields,
+            action_mode="velocity_target",
+            gripper_indices=(2, 3),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "metadata"
+            recorder = LeRobotV21EpisodeRecorder(
+                RecorderConfig(root, "metadata", "rm2", 10.0, spec, save_video=False, session_id="session")
+            )
+            recorder.start()
+            recorder.begin_episode(EpisodeRecordingContext(0, "episode", "task", "session", 1))
+            recorder.emit(
+                _event(
+                    ControlStepRecorded,
+                    episode_id="episode",
+                    step=0,
+                    payload={
+                        "control_step_id": 0,
+                        "observation_id": 10,
+                        "policy_observation_id": 20,
+                        "state": np.asarray([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
+                        "images": {"head": np.zeros((2, 2, 3), dtype=np.uint8)},
+                        "camera_frame_ids": {"head": 1},
+                        "camera_timestamps_ns": {"head": 1_000_000_000},
+                        "max_camera_skew_ns": 0,
+                        "selected_raw_action": np.asarray([0.1, 0.2, 0.3, 0.4], dtype=np.float32),
+                        "stabilized_target_action": np.asarray([0.5, 0.6, 0.7, 0.8], dtype=np.float32),
+                        "executed_action": np.asarray([0.9, 1.0, 1.1, 1.2], dtype=np.float32),
+                    },
+                )
+            )
+            recorder.end_episode(labels={"result": "SUCCESS"})
+            self.assertTrue(recorder.stop(timeout=20))
+
+            info = json.loads((root / "meta" / "info.json").read_text(encoding="utf-8"))
+            schema = json.loads((root / "meta" / "mp_real" / "schema.json").read_text(encoding="utf-8"))
+            for container in (info["mp_real"], schema):
+                replay = container["replay"] if "replay" in container else container
+                self.assertEqual(replay["action_source"], "executed_action")
+                self.assertEqual(replay["action_mode"], spec.action_mode)
+                self.assertEqual(replay["joint_unit"], spec.joint_unit)
+                self.assertEqual(replay["arm_count"], 2)
+                self.assertEqual(replay["gripper_indices"], [2, 3])
+                self.assertEqual(container["action_spec"], spec.to_dict())
+                self.assertTrue(container["control_step_aligned"])
+                self.assertEqual(container["recording_semantics"], "control_step_observation_action")
+            self.assertEqual(info["features"]["observation.state"]["names"], [list(spec.state_field_names)])
+            self.assertEqual(info["features"]["action"]["names"], [list(spec.action_field_names)])
+            source = LeRobotV21EpisodeSource(root)
+            try:
+                self.assertEqual(source.get_action_spec(), spec)
+                self.assertTrue(np.allclose(source.get_sample(0, 0, include_images=False).action, [0.9, 1.0, 1.1, 1.2]))
+            finally:
+                source.close()
+
+    def test_h6_legacy_schema_is_unknown_and_warned_without_rewriting_data(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._write_dataset(Path(directory) / "legacy", save_video=False)
+            schema_path = root / "meta" / "mp_real" / "schema.json"
+            schema_path.unlink()
+            info_path = root / "meta" / "info.json"
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+            info["mp_real"] = {
+                "schema_version": 1,
+                "recording_semantics": "legacy_observation_action_provenance_unknown",
+                "control_step_aligned": False,
+                "replay": {"action_source": "executed_action"},
+            }
+            info_path.write_text(json.dumps(info), encoding="utf-8")
+
+            source = LeRobotV21EpisodeSource(root)
+            try:
+                spec = source.get_action_spec()
+                self.assertEqual(spec.action_mode, "unknown")
+                self.assertEqual(spec.joint_unit, "unknown")
+                self.assertEqual(spec.arm_count, 0)
+            finally:
+                source.close()
+            report = validate_lerobot_v21_dataset(root, check_videos=False)
+            self.assertTrue(report.valid, report.errors)
+            self.assertTrue(any("predates control-step-aligned semantics" in item for item in report.warnings))
+
     def test_openpi_lerobot_loader_reads_generated_standard_dataset(self) -> None:
         openpi_python = Path(os.environ.get("OPENPI_PYTHON", "/home/pc4/0x0219/openpi/.venv/bin/python"))
         if not openpi_python.is_file():

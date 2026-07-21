@@ -12,11 +12,10 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
-import av
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
 
+from mp_real.data.constants import CODEBASE_VERSION, MP_REAL_SCHEMA_VERSION
+from mp_real.data.deps import OptionalModule, require_av, require_pyarrow
 from mp_real.data.models import (
     DatasetMetadata,
     EpisodeMetadata,
@@ -40,12 +39,20 @@ from mp_real.runtime.events import (
 )
 from mp_real.runtime.models import ActionSpec, VectorField
 
-CODEBASE_VERSION = "v2.1"
-MP_REAL_SCHEMA_VERSION = 3
 RECORDER_VERSION = "h2-telemetry-parts-v3"
 DEFAULT_CHUNK_SIZE = 1000
 TIMESTAMP_TOLERANCE_S = 1e-4
 _STOP = object()
+STANDARD_ACTION_SOURCE = "executed_action"
+
+av = OptionalModule("av", feature="LeRobot video recording/reading", extra="recording")
+pa = OptionalModule("pyarrow", feature="LeRobot Parquet recording/reading", extra="recording")
+pq = OptionalModule(
+    "pyarrow.parquet",
+    package="pyarrow",
+    feature="LeRobot Parquet recording/reading",
+    extra="recording",
+)
 
 
 class DatasetValidationError(ValueError):
@@ -262,6 +269,16 @@ def _build_info(
         if control_step_aligned
         else "legacy_observation_action_provenance_unknown"
     )
+    spec = config.action_spec
+    replay_metadata = {
+        "action_source": STANDARD_ACTION_SOURCE,
+        "action_mode": spec.action_mode,
+        "joint_unit": spec.joint_unit,
+        "arm_count": spec.arm_count,
+        "gripper_indices": list(spec.gripper_indices),
+        "state_names": list(spec.state_field_names),
+        "action_names": list(spec.action_field_names),
+    }
     return {
         "codebase_version": CODEBASE_VERSION,
         "robot_type": config.robot_name,
@@ -284,6 +301,8 @@ def _build_info(
             "recording_semantics": semantics,
             "control_step_aligned": control_step_aligned,
             "policy_observation_reuse_possible": not control_step_aligned,
+            "schema_status": "current" if control_step_aligned else "legacy_or_unknown",
+            "action_spec": spec.to_dict(),
             "session_id": config.session_id,
             "operator": config.operator,
             "policy_label": config.policy_label,
@@ -297,10 +316,40 @@ def _build_info(
             # ActionExecuted events.  Naming that provenance explicitly is
             # required before a future real-robot command replay may consume
             # the dataset; raw model chunks remain telemetry only.
-            "replay": {
-                "action_source": "executed_action",
-                "action_mode": config.action_spec.action_mode,
-            },
+            "replay": replay_metadata,
+        },
+    }
+
+
+def _recording_schema_payload(
+    config: RecorderConfig,
+    *,
+    recording_semantics: str,
+    control_step_aligned: bool,
+) -> dict[str, object]:
+    spec = config.action_spec
+    return {
+        "schema_version": MP_REAL_SCHEMA_VERSION,
+        "recorder_version": RECORDER_VERSION,
+        "recording_semantics": recording_semantics,
+        "control_step_aligned": control_step_aligned,
+        "policy_observation_reuse_possible": not control_step_aligned,
+        "schema_status": "current" if control_step_aligned else "legacy_or_unknown",
+        "action_source": STANDARD_ACTION_SOURCE,
+        "action_mode": spec.action_mode,
+        "joint_unit": spec.joint_unit,
+        "arm_count": spec.arm_count,
+        "gripper_indices": list(spec.gripper_indices),
+        "robot_name": config.robot_name,
+        "action_spec": spec.to_dict(),
+        "state_field_order": _field_names(spec.state_fields, spec.state_dim, "state"),
+        "action_field_order": _field_names(spec.action_fields, spec.action_dim, "action"),
+        "camera_roles": list(spec.camera_roles),
+        "max_camera_age_ns": config.max_camera_age_ns,
+        "telemetry": {
+            "enabled": config.save_telemetry,
+            "layout": "parts" if config.save_telemetry else "disabled",
+            "part_size_steps": config.telemetry_part_size_steps if config.save_telemetry else 0,
         },
     }
 
@@ -1045,6 +1094,9 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
         return self._final_root
 
     def start(self) -> None:
+        require_pyarrow("LeRobot v2.1 recording")
+        if self.config.save_video:
+            require_av("LeRobot v2.1 video recording")
         with self._lock:
             if self._started:
                 return
@@ -1208,31 +1260,11 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
                         )
                         _write_json(
                             self._work_root / "meta" / "mp_real" / "schema.json",
-                            {
-                                "schema_version": MP_REAL_SCHEMA_VERSION,
-                                "recorder_version": RECORDER_VERSION,
-                                "recording_semantics": "legacy_observation_action_provenance_unknown",
-                                "control_step_aligned": False,
-                                "policy_observation_reuse_possible": True,
-                                "action_source": "executed_action",
-                                "robot_name": self.config.robot_name,
-                                "action_spec": dataclasses.asdict(self.config.action_spec),
-                                "state_field_order": _field_names(
-                                    self.config.action_spec.state_fields, self.config.action_spec.state_dim, "state"
-                                ),
-                                "action_field_order": _field_names(
-                                    self.config.action_spec.action_fields, self.config.action_spec.action_dim, "action"
-                                ),
-                                "camera_roles": list(self.config.action_spec.camera_roles),
-                                "max_camera_age_ns": self.config.max_camera_age_ns,
-                                "telemetry": {
-                                    "enabled": self.config.save_telemetry,
-                                    "layout": "parts" if self.config.save_telemetry else "disabled",
-                                    "part_size_steps": (
-                                        self.config.telemetry_part_size_steps if self.config.save_telemetry else 0
-                                    ),
-                                },
-                            },
+                            _recording_schema_payload(
+                                self.config,
+                                recording_semantics="legacy_observation_action_provenance_unknown",
+                                control_step_aligned=False,
+                            ),
                         )
                         _append_jsonl(
                             self._work_root / "meta" / "mp_real" / "sessions.jsonl",
@@ -1506,6 +1538,14 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
                 if f"observation.images.{role}" in info["features"]:
                     info["features"][f"observation.images.{role}"]["info"] = metadata  # type: ignore[index]
         _write_json(self._work_root / "meta" / "info.json", info)
+        _write_json(
+            self._work_root / "meta" / "mp_real" / "schema.json",
+            _recording_schema_payload(
+                self.config,
+                recording_semantics=str(info["mp_real"]["recording_semantics"]),  # type: ignore[index]
+                control_step_aligned=control_step_aligned,
+            ),
+        )
         for task, task_index in sorted(tasks.items(), key=lambda item: item[1]):
             _append_jsonl(self._work_root / "meta" / "tasks.jsonl", {"task_index": task_index, "task": task})
         for episode_index, writer in sorted(non_empty.items()):
@@ -1562,29 +1602,11 @@ class LeRobotV21EpisodeRecorder(RuntimeEventSink):
         _write_json(self._work_root / "meta" / "info.json", info)
         _write_json(
             self._work_root / "meta" / "mp_real" / "schema.json",
-            {
-                "schema_version": MP_REAL_SCHEMA_VERSION,
-                "recorder_version": RECORDER_VERSION,
-                "recording_semantics": info["mp_real"]["recording_semantics"],  # type: ignore[index]
-                "control_step_aligned": control_step_aligned,
-                "policy_observation_reuse_possible": not control_step_aligned,
-                "action_source": "executed_action",
-                "robot_name": self.config.robot_name,
-                "action_spec": dataclasses.asdict(self.config.action_spec),
-                "state_field_order": _field_names(
-                    self.config.action_spec.state_fields, self.config.action_spec.state_dim, "state"
-                ),
-                "action_field_order": _field_names(
-                    self.config.action_spec.action_fields, self.config.action_spec.action_dim, "action"
-                ),
-                "camera_roles": list(self.config.action_spec.camera_roles),
-                "max_camera_age_ns": self.config.max_camera_age_ns,
-                "telemetry": {
-                    "enabled": self.config.save_telemetry,
-                    "layout": "parts" if self.config.save_telemetry else "disabled",
-                    "part_size_steps": self.config.telemetry_part_size_steps if self.config.save_telemetry else 0,
-                },
-            },
+            _recording_schema_payload(
+                self.config,
+                recording_semantics=str(info["mp_real"]["recording_semantics"]),  # type: ignore[index]
+                control_step_aligned=control_step_aligned,
+            ),
         )
         for task, task_index in sorted(tasks.items(), key=lambda item: item[1]):
             _append_jsonl(self._work_root / "meta" / "tasks.jsonl", {"task_index": task_index, "task": task})
@@ -2099,14 +2121,35 @@ def _action_spec_from_recording_schema(root: Path, info: Mapping[str, Any]) -> A
     schema_path = root / "meta" / "mp_real" / "schema.json"
     if schema_path.is_file():
         try:
-            payload = _load_json(schema_path)["action_spec"]
+            schema_payload = _load_json(schema_path)
+            payload = schema_payload["action_spec"]
             if isinstance(payload, Mapping):
+                payload = _legacy_action_spec_payload(payload, schema_payload)
                 return ActionSpec.from_dict(payload)
         except (KeyError, TypeError, ValueError):
             # An invalid optional extension is represented by the conservative
             # unknown schema below and will be rejected by pose validation.
             pass
+    mp_real_info = info.get("mp_real", {})
+    if isinstance(mp_real_info, Mapping):
+        try:
+            payload = mp_real_info["action_spec"]
+            if isinstance(payload, Mapping):
+                payload = _legacy_action_spec_payload(payload, mp_real_info)
+                return ActionSpec.from_dict(payload)
+        except (KeyError, TypeError, ValueError):
+            pass
     return _action_spec_from_info(info)
+
+
+def _legacy_action_spec_payload(payload: Mapping[str, Any], container: Mapping[str, Any]) -> Mapping[str, Any]:
+    schema_version = int(container.get("schema_version", 0) or 0)
+    control_step_aligned = bool(container.get("control_step_aligned", False))
+    if schema_version >= MP_REAL_SCHEMA_VERSION and control_step_aligned:
+        return payload
+    adjusted = dict(payload)
+    adjusted.setdefault("action_mode", "unknown")
+    return adjusted
 
 
 def _action_spec_from_info(info: Mapping[str, Any]) -> ActionSpec:
@@ -2117,6 +2160,16 @@ def _action_spec_from_info(info: Mapping[str, Any]) -> ActionSpec:
     action_dim = int(action_feature["shape"][0])
     state_names = _read_feature_names(state_feature, state_dim, "state")
     action_names = _read_feature_names(action_feature, action_dim, "action")
+    mp_real_info = info.get("mp_real", {})
+    replay = mp_real_info.get("replay", {}) if isinstance(mp_real_info, Mapping) else {}
+    action_mode = "unknown"
+    arm_count = 0
+    gripper_indices: tuple[int, ...] = ()
+    if isinstance(replay, Mapping):
+        action_mode = str(replay.get("action_mode") or action_mode)
+        if replay.get("arm_count") is not None:
+            arm_count = int(replay["arm_count"])
+        gripper_indices = tuple(int(item) for item in replay.get("gripper_indices", ()))
     return ActionSpec(
         action_dim=action_dim,
         state_dim=state_dim,
@@ -2129,6 +2182,9 @@ def _action_spec_from_info(info: Mapping[str, Any]) -> ActionSpec:
         ),
         state_fields=tuple(VectorField(name, "unknown", "unknown") for name in state_names),
         action_fields=tuple(VectorField(name, "unknown", "unknown") for name in action_names),
+        action_mode=action_mode,
+        arm_count=arm_count,
+        gripper_indices=gripper_indices,
     )
 
 
@@ -2261,4 +2317,6 @@ def validate_lerobot_v21_dataset(root: Path | str, *, check_videos: bool = True)
             warnings.append(
                 "mp-real recording is not marked control_step_aligned; observation/action semantics are unknown"
             )
+    else:
+        warnings.append("non-mp-real or legacy dataset: recording semantics are unknown")
     return ValidationReport(path, not errors, tuple(errors), tuple(warnings), len(episodes))

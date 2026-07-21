@@ -10,19 +10,17 @@ action with the per-joint mode, making the inactive arm a true no-op.
 from __future__ import annotations
 
 import argparse
+import json
+import shutil
 from collections import Counter
 from collections.abc import Iterable
 from datetime import datetime
-import json
 from pathlib import Path
-import shutil
-import sys
 from typing import Any
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-
 
 DEFAULT_COLUMNS = ("observation.state", "action")
 DEFAULT_DIMS = (0, 1, 2, 3, 4, 5)

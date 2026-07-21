@@ -390,7 +390,6 @@ class ReplayPlanner:
             arm_count, gripper_indices, gripper_semantics = ReplayPlanner._layout_metadata(source_spec, action=True)
             if arm_count <= 0:
                 errors.append(ReplaySafetyIssue("arm_count", "recorded action layout has no declared arms"))
-                arm_count = 1
             return ReplayActionSource(
                 action_source or "unknown",
                 action_mode or "unknown",
@@ -412,7 +411,6 @@ class ReplayPlanner:
         arm_count, gripper_indices, gripper_semantics = ReplayPlanner._layout_metadata(source_spec, action=False)
         if arm_count <= 0:
             errors.append(ReplaySafetyIssue("arm_count", "recorded state layout has no declared arms"))
-            arm_count = 1
         return StateTrajectorySource(source_spec, arm_count, gripper_indices, gripper_semantics)
 
     @staticmethod

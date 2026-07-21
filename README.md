@@ -11,6 +11,17 @@ cd mp-real
 uv sync
 ```
 
+The core install is for deployment, robot control, Web startup and camera
+preview. It intentionally does not install LeRobot Parquet/video dependencies.
+For recording, data inspection, data audit, offline viewing or open-loop
+evaluation, include the matching extra:
+
+```bash
+uv sync --extra recording
+uv sync --extra data
+uv sync --extra evaluation
+```
+
 Install every required extra in one `uv sync` command. Running separate
 `uv sync --extra ...` commands selects a new exact environment each time, so a
 later command can remove extras selected by an earlier one.
@@ -22,6 +33,7 @@ sync, then install the deployed `pyAgxArm` checkout as an editable package:
 # Piper + RealSense + faster Web JPEG encoding + local lint tools
 uv sync --extra piper --extra realsense --extra web --extra dev
 uv pip install -e /home/server/prj/pyAgxArm
+uv pip install   --python /home/server/prj/mp-real/.venv/bin/python   --editable /home/server/prj/pyAgxArm
 ```
 
 If the controller also needs RM2 and V4L2 support, include those extras in
@@ -56,6 +68,27 @@ parent/
 ```
 
 When `pyAgxArm` is deployed elsewhere, use its absolute path with `uv pip install -e` as shown above. The ROS camera backend uses the system ROS installation (`rospy`, `sensor_msgs`) and is deliberately not listed as a PyPI dependency. For RM2, source a copy of `configs/rm2.env.example` with the vendor SDK path before starting inference.
+
+## Capability Status
+
+Software paths with Mock/Fake coverage include the shared sync/RTC/infer-only
+runtime, Web resource lifecycle, EvaluationSession, LeRobot v2.1 recorder and
+reader, offline data view, open-loop evaluation, Baseline, plan integrity and
+delayed FakeRobot replay feedback.
+
+The RM2 CLI defaults match the operator-provided command that has been verified
+on real hardware with ROS cameras, `follow` command mode, `fps=10`,
+`replan_steps=10`, `speed_percent=35`, raw gripper units, static left-state and
+left-arm command disabled. H6 does not claim that RM2 Web replay,
+move-to-state or robot trajectory replay are hardware validated.
+
+H6 does not record a Piper hardware-validation pass. Piper deployment code is
+present and covered by software tests, but real move-to-state and replay remain
+behind hardening gates.
+
+Experimental and hardware-blocked capabilities are listed in
+[`robot_capability_matrix.md`](docs/robot_capability_matrix.md) and
+[`known_limitations.md`](docs/known_limitations.md).
 
 ## Adding A Robot
 
@@ -272,7 +305,7 @@ and clone operations are queued to a bounded background writer. Starting from
 a Baseline only creates a manual evaluation session. It does not warm up a
 policy, start an episode, or send an action. A changed runtime is rejected with
 a categorized configuration diff until the operator explicitly creates a
-derived Baseline. See `docs/baseline_workflow.md`, the Piper/RM2
+derived Baseline. See the [Baseline workflow](docs/en/baseline_workflow.md), the Piper/RM2
 [`robot_capability_matrix.md`](docs/robot_capability_matrix.md), and the
 [`piper_rm2_generality_audit.md`](docs/piper_rm2_generality_audit.md).
 
@@ -292,8 +325,9 @@ uv run mp-robot-replay \
 `--execute` additionally requires the exact reviewed `--confirm-plan-hash`.
 It creates no `PolicyClient` or camera, moves to the recorded start state at
 low speed, then waits for confirmation before sending trajectory targets.
-Review [the stage-10 hardware gates](docs/hardware_validation_stage_10.md)
-before any physical test.
+Review [`robot_replay_safety.md`](docs/robot_replay_safety.md) and
+[`hardware_validation_h5.md`](docs/hardware_validation_h5.md) before any
+physical test.
 
 ### Policy warmup and first action
 

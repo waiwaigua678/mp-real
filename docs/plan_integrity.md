@@ -16,6 +16,10 @@ The change does not alter replay acknowledgement semantics, gripper kinematic
 semantics, Piper/RM2 workspace validation, or hardware motion capability.
 Those remain H4/H5 work.
 
+H6 tightens the metadata that feeds these hashes: replay and recording
+metadata now come from `ActionSpec`, and legacy/unknown datasets remain
+explicitly unknown instead of being silently treated as current schemas.
+
 ## Immutability
 
 Plan-owned NumPy arrays are copied on construction and marked read-only with

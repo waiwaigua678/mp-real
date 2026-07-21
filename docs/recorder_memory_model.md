@@ -5,6 +5,10 @@ semantics: `observation.state` and `action` still describe the executed
 control step. The mp-real telemetry extension now streams bounded part files
 instead of keeping whole-episode telemetry in memory.
 
+H6 keeps Parquet and video dependencies outside the core deployment install.
+Recording, validation, inspection, audit and offline data viewing require a
+data extra such as `uv sync --extra recording`.
+
 ## Pre-H2 Growth Model
 
 The old recorder worker kept several episode-scoped structures until recorder

@@ -68,8 +68,14 @@ Finalized H2-aligned recordings set:
 - `mp_real.control_step_aligned = true`
 - `mp_real.policy_observation_reuse_possible = false`
 - `mp_real.telemetry.layout = parts`
+- `mp_real.action_spec = ActionSpec.to_dict()`
+- `mp_real.replay.action_source = executed_action`
+- `mp_real.replay.action_mode`, `joint_unit`, `arm_count` and
+  `gripper_indices` from the actual `ActionSpec`
 
 Datasets produced through the legacy observation/action event assembler are finalized with unknown control-step semantics and must be audited before training.
+Readers keep legacy/unknown datasets readable, but do not infer missing
+control-step observations or motion layout from incomplete metadata.
 
 Schema v2 single-file telemetry remains readable for compatibility. Schema v3
 streams telemetry under `telemetry/chunk-*/episode_*/part_*.npz` with an

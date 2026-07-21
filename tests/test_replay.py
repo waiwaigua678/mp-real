@@ -755,8 +755,13 @@ class ReplayControllerTests(unittest.TestCase):
             self.assertTrue(writer.stop(result=controller.cursor().state.value, timeout=2.0))
             record = Path(directory) / f"replay-{plan.plan_id}"
             self.assertTrue(record.is_dir())
-            manifest = (record / "manifest.json").read_text(encoding="utf-8")
-            self.assertIn(plan.plan_hash, manifest)
+            manifest = json.loads((record / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["plan_hash"], plan.plan_hash)
+            cursors = manifest["tracking_cursors"]
+            self.assertIn("sent_sample_index", cursors)
+            self.assertIn("feedback_sample_index", cursors)
+            self.assertIn("acknowledged_sample_index", cursors)
+            self.assertEqual(cursors["acknowledged_sample_index"], plan.end_sample)
             self.assertIn("replay_step", (record / "events.jsonl").read_text(encoding="utf-8"))
 
     def test_h3_replay_rehashes_before_arm_execute_resume_and_stale_identity(self) -> None:

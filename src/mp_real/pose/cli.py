@@ -6,7 +6,6 @@ import argparse
 import logging
 from pathlib import Path
 
-from mp_real.data.lerobot_v21 import LeRobotV21EpisodeSource
 from mp_real.data.pose import recorded_pose_target
 from mp_real.pose.config import load_pose_mapping_config
 from mp_real.pose.controller import PoseMoveController
@@ -41,6 +40,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("episode-index and sample-index must be non-negative")
     if not 0 < args.speed_scale <= 1:
         raise ValueError("speed-scale must be in (0, 1]")
+
+    from mp_real.data.lerobot_v21 import LeRobotV21EpisodeSource
 
     source = LeRobotV21EpisodeSource(args.dataset)
     try:

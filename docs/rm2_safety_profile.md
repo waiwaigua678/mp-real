@@ -77,3 +77,6 @@ RM2 real motion remains hardware blocked until a reviewed profile supplies real
 joint limits, health error mapping, freshness semantics and all required
 operator safety gates pass.
 
+Any change to RM2 `ActionSpec` metadata, safety policy or safety profile
+requires a fresh pose/replay plan. H6 metadata fixes do not grandfather older
+unknown-schema recordings into hardware-safe data.
