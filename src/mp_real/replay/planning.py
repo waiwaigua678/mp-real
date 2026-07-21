@@ -24,6 +24,8 @@ from mp_real.replay.models import (
     new_plan_identity,
 )
 from mp_real.runtime.models import ActionSpec
+from mp_real.safety.models import RobotSafetyProfile
+from mp_real.safety.validation import validate_motion_safety
 
 
 class ReplayPlanner:
@@ -48,6 +50,7 @@ class ReplayPlanner:
         constraints: ReplayConstraints | None = None,
         generation_id: int = 1,
         resource_owner_id: str | None = None,
+        safety_profile: RobotSafetyProfile | None = None,
     ) -> ReplayPlanningResult:
         constraints = constraints or ReplayConstraints()
         errors: list[ReplaySafetyIssue] = []
@@ -187,6 +190,38 @@ class ReplayPlanner:
                     f"maximum acceleration {max_acceleration:.6f} exceeds {constraints.max_acceleration:.6f}",
                 )
             )
+        safety_unavailable: list[ReplaySafetyIssue] = []
+        safety_passed: list[ReplaySafetyIssue] = []
+        safety_policy: str | None = None
+        safety_profile_hash: str | None = None
+        safety_profile_payload: Mapping[str, Any] = {}
+        development_override: Mapping[str, Any] = {}
+        if safety_profile is not None:
+            target_fields = (
+                target_action_spec.action_fields
+                if mode is ReplayMode.COMMAND_REPLAY
+                else target_action_spec.state_fields
+            )
+            safety_report = validate_motion_safety(
+                profile=safety_profile,
+                action_spec=target_action_spec,
+                values=values,
+                state_fields=target_fields,
+                robot_name=robot_name,
+                robot_model=safety_profile.robot_model,
+                health=None,
+                require_hardware_motion_enabled=True,
+                recorded_trajectory_context=True,
+                sample_indices=[sample[0] for sample in samples],
+            )
+            errors.extend(_safety_to_replay(issue) for issue in safety_report.errors)
+            warnings.extend(_safety_to_replay(issue) for issue in safety_report.warnings)
+            safety_unavailable.extend(_safety_to_replay(issue) for issue in safety_report.unavailable_checks)
+            safety_passed.extend(_safety_to_replay(issue) for issue in safety_report.passed_checks)
+            safety_policy = safety_report.safety_policy
+            safety_profile_hash = safety_report.safety_profile_hash
+            safety_profile_payload = safety_report.safety_profile or {}
+            development_override = safety_report.development_override or {}
         dataset_hash = build_replay_source_hash(dataset_id, info, episode_index, start, end, samples, values)
         plan_id, session_id = new_plan_identity()
         plan = None
@@ -216,10 +251,14 @@ class ReplayPlanner:
                 constraints=constraints,
                 created_at_monotonic_ns=time.monotonic_ns(),
                 resource_owner_id=resource_owner_id,
+                safety_profile_hash=safety_profile_hash,
+                safety_policy=safety_policy,
             )
         report = ReplaySafetyReport(
             errors=tuple(errors),
             warnings=tuple(warnings),
+            unavailable_checks=tuple(safety_unavailable),
+            passed_checks=tuple(safety_passed),
             converted_fields=tuple(converted),
             skipped_fields=tuple(skipped),
             maximum_observed_delta=max_delta,
@@ -231,6 +270,10 @@ class ReplayPlanner:
             plan_hash=plan.plan_hash if plan is not None else None,
             source_dataset_id=dataset_id,
             source_dataset_hash=dataset_hash,
+            safety_policy=safety_policy,
+            safety_profile_hash=safety_profile_hash,
+            safety_profile=safety_profile_payload,
+            development_override=development_override,
         )
         return ReplayPlanningResult(plan, report)
 
@@ -390,4 +433,15 @@ def build_replay_source_hash(
             "targets": targets,
             "expected_states": np.vstack([sample[4] for sample in samples]) if samples else np.empty((0, 0)),
         }
+    )
+
+
+def _safety_to_replay(issue: Any) -> ReplaySafetyIssue:
+    return ReplaySafetyIssue(
+        code=str(issue.code),
+        message=str(issue.message),
+        sample_index=issue.sample_index,
+        dimension=issue.dimension,
+        severity=str(issue.severity),
+        source=issue.source,
     )

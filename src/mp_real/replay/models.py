@@ -72,6 +72,8 @@ class ReplaySafetyIssue:
     message: str
     sample_index: int | None = None
     dimension: int | None = None
+    severity: str = "error"
+    source: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -80,6 +82,8 @@ class ReplaySafetyReport:
 
     errors: tuple[ReplaySafetyIssue, ...] = ()
     warnings: tuple[ReplaySafetyIssue, ...] = ()
+    unavailable_checks: tuple[ReplaySafetyIssue, ...] = ()
+    passed_checks: tuple[ReplaySafetyIssue, ...] = ()
     converted_fields: tuple[str, ...] = ()
     skipped_fields: tuple[str, ...] = ()
     maximum_observed_delta: float | None = None
@@ -91,10 +95,20 @@ class ReplaySafetyReport:
     plan_hash: str | None = None
     source_dataset_id: str | None = None
     source_dataset_hash: str | None = None
+    safety_policy: str | None = None
+    safety_profile_hash: str | None = None
+    safety_profile: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    development_override: Mapping[str, Any] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "errors", tuple(self.errors))
+        object.__setattr__(self, "warnings", tuple(self.warnings))
+        object.__setattr__(self, "unavailable_checks", tuple(self.unavailable_checks))
+        object.__setattr__(self, "passed_checks", tuple(self.passed_checks))
         object.__setattr__(self, "start_state", readonly_optional_array(self.start_state))
         object.__setattr__(self, "end_state", readonly_optional_array(self.end_state))
+        object.__setattr__(self, "safety_profile", freeze_jsonish(self.safety_profile))
+        object.__setattr__(self, "development_override", freeze_jsonish(self.development_override))
 
     @property
     def valid(self) -> bool:
@@ -235,6 +249,8 @@ class ReplayPlan:
     created_at_monotonic_ns: int
     plan_hash: str = ""
     safety_flags: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    safety_profile_hash: str | None = None
+    safety_policy: str | None = None
     resource_owner_id: str | None = None
     resource_lease_id: str | None = None
     source_data_identity: Mapping[str, Any] = dataclasses.field(default_factory=dict)
@@ -319,6 +335,8 @@ class ReplayPlan:
             "steps": [step.canonical_payload() for step in self.steps],
             "constraints": self.constraints,
             "safety_flags": self.safety_flags,
+            "safety_profile_hash": self.safety_profile_hash,
+            "safety_policy": self.safety_policy,
             "resource_owner_id": self.resource_owner_id,
             "resource_lease_id": self.resource_lease_id,
             "created_from_robot_state_hash": self.created_from_robot_state_hash,
@@ -347,6 +365,8 @@ class ReplayPlan:
         resource_owner_id: str | None = None,
         resource_lease_id: str | None = None,
         created_from_robot_state_hash: str | None = None,
+        safety_profile_hash: str | None = None,
+        safety_policy: str | None = None,
     ) -> ReplayPlan:
         return dataclasses.replace(
             self,
@@ -358,6 +378,8 @@ class ReplayPlan:
                 if created_from_robot_state_hash is None
                 else created_from_robot_state_hash
             ),
+            safety_profile_hash=self.safety_profile_hash if safety_profile_hash is None else safety_profile_hash,
+            safety_policy=self.safety_policy if safety_policy is None else safety_policy,
             plan_hash="",
         )
 

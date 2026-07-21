@@ -14,6 +14,7 @@ from mp_real.pose.models import (
     PosePlanStaleError,
 )
 from mp_real.robots.pose import PoseControlCapability
+from mp_real.safety.models import profile_for_robot
 
 
 class PoseMoveController:
@@ -35,6 +36,14 @@ class PoseMoveController:
 
     def revalidate(self, plan: MoveToRecordedStatePlan) -> None:
         plan.require_integrity(check_expiration=True)
+        profile = profile_for_robot(self._capability)
+        if plan.safety_profile_hash is not None:
+            if profile is None:
+                raise PosePlanStaleError("connected robot does not expose the reviewed safety profile")
+            if profile.profile_hash != plan.safety_profile_hash:
+                raise PosePlanStaleError("connected robot safety profile changed after plan generation")
+            if plan.safety_policy is not None and profile.policy.value != plan.safety_policy:
+                raise PosePlanStaleError("connected robot safety policy changed after plan generation")
         current = self._capability.get_current_pose_state()
         values = np.asarray(current.values, dtype=np.float32)
         expected = np.asarray(plan.current_state.values, dtype=np.float32)

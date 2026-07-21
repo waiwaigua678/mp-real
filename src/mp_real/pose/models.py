@@ -212,6 +212,24 @@ class PoseValidationReport:
     issues: tuple[PoseValidationIssue, ...] = ()
     warnings: tuple[PoseValidationIssue, ...] = ()
     mapping_fingerprint: str | None = None
+    unavailable_checks: tuple[PoseValidationIssue, ...] = ()
+    passed_checks: tuple[PoseValidationIssue, ...] = ()
+    safety_policy: str | None = None
+    safety_profile_hash: str | None = None
+    safety_profile: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    development_override: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "issues", tuple(self.issues))
+        object.__setattr__(self, "warnings", tuple(self.warnings))
+        object.__setattr__(self, "unavailable_checks", tuple(self.unavailable_checks))
+        object.__setattr__(self, "passed_checks", tuple(self.passed_checks))
+        object.__setattr__(self, "safety_profile", freeze_jsonish(self.safety_profile))
+        object.__setattr__(self, "development_override", freeze_jsonish(self.development_override))
+
+    @property
+    def errors(self) -> tuple[PoseValidationIssue, ...]:
+        return self.issues
 
     @property
     def valid(self) -> bool:
@@ -304,6 +322,8 @@ class MoveToRecordedStatePlan:
     created_at_monotonic_ns: int
     plan_hash: str = ""
     safety_flags: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    safety_profile_hash: str | None = None
+    safety_policy: str | None = None
     resource_owner_id: str | None = None
     resource_lease_id: str | None = None
     created_from_robot_state_hash: str | None = None
@@ -361,6 +381,8 @@ class MoveToRecordedStatePlan:
         generation_id: int = 0,
         resource_owner_id: str | None = None,
         resource_lease_id: str | None = None,
+        safety_profile_hash: str | None = None,
+        safety_policy: str | None = None,
     ) -> MoveToRecordedStatePlan:
         now_ns = time.monotonic_ns()
         current = np.asarray(current_state.values, dtype=np.float32)
@@ -431,6 +453,8 @@ class MoveToRecordedStatePlan:
             created_at_monotonic_ns=now_ns,
             resource_owner_id=resource_owner_id,
             resource_lease_id=resource_lease_id,
+            safety_profile_hash=safety_profile_hash,
+            safety_policy=safety_policy,
         )
 
     def canonical_payload(self) -> Mapping[str, Any]:
@@ -454,6 +478,8 @@ class MoveToRecordedStatePlan:
             "session_id": self.session_id,
             "generation_id": self.generation_id,
             "safety_flags": self.safety_flags,
+            "safety_profile_hash": self.safety_profile_hash,
+            "safety_policy": self.safety_policy,
             "resource_owner_id": self.resource_owner_id,
             "resource_lease_id": self.resource_lease_id,
             "created_from_robot_state_hash": self.created_from_robot_state_hash,

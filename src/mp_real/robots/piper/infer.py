@@ -32,6 +32,16 @@ from mp_real.runtime.inference import run_rtc_loop as run_generic_rtc_loop
 from mp_real.runtime.inference import run_sync_loop as run_generic_sync_loop
 from mp_real.runtime.models import ActionSpec, ObservationSnapshot, RobotState, VectorField
 from mp_real.runtime.observation import capture_observation
+from mp_real.safety.models import (
+    ArmHealthSnapshot,
+    DevelopmentOverride,
+    RobotHealthSnapshot,
+    RobotSafetyProfile,
+    SafetyPolicy,
+    health_from_state_mapping,
+    load_robot_safety_profile,
+)
+from mp_real.safety.validation import validate_motion_safety
 
 CameraBackend = Literal["realsense", "v4l2", "black"]
 ArmCommandMode = Literal["move_j", "move_js", "auto"]
@@ -154,6 +164,16 @@ class Args:
     hold_last_action: bool = True
     # Log producer inference time and control-loop timing.
     log_timing: bool = True
+    # Optional JSON RobotSafetyProfile. Without this, true joint/workspace limits remain unavailable.
+    safety_profile_path: pathlib.Path | None = None
+    # Default real-robot safety policy.
+    safety_policy: SafetyPolicy = SafetyPolicy.STRICT
+    # Explicit operator identity required when safety_policy=development_override.
+    safety_override_operator: str | None = None
+    # Explicit reason required when safety_policy=development_override.
+    safety_override_reason: str | None = None
+    # Real hardware motion remains blocked until an audited profile enables it.
+    hardware_motion_enabled: bool = False
 
 
 @dataclasses.dataclass
@@ -172,6 +192,7 @@ class PiperRobot(Robot):
     right: PiperArm
     args: Args
     robot_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    safety_profile: RobotSafetyProfile | None = None
     action_spec: ActionSpec = dataclasses.field(
         default_factory=lambda: ActionSpec(
             action_dim=14,
@@ -185,12 +206,15 @@ class PiperRobot(Robot):
     )
 
     def read_state(self) -> RobotState:
-        values = read_state(self.left, self.right, self.args, robot_lock=self.robot_lock)
         timestamp_ns = time.monotonic_ns()
+        with self.robot_lock:
+            values = _read_state_unlocked(self.left, self.right, self.args)
+            health = piper_health_snapshot_unlocked(self.left, self.right, self.args, timestamp_ns)
         return RobotState(
             values=values,
             timestamp_monotonic=timestamp_ns / 1e9,
             timestamp_monotonic_ns=timestamp_ns,
+            health=health.to_dict(),
         )
 
     def execute_transition(self, previous: np.ndarray | None, target: np.ndarray) -> np.ndarray:
@@ -222,31 +246,43 @@ class PiperRobot(Robot):
         return self.read_state()
 
     def validate_pose_target(self, target: RecordedPoseTarget) -> PoseValidationReport:
-        del target
-        issues: list[PoseValidationIssue] = []
-        # No workspace FK or SDK stop primitive is assumed.  A deployed Piper
-        # integration must expose both before a real move is eligible.
-        if not all(callable(getattr(bundle.arm, "stop", None)) for bundle in (self.left, self.right)):
-            issues.append(PoseValidationIssue("stop_motion_unsupported", "Piper SDK stop() is unavailable"))
-        issues.append(
-            PoseValidationIssue(
-                "workspace_validation_unavailable",
-                "Piper workspace validation is not configured for this SDK deployment",
+        profile = self.get_safety_profile()
+        try:
+            current = self.get_current_pose_state()
+            health = health_from_state_mapping(current.health)
+        except BaseException as exc:
+            health = RobotHealthSnapshot(
+                "piper",
+                connected=False,
+                enabled=None,
+                healthy=False,
+                error_codes=(f"{type(exc).__name__}: {exc}",),
+                communication_status="read_state_error",
+                stop_capability=profile.stop_capability,
+                raw_status={"read_state_error": f"{type(exc).__name__}: {exc}"},
             )
+        safety = validate_motion_safety(
+            profile=profile,
+            action_spec=self.action_spec,
+            values=target.state_values,
+            state_fields=target.state_fields,
+            robot_name="piper",
+            robot_model="piper",
+            health=health,
+            require_hardware_motion_enabled=True,
         )
-        issues.extend(
-            (
-                PoseValidationIssue(
-                    "joint_limit_validation_unavailable",
-                    "Piper joint-limit validation is not configured for this SDK deployment",
-                ),
-                PoseValidationIssue(
-                    "health_validation_unavailable",
-                    "Piper health validation is not configured for this SDK deployment",
-                ),
-            )
+        return pose_report_from_safety(safety)
+
+    def get_safety_profile(self) -> RobotSafetyProfile:
+        observed_stop = all(callable(getattr(bundle.arm, "stop", None)) for bundle in (self.left, self.right))
+        profile = self.safety_profile or safety_profile_from_args(
+            self.args,
+            self.action_spec,
+            stop_capability=observed_stop,
         )
-        return PoseValidationReport(tuple(issues))
+        if self.safety_profile is not None and self.safety_profile.stop_capability is None:
+            profile = dataclasses.replace(profile, stop_capability=observed_stop)
+        return profile
 
     def plan_move_to_state(self, plan: MoveToRecordedStatePlan) -> MoveToRecordedStatePlan:
         if plan.target_state.shape != (self.action_spec.state_dim,):
@@ -345,6 +381,186 @@ def arm_diagnostics(arm: Any) -> str:
         except Exception as exc:
             diagnostics.append(f"{label}=<error {exc}>")
     return "; ".join(diagnostics) if diagnostics else "no diagnostics available"
+
+
+def safety_profile_from_args(
+    args: Args,
+    action_spec: ActionSpec | None = None,
+    *,
+    stop_capability: bool | None = None,
+) -> RobotSafetyProfile:
+    if args.safety_profile_path is not None:
+        return load_robot_safety_profile(args.safety_profile_path)
+    spec = action_spec or ActionSpec(
+        action_dim=14,
+        state_dim=14,
+        joint_dof_per_arm=6,
+        joint_unit="rad",
+        camera_roles=("cam_head", "cam_left_wrist", "cam_right_wrist"),
+        state_fields=_vector_fields(),
+        action_fields=_vector_fields(),
+    )
+    policy = (
+        args.safety_policy
+        if isinstance(args.safety_policy, SafetyPolicy)
+        else SafetyPolicy(str(args.safety_policy))
+    )
+    override = DevelopmentOverride(
+        enabled=policy is SafetyPolicy.DEVELOPMENT_OVERRIDE,
+        operator=args.safety_override_operator,
+        reason=args.safety_override_reason,
+    )
+    return RobotSafetyProfile.from_action_spec(
+        robot_name="piper",
+        robot_model="piper",
+        action_spec=spec,
+        stop_capability=stop_capability,
+        policy=policy,
+        development_override=override,
+        hardware_motion_enabled=args.hardware_motion_enabled,
+    )
+
+
+def pose_report_from_safety(report: Any) -> PoseValidationReport:
+    def convert(issue: Any) -> PoseValidationIssue:
+        return PoseValidationIssue(
+            code=str(issue.code),
+            message=str(issue.message),
+            dimension=issue.dimension,
+            severity=str(issue.severity),
+        )
+
+    return PoseValidationReport(
+        issues=tuple(convert(issue) for issue in report.errors),
+        warnings=tuple(convert(issue) for issue in report.warnings),
+        unavailable_checks=tuple(convert(issue) for issue in report.unavailable_checks),
+        passed_checks=tuple(convert(issue) for issue in report.passed_checks),
+        safety_policy=report.safety_policy,
+        safety_profile_hash=report.safety_profile_hash,
+        safety_profile=report.safety_profile or {},
+        development_override=report.development_override or {},
+    )
+
+
+def piper_health_snapshot_unlocked(
+    left: PiperArm,
+    right: PiperArm,
+    args: Args,
+    now_ns: int | None = None,
+) -> RobotHealthSnapshot:
+    del args
+    now_ns = time.monotonic_ns() if now_ns is None else now_ns
+    arms = {
+        bundle.name: _piper_arm_health_snapshot_unlocked(bundle, now_ns)
+        for bundle in (
+            left,
+            right,
+        )
+    }
+    error_codes = tuple(code for arm in arms.values() for code in arm.error_codes)
+    connected = _aggregate_bool(tuple(arm.connected for arm in arms.values()))
+    enabled = _aggregate_bool(tuple(arm.enabled for arm in arms.values()))
+    healthy_values = tuple(arm.healthy for arm in arms.values())
+    healthy = False if error_codes else _aggregate_bool(healthy_values)
+    ages = tuple(arm.last_feedback_age_s for arm in arms.values() if arm.last_feedback_age_s is not None)
+    stale_values = tuple(arm.stale_feedback for arm in arms.values())
+    stop_capability = _aggregate_bool(tuple(arm.stop_capability for arm in arms.values()))
+    return RobotHealthSnapshot(
+        robot_name="piper",
+        connected=connected,
+        enabled=enabled,
+        healthy=healthy,
+        error_codes=error_codes,
+        stale_feedback=(
+            False if stale_values and all(value is False for value in stale_values) else _aggregate_bool(stale_values)
+        ),
+        last_feedback_age_s=max(ages) if ages else None,
+        communication_status="ok" if connected is True else "unknown" if connected is None else "error",
+        stop_capability=stop_capability,
+        raw_status={"feedback_timestamp_source": "sdk_monotonic_if_available"},
+        arms=arms,
+    )
+
+
+def _piper_arm_health_snapshot_unlocked(bundle: PiperArm, now_ns: int) -> ArmHealthSnapshot:
+    raw: dict[str, Any] = {}
+    errors: list[str] = []
+    status_msg: Any | None = None
+    joint_msg: Any | None = None
+    try:
+        status = bundle.arm.get_arm_status()
+        status_msg = getattr(status, "msg", status)
+        raw["arm_status"] = short_repr(status_msg)
+    except Exception as exc:
+        errors.append(f"get_arm_status:{type(exc).__name__}:{exc}")
+        raw["arm_status_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        joint_msg = bundle.arm.get_joint_angles()
+        raw["joint_feedback"] = short_repr(getattr(joint_msg, "msg", joint_msg))
+    except Exception as exc:
+        errors.append(f"get_joint_angles:{type(exc).__name__}:{exc}")
+        raw["joint_feedback_error"] = f"{type(exc).__name__}: {exc}"
+    error_codes = tuple((*errors, *_error_codes_from_status(status_msg)))
+    last_feedback_age_s = _feedback_age_s(joint_msg, now_ns)
+    enabled = _first_optional_bool(status_msg, ("enabled", "is_enabled", "enable_state", "arm_enabled"))
+    explicit_healthy = _first_optional_bool(status_msg, ("healthy", "ok"))
+    connected = False if errors and joint_msg is None and status_msg is None else True
+    return ArmHealthSnapshot(
+        name=bundle.name,
+        connected=connected,
+        enabled=enabled,
+        healthy=False if error_codes else explicit_healthy,
+        error_codes=error_codes,
+        stale_feedback=None if last_feedback_age_s is None else False,
+        last_feedback_age_s=last_feedback_age_s,
+        communication_status="ok" if connected else "error",
+        stop_capability=callable(getattr(bundle.arm, "stop", None)),
+        raw_status=raw,
+    )
+
+
+def _first_optional_bool(value: Any, names: tuple[str, ...]) -> bool | None:
+    if value is None:
+        return None
+    for name in names:
+        if hasattr(value, name):
+            return bool(getattr(value, name))
+    return None
+
+
+def _error_codes_from_status(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    result: list[str] = []
+    for name in ("error_code", "err_code", "error", "err"):
+        raw = getattr(value, name, None)
+        if raw in (None, 0, "0", "", (), []):
+            continue
+        result.append(f"{name}={short_repr(raw)}")
+    return tuple(result)
+
+
+def _feedback_age_s(value: Any, now_ns: int) -> float | None:
+    for container in (value, getattr(value, "msg", None)):
+        if container is None:
+            continue
+        for name in ("timestamp_monotonic_ns", "monotonic_timestamp_ns", "feedback_monotonic_ns"):
+            timestamp = getattr(container, name, None)
+            if timestamp is not None:
+                return max(0.0, (now_ns - int(timestamp)) / 1e9)
+        for name in ("timestamp_monotonic", "feedback_monotonic"):
+            timestamp = getattr(container, name, None)
+            if timestamp is not None:
+                return max(0.0, now_ns / 1e9 - float(timestamp))
+    return None
+
+
+def _aggregate_bool(values: tuple[bool | None, ...]) -> bool | None:
+    if any(value is False for value in values):
+        return False
+    if values and all(value is True for value in values):
+        return True
+    return None
 
 
 def enable_arm_with_timeout(arm: Any, name: str, timeout_s: float) -> None:
@@ -867,6 +1083,7 @@ def create_robot(args: Args) -> PiperRobot:
 
 
 def main(args: Args) -> None:
+    safety_profile_from_args(args)
     loop_config = InferenceLoopConfig.from_args(args)
     loop_config.validate()
     if args.command_rate_hz <= 0:

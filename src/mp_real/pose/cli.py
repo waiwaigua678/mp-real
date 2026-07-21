@@ -58,7 +58,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"dataset={target.dataset_id} episode={target.episode_index} sample={target.sample_index}")
         print(f"recorded_robot={target.robot_name} state_schema={target.state_schema}")
         print(f"target_state={target.state_values.tolist()}")
-        for issue in (*validated.report.issues, *validated.report.warnings):
+        for issue in (
+            *validated.report.issues,
+            *validated.report.warnings,
+            *validated.report.unavailable_checks,
+            *validated.report.passed_checks,
+        ):
             print(f"{issue.severity.upper()} {issue.code}: {issue.message}")
         if not validated.report.valid:
             return 2
@@ -84,6 +89,13 @@ def main(argv: list[str] | None = None) -> int:
                 keep_gripper=args.keep_gripper,
             )
             capability_report = robot.validate_pose_target(target)
+            for issue in (
+                *capability_report.issues,
+                *capability_report.warnings,
+                *capability_report.unavailable_checks,
+                *capability_report.passed_checks,
+            ):
+                print(f"{issue.severity.upper()} {issue.code}: {issue.message}")
             capability_report.require_valid()
             plan = robot.plan_move_to_state(
                 MoveToRecordedStatePlan.build(
@@ -96,6 +108,8 @@ def main(argv: list[str] | None = None) -> int:
                     constraints=constraints,
                     safety_warnings=("vendor command speed capped at 10 percent",),
                     mapping_fingerprint=validated.report.mapping_fingerprint,
+                    safety_profile_hash=capability_report.safety_profile_hash,
+                    safety_policy=capability_report.safety_policy,
                 )
             )
             plan.require_integrity(check_expiration=True)

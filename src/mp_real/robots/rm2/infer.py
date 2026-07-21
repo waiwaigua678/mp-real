@@ -40,6 +40,16 @@ from mp_real.runtime.inference import run_rtc_loop as run_generic_rtc_loop
 from mp_real.runtime.inference import run_sync_loop as run_generic_sync_loop
 from mp_real.runtime.models import ActionSpec, ObservationSnapshot, RobotState, VectorField
 from mp_real.runtime.observation import capture_observation
+from mp_real.safety.models import (
+    ArmHealthSnapshot,
+    DevelopmentOverride,
+    RobotHealthSnapshot,
+    RobotSafetyProfile,
+    SafetyPolicy,
+    health_from_state_mapping,
+    load_robot_safety_profile,
+)
+from mp_real.safety.validation import validate_motion_safety
 
 
 def env_path(name: str) -> pathlib.Path | None:
@@ -130,6 +140,11 @@ class Args:
     hold_last_action: bool = True
     log_timing: bool = True
     profile_timing: bool = False
+    safety_profile_path: pathlib.Path | None = None
+    safety_policy: SafetyPolicy = SafetyPolicy.STRICT
+    safety_override_operator: str | None = None
+    safety_override_reason: str | None = None
+    hardware_motion_enabled: bool = False
 
 
 class RmRobotHandle(ctypes.Structure):
@@ -318,6 +333,54 @@ class RmArm:
             except Exception:
                 pass
 
+    def health_snapshot(self, args: Args, now_ns: int) -> ArmHealthSnapshot:
+        raw: dict[str, Any] = {"handle": getattr(self.handle.contents, "id", None) if self.handle else None}
+        errors: list[str] = []
+        state = RmCurrentArmState()
+        connected = self.handle is not None
+        if connected:
+            rc = self.sdk.lib.rm_get_current_arm_state(self.handle, ctypes.byref(state))
+            raw["rm_get_current_arm_state_rc"] = rc
+            if rc != 0:
+                errors.append(f"rm_get_current_arm_state={rc}")
+            else:
+                err_len = int(state.err.err_len)
+                raw["arm_state_errors"] = [int(state.err.err[index]) for index in range(min(err_len, 24))]
+                errors.extend(f"rm_err={code}" for code in raw["arm_state_errors"] if code)
+        gripper_raw: dict[str, Any] = {}
+        if connected:
+            gripper_state = RmGripperState()
+            rc = self.sdk.lib.rm_get_gripper_state(self.handle, ctypes.byref(gripper_state))
+            gripper_raw["rc"] = rc
+            if rc == 0:
+                gripper_raw.update(
+                    {
+                        "enable_state": int(gripper_state.enable_state),
+                        "status": int(gripper_state.status),
+                        "error": int(gripper_state.error),
+                        "mode": int(gripper_state.mode),
+                        "actpos": int(gripper_state.actpos),
+                    }
+                )
+                if gripper_state.error:
+                    errors.append(f"gripper_error={int(gripper_state.error)}")
+            else:
+                gripper_raw["error"] = f"rm_get_gripper_state={rc}"
+        raw["gripper"] = gripper_raw
+        del args, now_ns
+        return ArmHealthSnapshot(
+            name=self.name,
+            connected=connected,
+            enabled=None,
+            healthy=False if errors else None,
+            error_codes=tuple(errors),
+            stale_feedback=None,
+            last_feedback_age_s=None,
+            communication_status="ok" if connected and not errors else "error" if errors else "unknown",
+            stop_capability=callable(getattr(self, "stop", None)),
+            raw_status=raw,
+        )
+
     def _require_handle(self) -> None:
         if self.handle is None:
             raise RuntimeError(f"{self.name} arm is not connected")
@@ -329,6 +392,12 @@ class MockArm:
     joint_dof: int
     last_gripper: float
     joints: np.ndarray | None = None
+    connected: bool | None = True
+    enabled: bool | None = True
+    healthy: bool | None = True
+    error_codes: tuple[str, ...] = ()
+    last_feedback_age_s: float | None = 0.0
+    stop_capability: bool = True
 
     def connect(self) -> None:
         if self.joints is None:
@@ -355,7 +424,24 @@ class MockArm:
         self.last_gripper = float(np.clip(value, 0.0, 1.0))
 
     def stop(self) -> None:
+        if not self.stop_capability:
+            raise RuntimeError(f"{self.name} mock stop unavailable")
         pass
+
+    def health_snapshot(self, args: Args, now_ns: int) -> ArmHealthSnapshot:
+        del args, now_ns
+        return ArmHealthSnapshot(
+            name=self.name,
+            connected=self.connected,
+            enabled=self.enabled,
+            healthy=False if self.error_codes else self.healthy,
+            error_codes=self.error_codes,
+            stale_feedback=None if self.last_feedback_age_s is None else False,
+            last_feedback_age_s=self.last_feedback_age_s,
+            communication_status="ok" if self.connected else "error" if self.connected is False else "unknown",
+            stop_capability=self.stop_capability,
+            raw_status={"backend": "mock"},
+        )
 
 
 @dataclasses.dataclass
@@ -366,6 +452,7 @@ class Rm2Robot(Robot):
     right: Any
     args: Args
     robot_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    safety_profile: RobotSafetyProfile | None = None
     action_spec: ActionSpec = dataclasses.field(init=False)
 
     def __post_init__(self) -> None:
@@ -380,12 +467,22 @@ class Rm2Robot(Robot):
     )
 
     def read_state(self) -> RobotState:
-        values = read_state(self.left, self.right, self.args, robot_lock=self.robot_lock)
         timestamp_ns = time.monotonic_ns()
+        with self.robot_lock:
+            values = np.concatenate(
+                [
+                    robot_joints_to_policy(self.left.read_joints(), self.args),
+                    robot_joints_to_policy(self.right.read_joints(), self.args),
+                    np.asarray([self.left.read_gripper(self.args)], dtype=np.float32),
+                    np.asarray([self.right.read_gripper(self.args)], dtype=np.float32),
+                ]
+            ).astype(np.float32)
+            health = rm2_health_snapshot_unlocked(self.left, self.right, self.args, timestamp_ns)
         return RobotState(
             values=values,
             timestamp_monotonic=timestamp_ns / 1e9,
             timestamp_monotonic_ns=timestamp_ns,
+            health=health.to_dict(),
         )
 
     def execute_transition(self, previous: np.ndarray | None, target: np.ndarray) -> np.ndarray:
@@ -405,29 +502,43 @@ class Rm2Robot(Robot):
         return self.read_state()
 
     def validate_pose_target(self, target: RecordedPoseTarget) -> PoseValidationReport:
-        del target
-        issues: list[PoseValidationIssue] = []
-        if not all(callable(getattr(arm, "stop", None)) for arm in (self.left, self.right)):
-            issues.append(PoseValidationIssue("stop_motion_unsupported", "RM2 arm stop() is unavailable"))
-        issues.append(
-            PoseValidationIssue(
-                "workspace_validation_unavailable",
-                "RM2 workspace validation is not configured for this SDK deployment",
+        profile = self.get_safety_profile()
+        try:
+            current = self.get_current_pose_state()
+            health = health_from_state_mapping(current.health)
+        except BaseException as exc:
+            health = RobotHealthSnapshot(
+                "rm2",
+                connected=False,
+                enabled=None,
+                healthy=False,
+                error_codes=(f"{type(exc).__name__}: {exc}",),
+                communication_status="read_state_error",
+                stop_capability=profile.stop_capability,
+                raw_status={"read_state_error": f"{type(exc).__name__}: {exc}"},
             )
+        safety = validate_motion_safety(
+            profile=profile,
+            action_spec=self.action_spec,
+            values=target.state_values,
+            state_fields=target.state_fields,
+            robot_name="rm2",
+            robot_model="rm2",
+            health=health,
+            require_hardware_motion_enabled=True,
         )
-        issues.extend(
-            (
-                PoseValidationIssue(
-                    "joint_limit_validation_unavailable",
-                    "RM2 joint-limit validation is not configured for this SDK deployment",
-                ),
-                PoseValidationIssue(
-                    "health_validation_unavailable",
-                    "RM2 health validation is not configured for this SDK deployment",
-                ),
-            )
+        return pose_report_from_safety(safety)
+
+    def get_safety_profile(self) -> RobotSafetyProfile:
+        observed_stop = all(callable(getattr(arm, "stop", None)) for arm in (self.left, self.right))
+        profile = self.safety_profile or safety_profile_from_args(
+            self.args,
+            self.action_spec,
+            stop_capability=observed_stop,
         )
-        return PoseValidationReport(tuple(issues))
+        if self.safety_profile is not None and self.safety_profile.stop_capability is None:
+            profile = dataclasses.replace(profile, stop_capability=observed_stop)
+        return profile
 
     def plan_move_to_state(self, plan: MoveToRecordedStatePlan) -> MoveToRecordedStatePlan:
         if plan.target_state.shape != (self.action_spec.state_dim,):
@@ -612,6 +723,114 @@ def create_rm_arms(args: Args) -> tuple[Any, Any]:
 def close_arm(arm: Any | None) -> None:
     if arm is not None:
         arm.close()
+
+
+def safety_profile_from_args(
+    args: Args,
+    action_spec: ActionSpec | None = None,
+    *,
+    stop_capability: bool | None = None,
+) -> RobotSafetyProfile:
+    if args.safety_profile_path is not None:
+        return load_robot_safety_profile(args.safety_profile_path)
+    spec = action_spec or ActionSpec(
+        action_dim=action_dim(args),
+        state_dim=action_dim(args),
+        joint_dof_per_arm=args.joint_dof,
+        joint_unit=args.policy_joint_unit,
+        camera_roles=("left_color", "right_color", "head_color"),
+        state_fields=_vector_fields(args),
+        action_fields=_vector_fields(args),
+    )
+    policy = (
+        args.safety_policy
+        if isinstance(args.safety_policy, SafetyPolicy)
+        else SafetyPolicy(str(args.safety_policy))
+    )
+    override = DevelopmentOverride(
+        enabled=policy is SafetyPolicy.DEVELOPMENT_OVERRIDE,
+        operator=args.safety_override_operator,
+        reason=args.safety_override_reason,
+    )
+    return RobotSafetyProfile.from_action_spec(
+        robot_name="rm2",
+        robot_model="rm2",
+        action_spec=spec,
+        stop_capability=stop_capability,
+        policy=policy,
+        development_override=override,
+        hardware_motion_enabled=args.hardware_motion_enabled,
+    )
+
+
+def pose_report_from_safety(report: Any) -> PoseValidationReport:
+    def convert(issue: Any) -> PoseValidationIssue:
+        return PoseValidationIssue(
+            code=str(issue.code),
+            message=str(issue.message),
+            dimension=issue.dimension,
+            severity=str(issue.severity),
+        )
+
+    return PoseValidationReport(
+        issues=tuple(convert(issue) for issue in report.errors),
+        warnings=tuple(convert(issue) for issue in report.warnings),
+        unavailable_checks=tuple(convert(issue) for issue in report.unavailable_checks),
+        passed_checks=tuple(convert(issue) for issue in report.passed_checks),
+        safety_policy=report.safety_policy,
+        safety_profile_hash=report.safety_profile_hash,
+        safety_profile=report.safety_profile or {},
+        development_override=report.development_override or {},
+    )
+
+
+def rm2_health_snapshot_unlocked(left: Any, right: Any, args: Args, now_ns: int | None = None) -> RobotHealthSnapshot:
+    now_ns = time.monotonic_ns() if now_ns is None else now_ns
+    arms: dict[str, ArmHealthSnapshot] = {}
+    for arm in (left, right):
+        snapshot = getattr(arm, "health_snapshot", None)
+        if callable(snapshot):
+            arm_health = snapshot(args, now_ns)
+        else:
+            arm_health = ArmHealthSnapshot(
+                name=str(getattr(arm, "name", "unknown")),
+                connected=None,
+                enabled=None,
+                healthy=None,
+                communication_status="unknown",
+                stop_capability=callable(getattr(arm, "stop", None)),
+                raw_status={"health_snapshot": "unavailable"},
+            )
+        arms[arm_health.name] = arm_health
+    error_codes = tuple(code for arm in arms.values() for code in arm.error_codes)
+    connected = _aggregate_bool(tuple(arm.connected for arm in arms.values()))
+    enabled = _aggregate_bool(tuple(arm.enabled for arm in arms.values()))
+    healthy = False if error_codes else _aggregate_bool(tuple(arm.healthy for arm in arms.values()))
+    ages = tuple(arm.last_feedback_age_s for arm in arms.values() if arm.last_feedback_age_s is not None)
+    stale_values = tuple(arm.stale_feedback for arm in arms.values())
+    return RobotHealthSnapshot(
+        robot_name="rm2",
+        connected=connected,
+        enabled=enabled,
+        healthy=healthy,
+        error_codes=error_codes,
+        stale_feedback=(
+            False if stale_values and all(value is False for value in stale_values) else _aggregate_bool(stale_values)
+        ),
+        last_feedback_age_s=max(ages) if ages else None,
+        communication_status="ok" if connected is True else "error" if connected is False else "unknown",
+        stop_capability=_aggregate_bool(tuple(arm.stop_capability for arm in arms.values())),
+        raw_status={"feedback_timestamp_source": "sdk_unavailable"},
+        arms=arms,
+    )
+
+
+def _aggregate_bool(values: tuple[bool | None, ...]) -> bool | None:
+    if any(value is False for value in values):
+        return False
+    if values and all(value is True for value in values):
+        return True
+    return None
 
 
 def action_dim(args: Args) -> int:
@@ -948,6 +1167,7 @@ def validate_args(args: Args) -> None:
         raise ValueError("init joint tuples must contain at least joint_dof values")
     if args.command_rate_hz <= 0:
         raise ValueError("command_rate_hz must be positive")
+    safety_profile_from_args(args)
     InferenceLoopConfig.from_args(args).validate()
 
 

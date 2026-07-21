@@ -182,8 +182,15 @@ def _pose_validation_json(report: PoseValidationReport | None) -> dict[str, Any]
     return {
         "valid": report.valid,
         "mapping_fingerprint": report.mapping_fingerprint,
+        "safety_policy": report.safety_policy,
+        "safety_profile_hash": report.safety_profile_hash,
+        "safety_profile": _replay_json_safe(report.safety_profile),
+        "development_override": _replay_json_safe(report.development_override),
+        "errors": [dataclasses.asdict(issue) for issue in report.errors],
         "issues": [dataclasses.asdict(issue) for issue in report.issues],
         "warnings": [dataclasses.asdict(issue) for issue in report.warnings],
+        "unavailable_checks": [dataclasses.asdict(issue) for issue in report.unavailable_checks],
+        "passed_checks": [dataclasses.asdict(issue) for issue in report.passed_checks],
     }
 
 
@@ -204,6 +211,8 @@ def _pose_plan_json(plan: MoveToRecordedStatePlan | None) -> dict[str, Any] | No
         "expected_duration_s": plan.expected_duration_s,
         "waypoint_count": len(plan.waypoints),
         "safety_warnings": list(plan.safety_warnings),
+        "safety_policy": plan.safety_policy,
+        "safety_profile_hash": plan.safety_profile_hash,
         "required_confirmations": list(plan.required_confirmations),
     }
 
@@ -232,6 +241,8 @@ def _replay_plan_json(plan: ReplayPlan | None) -> dict[str, Any] | None:
         "speed_scale": plan.speed_scale,
         "expected_duration_s": plan.expected_duration_s,
         "step_count": len(plan.steps),
+        "safety_policy": plan.safety_policy,
+        "safety_profile_hash": plan.safety_profile_hash,
     }
 
 
@@ -544,6 +555,7 @@ class RobotWebRuntime:
         self._replay_record_root = pathlib.Path(replay_record_root) if replay_record_root is not None else None
         self._pose_target = None
         self._pose_validation: PoseValidationReport | None = None
+        self._pose_live_validation: PoseValidationReport | None = None
         self._pose_plan: MoveToRecordedStatePlan | None = None
         self._pose_robot: Robot | None = None
         self._pose_controller: PoseMoveController | None = None
@@ -1240,6 +1252,14 @@ class RobotWebRuntime:
             viewer = self._recorded_data_view
             profile = self._profile
             args = copy.deepcopy(self._args)
+            safety_profile = profile.safety_profile_for_args(args)
+            replay_safety_profile = (
+                safety_profile
+                if getattr(args, "safety_profile_path", None) is not None
+                or safety_profile.hardware_motion_enabled
+                or safety_profile.development_override.enabled
+                else None
+            )
             self._replay_generation_id += 1
             generation_id = self._replay_generation_id
             self._replay_stop_event.clear()
@@ -1265,6 +1285,7 @@ class RobotWebRuntime:
                     speed_scale,
                     generation_id,
                     self._resource_owner_id,
+                    replay_safety_profile,
                 ),
                 name=f"{profile.robot_name}-replay-plan-g{generation_id}",
                 daemon=False,
@@ -1288,6 +1309,7 @@ class RobotWebRuntime:
         speed_scale: float,
         generation_id: int,
         resource_owner_id: str,
+        safety_profile: Any,
     ) -> None:
         try:
             result = ReplayPlanner(viewer.replay_source(dataset_id)).plan(
@@ -1303,6 +1325,7 @@ class RobotWebRuntime:
                 speed_scale=speed_scale,
                 generation_id=generation_id,
                 resource_owner_id=resource_owner_id,
+                safety_profile=safety_profile,
             )
         except BaseException as exc:
             with self._lock:
@@ -1631,6 +1654,7 @@ class RobotWebRuntime:
         with self._lock:
             self._pose_target = target
             self._pose_validation = validation
+            self._pose_live_validation = None
             self._pose_plan = None
             self._pose_phase = "offline_preflighted" if validation.valid else "offline_rejected"
             self._pose_error = None if validation.valid else "; ".join(issue.message for issue in validation.issues)
@@ -1695,7 +1719,8 @@ class RobotWebRuntime:
                 mapping_config=self._pose_mapping_config,
             ).validate(target)
             validation.report.require_valid()
-            robot.validate_pose_target(target).require_valid()
+            capability_report = robot.validate_pose_target(target)
+            capability_report.require_valid()
             plan = MoveToRecordedStatePlan.build(
                 target=target,
                 current_state=robot.get_current_pose_state(),
@@ -1710,6 +1735,8 @@ class RobotWebRuntime:
                 generation_id=generation_id,
                 resource_owner_id=lease.owner_id,
                 resource_lease_id=lease.lease_id,
+                safety_profile_hash=capability_report.safety_profile_hash,
+                safety_policy=capability_report.safety_policy,
             )
             plan = robot.plan_move_to_state(plan)
             plan.require_integrity(check_expiration=True)
@@ -1736,6 +1763,7 @@ class RobotWebRuntime:
                 should_close = False
                 self._pose_robot = robot
                 self._pose_plan = plan
+                self._pose_live_validation = capability_report
                 self._pose_phase = "awaiting_move_confirmation"
                 self._pose_error = None
         if should_close:
@@ -2060,6 +2088,7 @@ class RobotWebRuntime:
                 if target is not None
                 else None,
                 "offline_validation": _pose_validation_json(self._pose_validation),
+                "live_validation": _pose_validation_json(self._pose_live_validation),
                 "plan": _pose_plan_json(plan),
                 "progress": {
                     "waypoint_index": progress.waypoint_index,
@@ -2588,6 +2617,7 @@ class RobotWebRuntime:
             self._pose_robot = None
             self._pose_lease = None
             self._pose_plan = None
+            self._pose_live_validation = None
             self._pose_progress = None
             self._pose_prepared = None
             self._pose_phase = "idle"
@@ -2824,6 +2854,7 @@ class RobotWebRuntime:
                 "robot": self._profile.robot_name,
                 "camera_roles": list(self._profile.camera_roles_for_args(self._args)),
                 "action_spec": dataclasses.asdict(self._profile.action_spec_for_args(self._args)),
+                "safety_profile": _replay_json_safe(self._profile.safety_profile_for_args(self._args).to_dict()),
                 "capabilities": dataclasses.asdict(self._profile.capabilities),
                 "runtime_mode": self._runtime_mode.value,
                 "phase": self._phase,

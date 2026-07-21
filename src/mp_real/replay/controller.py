@@ -28,6 +28,7 @@ from mp_real.replay.models import (
 from mp_real.robots.base import Robot
 from mp_real.robots.pose import PoseControlCapability
 from mp_real.runtime.models import RobotState
+from mp_real.safety.models import profile_for_robot
 
 ReplayRecordCallback = Callable[[Mapping[str, Any]], None]
 
@@ -211,7 +212,8 @@ class RobotReplayController:
         )
         validated = MoveToStateValidator(self._plan.robot_name, capability.action_spec).validate(target)
         validated.report.require_valid()
-        capability.validate_pose_target(target).require_valid()
+        capability_report = capability.validate_pose_target(target)
+        capability_report.require_valid()
         pose_constraints = self._plan.constraints.move_to_start_constraints or PoseMotionConstraints()
         move_plan = MoveToRecordedStatePlan.build(
             target=target,
@@ -225,6 +227,8 @@ class RobotReplayController:
             required_confirmations=("move_to_replay_start",),
             session_id=self._plan.session_id,
             generation_id=self._plan.generation_id,
+            safety_profile_hash=capability_report.safety_profile_hash,
+            safety_policy=capability_report.safety_policy,
         )
         move_plan = capability.plan_move_to_state(move_plan)
         controller = PoseMoveController(capability, thread_name=f"{self._thread_name}-move-to-start")
@@ -344,6 +348,18 @@ class RobotReplayController:
     def _require_action_spec(self) -> None:
         if self._robot.action_spec != self._plan.action_spec:
             raise ReplayPlanStaleError("connected robot ActionSpec does not match the reviewed replay plan")
+        self._require_safety_profile()
+
+    def _require_safety_profile(self) -> None:
+        if self._plan.safety_profile_hash is None:
+            return
+        profile = profile_for_robot(self._robot)
+        if profile is None:
+            raise ReplayPlanStaleError("connected robot does not expose the reviewed safety profile")
+        if profile.profile_hash != self._plan.safety_profile_hash:
+            raise ReplayPlanStaleError("connected robot safety profile changed after replay plan generation")
+        if self._plan.safety_policy is not None and profile.policy.value != self._plan.safety_policy:
+            raise ReplayPlanStaleError("connected robot safety policy changed after replay plan generation")
 
     def _check_health(self, state: RobotState) -> None:
         health = state.health

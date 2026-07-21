@@ -14,6 +14,7 @@ from mp_real.robots.registry import create_robot
 from mp_real.robots.rm2 import infer as infer_rm2
 from mp_real.runtime.config import InferenceLoopConfig
 from mp_real.runtime.models import ActionSpec, VectorField
+from mp_real.safety.models import RobotSafetyProfile
 from mp_real.web.runtime import CachedFrameObservationSource, WebInferenceAdapter
 
 
@@ -52,6 +53,7 @@ class RobotWebProfile:
         WebInferenceAdapter,
     ]
     make_loop_config: Callable[[Any], InferenceLoopConfig]
+    safety_profile_for_args: Callable[[Any], RobotSafetyProfile]
     validate_args: Callable[[Any], None]
     configure_reset: Callable[[Any], Any]
     baseline_config_for_args: Callable[[Any], Mapping[str, Mapping[str, Any]]]
@@ -145,6 +147,7 @@ def _piper_loop_config(args: infer_piper.Args) -> InferenceLoopConfig:
 def _piper_validate(args: infer_piper.Args) -> None:
     if args.command_rate_hz <= 0:
         raise ValueError("command_rate_hz must be positive")
+    infer_piper.safety_profile_from_args(args, _piper_action_spec(args))
     _piper_loop_config(args).validate()
 
 
@@ -189,6 +192,16 @@ def _piper_baseline_config(args: infer_piper.Args) -> Mapping[str, Mapping[str, 
             "initial_grippers": {"left": args.init_left_gripper, "right": args.init_right_gripper},
         },
         "safety_config": {
+            "policy": args.safety_policy.value
+            if hasattr(args.safety_policy, "value")
+            else str(args.safety_policy),
+            "profile_path": str(args.safety_profile_path) if args.safety_profile_path is not None else None,
+            "hardware_motion_enabled": args.hardware_motion_enabled,
+            "development_override": {
+                "enabled": str(args.safety_policy) == "development_override",
+                "operator": args.safety_override_operator,
+                "reason": args.safety_override_reason,
+            },
             "max_joint_step": args.max_joint_step,
             "max_action_step": args.max_action_step,
             "joint_deadband": args.joint_deadband,
@@ -309,6 +322,16 @@ def _rm2_baseline_config(args: infer_rm2.Args) -> Mapping[str, Mapping[str, Any]
             "initial_grippers": {"left": args.init_left_gripper, "right": args.init_right_gripper},
         },
         "safety_config": {
+            "policy": args.safety_policy.value
+            if hasattr(args.safety_policy, "value")
+            else str(args.safety_policy),
+            "profile_path": str(args.safety_profile_path) if args.safety_profile_path is not None else None,
+            "hardware_motion_enabled": args.hardware_motion_enabled,
+            "development_override": {
+                "enabled": str(args.safety_policy) == "development_override",
+                "operator": args.safety_override_operator,
+                "reason": args.safety_override_reason,
+            },
             "max_joint_step_deg": args.max_joint_step_deg,
             "max_action_step_deg": args.max_action_step_deg,
             "action_smoothing": args.action_smoothing,
@@ -331,6 +354,7 @@ PIPER_WEB_PROFILE = RobotWebProfile(
     camera_masks_for_args=_piper_camera_masks,
     make_adapter=_piper_adapter,
     make_loop_config=_piper_loop_config,
+    safety_profile_for_args=infer_piper.safety_profile_from_args,
     validate_args=_piper_validate,
     configure_reset=_piper_reset_args,
     baseline_config_for_args=_piper_baseline_config,
@@ -347,6 +371,7 @@ RM2_WEB_PROFILE = RobotWebProfile(
     camera_masks_for_args=_rm2_camera_masks,
     make_adapter=_rm2_adapter,
     make_loop_config=InferenceLoopConfig.from_args,
+    safety_profile_for_args=infer_rm2.safety_profile_from_args,
     validate_args=infer_rm2.validate_args,
     configure_reset=_rm2_reset_args,
     baseline_config_for_args=_rm2_baseline_config,
