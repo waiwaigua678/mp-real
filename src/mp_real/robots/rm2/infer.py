@@ -62,15 +62,16 @@ CameraBackend = Literal["ros", "realsense", "black"]
 ArmCommandMode = Literal["canfd", "follow", "movej"]
 RobotBackend = Literal["rm", "mock"]
 JointUnit = Literal["rad", "deg"]
+GripperUnit = Literal["raw", "normalized"]
 
 
 @dataclasses.dataclass
 class Args:
     """Run RM dual-arm VLA inference against an OpenPI websocket policy server."""
 
-    server_url: str = "ws://127.0.0.1:8000"
+    server_url: str = "ws://10.30.20.47:8000"
     api_key: str | None = None
-    prompt: str = "stack the bowls"
+    prompt: str = "Move the objects into the box using the right arm."
 
     rm_config: pathlib.Path | None = None
     rm_sdk_lib: pathlib.Path | None = None
@@ -80,6 +81,7 @@ class Args:
     arm_port: int | None = None
     joint_dof: int = 6
     policy_joint_unit: JointUnit = "rad"
+    policy_gripper_unit: GripperUnit = "raw"
 
     camera_backend: CameraBackend = "ros"
     cam_left_topic: str = "/camera_d435_0/color/image_raw"
@@ -98,8 +100,8 @@ class Args:
     resize_size: int = 224
 
     fps: float = 10.0
-    replan_steps: int = 5
-    max_steps: int | None = None
+    replan_steps: int = 10
+    max_steps: int | None = 1500
     use_rtc: bool = True
     rtc_replan_stride: int = 0
     rtc_prefetch_steps: int = 0
@@ -114,19 +116,30 @@ class Args:
     reset_only: bool = False
     init_left_joints: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     init_right_joints: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-    init_left_gripper: float = 1.0
-    init_right_gripper: float = 1.0
+    init_left_gripper: float = 0.0
+    init_right_gripper: float = 0.0
     read_gripper_state: bool = False
+    use_static_left_state: bool = True
+    static_left_joints: tuple[float, ...] = (
+        -0.2146873579,
+        -2.0904052776,
+        -0.2116336045,
+        1.3281718319,
+        -0.0628723487,
+        -0.0245347003,
+    )
 
-    arm_command: ArmCommandMode = "canfd"
-    speed_percent: int = 30
+    arm_command: ArmCommandMode = "follow"
+    command_left_arm: bool = False
+    command_right_arm: bool = True
+    speed_percent: int = 35
     movej_block: int = 0
-    canfd_follow: bool = True
+    canfd_follow: bool = False
     canfd_expand: int = 0
     canfd_trajectory_mode: int = 2
     canfd_smooth_radio: int = 20
-    max_joint_step_deg: float = 6.0
-    max_action_step_deg: float = 2.0
+    max_joint_step_deg: float = 0.0
+    max_action_step_deg: float = 0.0
     action_smoothing: float = 0.1
     gripper_smoothing: float = 0.0
     gripper_min: int = 1
@@ -283,9 +296,8 @@ class RmArm:
             return self.last_gripper
         state = RmGripperState()
         rc = self.sdk.lib.rm_get_gripper_state(self.handle, ctypes.byref(state))
-        if rc == 0 and state.actpos > 0:
-            denom = max(1, args.gripper_max - args.gripper_min)
-            self.last_gripper = float(np.clip((state.actpos - args.gripper_min) / denom, 0.0, 1.0))
+        if rc == 0:
+            self.last_gripper = gripper_position_to_policy(float(state.actpos), args)
         return self.last_gripper
 
     def command_joints(self, joints: np.ndarray, args: Args) -> None:
@@ -315,8 +327,8 @@ class RmArm:
 
     def command_gripper(self, value: float, args: Args) -> None:
         self._require_handle()
-        value = float(np.clip(value, 0.0, 1.0))
-        position = int(round(args.gripper_min + value * (args.gripper_max - args.gripper_min)))
+        value = clip_policy_gripper(value, args)
+        position = policy_gripper_to_robot_position(value, args)
         t0 = time.monotonic()
         rc = self.sdk.lib.rm_set_gripper_position(self.handle, position, False, int(args.gripper_timeout))
         elapsed = time.monotonic() - t0
@@ -420,8 +432,7 @@ class MockArm:
         self.joints = np.asarray(joints, dtype=np.float32)[: self.joint_dof].copy()
 
     def command_gripper(self, value: float, args: Args) -> None:
-        del args
-        self.last_gripper = float(np.clip(value, 0.0, 1.0))
+        self.last_gripper = clip_policy_gripper(value, args)
 
     def stop(self) -> None:
         if not self.stop_capability:
@@ -699,13 +710,13 @@ def create_rm_arms(args: Args) -> tuple[Any, Any]:
         left = MockArm(
             "left",
             args.joint_dof,
-            float(args.init_left_gripper),
+            clip_policy_gripper(float(args.init_left_gripper), args),
             np.asarray(args.init_left_joints[: args.joint_dof], dtype=np.float32),
         )
         right = MockArm(
             "right",
             args.joint_dof,
-            float(args.init_right_gripper),
+            clip_policy_gripper(float(args.init_right_gripper), args),
             np.asarray(args.init_right_joints[: args.joint_dof], dtype=np.float32),
         )
         left.connect()
@@ -713,8 +724,8 @@ def create_rm_arms(args: Args) -> tuple[Any, Any]:
         return left, right
     left_ip, right_ip, port = load_rm_connection(args)
     sdk = RmSdk(args.rm_sdk_lib)
-    left = RmArm("left", sdk, left_ip, port, args.joint_dof, float(args.init_left_gripper))
-    right = RmArm("right", sdk, right_ip, port, args.joint_dof, float(args.init_right_gripper))
+    left = RmArm("left", sdk, left_ip, port, args.joint_dof, clip_policy_gripper(args.init_left_gripper, args))
+    right = RmArm("right", sdk, right_ip, port, args.joint_dof, clip_policy_gripper(args.init_right_gripper, args))
     left.connect()
     right.connect()
     return left, right
@@ -752,7 +763,7 @@ def safety_profile_from_args(
         operator=args.safety_override_operator,
         reason=args.safety_override_reason,
     )
-    return RobotSafetyProfile.from_action_spec(
+    profile = RobotSafetyProfile.from_action_spec(
         robot_name="rm2",
         robot_model="rm2",
         action_spec=spec,
@@ -761,6 +772,17 @@ def safety_profile_from_args(
         development_override=override,
         hardware_motion_enabled=args.hardware_motion_enabled,
     )
+    if profile.gripper_indices and args.policy_gripper_unit == "raw":
+        return dataclasses.replace(
+            profile,
+            gripper_min=np.full(len(profile.gripper_indices), float(args.gripper_min), dtype=np.float32),
+            gripper_max=np.full(len(profile.gripper_indices), float(args.gripper_max), dtype=np.float32),
+            parameter_sources={
+                **profile.parameter_sources,
+                "gripper_range": "repository_configuration",
+            },
+        )
+    return profile
 
 
 def pose_report_from_safety(report: Any) -> PoseValidationReport:
@@ -844,10 +866,15 @@ def _vector_fields(args: Args) -> tuple[VectorField, ...]:
             VectorField(f"{arm}_joint_{index}", args.policy_joint_unit, "joint_position")
             for index in range(1, args.joint_dof + 1)
         )
+    gripper_unit = (
+        "raw_rm_gripper_position"
+        if args.policy_gripper_unit == "raw"
+        else "normalized_0_closed_1_open"
+    )
     fields.extend(
         (
-            VectorField("left_gripper", "normalized_0_closed_1_open", "gripper_open_fraction"),
-            VectorField("right_gripper", "normalized_0_closed_1_open", "gripper_open_fraction"),
+            VectorField("left_gripper", gripper_unit, "gripper_position"),
+            VectorField("right_gripper", gripper_unit, "gripper_position"),
         )
     )
     return tuple(fields)
@@ -873,11 +900,45 @@ def deg_limit_to_policy(limit_deg: float, args: Args) -> float:
     return float(limit_deg)
 
 
+def gripper_span(args: Args) -> float:
+    return float(max(1, args.gripper_max - args.gripper_min))
+
+
+def gripper_position_to_policy(position: float, args: Args) -> float:
+    if args.policy_gripper_unit == "raw":
+        return float(position)
+    value = (float(position) - float(args.gripper_min)) / gripper_span(args)
+    return float(np.clip(value, 0.0, 1.0))
+
+
+def clip_policy_gripper(value: float, args: Args) -> float:
+    value = float(value)
+    if args.policy_gripper_unit == "raw":
+        lo = min(0.0, float(args.gripper_min))
+        hi = float(args.gripper_max)
+        return float(np.clip(value, lo, hi))
+    return float(np.clip(value, 0.0, 1.0))
+
+
+def policy_gripper_to_robot_position(value: float, args: Args) -> int:
+    value = clip_policy_gripper(value, args)
+    if args.policy_gripper_unit == "raw":
+        value = float(np.clip(value, float(args.gripper_min), float(args.gripper_max)))
+        return int(round(value))
+    return int(round(args.gripper_min + value * gripper_span(args)))
+
+
+def left_state_joints(left: Any, args: Args) -> np.ndarray:
+    if args.use_static_left_state:
+        return np.asarray(args.static_left_joints[: args.joint_dof], dtype=np.float32)
+    return robot_joints_to_policy(left.read_joints(), args)
+
+
 def read_state(left: RmArm, right: RmArm, args: Args, *, robot_lock: threading.Lock | None = None) -> np.ndarray:
     def _read() -> np.ndarray:
         return np.concatenate(
             [
-                robot_joints_to_policy(left.read_joints(), args),
+                left_state_joints(left, args),
                 robot_joints_to_policy(right.read_joints(), args),
                 np.asarray([left.read_gripper(args)], dtype=np.float32),
                 np.asarray([right.read_gripper(args)], dtype=np.float32),
@@ -1005,13 +1066,15 @@ def _send_action_unlocked(
     action: np.ndarray, left: RmArm, right: RmArm, args: Args, *, send_gripper: bool = True
 ) -> None:
     lj, lg, rj, rg = action_to_targets(action, args)
-    left.last_gripper = float(np.clip(lg, 0.0, 1.0))
-    right.last_gripper = float(np.clip(rg, 0.0, 1.0))
+    left.last_gripper = clip_policy_gripper(lg, args)
+    right.last_gripper = clip_policy_gripper(rg, args)
     if args.dry_run:
         logging.info("dry-run left=%s lg=%.3f right=%s rg=%.3f", lj, left.last_gripper, rj, right.last_gripper)
         return
-    left.command_joints(policy_joints_to_robot(lj, args), args)
-    right.command_joints(policy_joints_to_robot(rj, args), args)
+    if args.command_left_arm:
+        left.command_joints(policy_joints_to_robot(lj, args), args)
+    if args.command_right_arm:
+        right.command_joints(policy_joints_to_robot(rj, args), args)
     if args.command_gripper and send_gripper:
         left.command_gripper(left.last_gripper, args)
         right.command_gripper(right.last_gripper, args)
@@ -1165,6 +1228,12 @@ def validate_args(args: Args) -> None:
         raise ValueError("joint_dof must be in [1, 7]")
     if len(args.init_left_joints) < args.joint_dof or len(args.init_right_joints) < args.joint_dof:
         raise ValueError("init joint tuples must contain at least joint_dof values")
+    if len(args.static_left_joints) < args.joint_dof:
+        raise ValueError("static_left_joints must contain at least joint_dof values")
+    if args.gripper_max <= args.gripper_min:
+        raise ValueError("gripper_max must be greater than gripper_min")
+    if not args.command_left_arm and not args.command_right_arm:
+        raise ValueError("at least one arm command must be enabled")
     if args.command_rate_hz <= 0:
         raise ValueError("command_rate_hz must be positive")
     safety_profile_from_args(args)
@@ -1180,6 +1249,23 @@ def create_robot(args: Args) -> Rm2Robot:
 
 def main(args: Args) -> None:
     validate_args(args)
+    logging.info(
+        "RM2 policy units: joints=%s gripper=%s; fps=%.3f replan_steps=%d arm_command=%s "
+        "command_left=%s command_right=%s prompt=%r",
+        args.policy_joint_unit,
+        args.policy_gripper_unit,
+        args.fps,
+        args.replan_steps,
+        args.arm_command,
+        args.command_left_arm,
+        args.command_right_arm,
+        args.prompt,
+    )
+    if args.use_static_left_state:
+        logging.info(
+            "Using static left state joints=%s",
+            np.asarray(args.static_left_joints[: args.joint_dof], dtype=np.float32),
+        )
     if args.robot_backend == "rm":
         args = resolve_rm_dependency_paths(args)
     loop_config = InferenceLoopConfig.from_args(args)

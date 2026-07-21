@@ -7,6 +7,9 @@ remain the only modules that talk to their SDKs.
 
 from mp_real.replay.controller import RobotReplayController
 from mp_real.replay.models import (
+    ReplayAcknowledgementStrategy,
+    ReplayCommandRecord,
+    ReplayFeedbackRecord,
     ReplayPlan,
     ReplaySafetyReport,
     ReplayState,
@@ -16,6 +19,9 @@ from mp_real.replay.models import (
 from mp_real.replay.planning import ReplayPlanner
 
 __all__ = [
+    "ReplayAcknowledgementStrategy",
+    "ReplayCommandRecord",
+    "ReplayFeedbackRecord",
     "ReplayPlan",
     "ReplayPlanner",
     "ReplaySafetyReport",

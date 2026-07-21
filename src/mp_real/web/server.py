@@ -72,6 +72,8 @@ from mp_real.pose.models import (
 from mp_real.pose.validation import MoveToStateValidator
 from mp_real.replay.controller import RobotReplayController
 from mp_real.replay.models import (
+    ReplayAcknowledgementStrategy,
+    ReplayConstraints,
     ReplayMode,
     ReplayPlan,
     ReplayPlanStaleError,
@@ -104,6 +106,10 @@ from mp_real.web.resources import (
 CAMERA_NAMES = ("cam_head", "cam_left_wrist", "cam_right_wrist")
 CAMERA_BACKENDS = ("realsense", "v4l2", "black")
 ARM_COMMAND_MODES = ("move_j", "move_js", "auto")
+RM2_ARM_COMMAND_MODES = ("canfd", "follow", "movej")
+RM2_CAMERA_BACKENDS = ("ros", "realsense", "black")
+RM2_POLICY_JOINT_UNITS = ("rad", "deg")
+RM2_POLICY_GRIPPER_UNITS = ("raw", "normalized")
 RESET_LEFT_JOINTS = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 RESET_RIGHT_JOINTS = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 RESET_LEFT_GRIPPER = 1.0
@@ -250,6 +256,80 @@ def _replay_cursor_json(cursor: RobotReplayCursor | None) -> dict[str, Any] | No
     return _replay_json_safe(cursor) if cursor is not None else None
 
 
+def _replay_progress_json(cursor: RobotReplayCursor | None) -> dict[str, Any] | None:
+    if cursor is None:
+        return None
+    return {
+        "sent": cursor.sent_progress_ratio,
+        "feedback": cursor.feedback_progress_ratio,
+        "acknowledged": cursor.acknowledged_progress_ratio,
+        "displayed": cursor.progress_ratio,
+        "planned_sample_index": cursor.planned_sample_index,
+        "sent_sample_index": cursor.sent_sample_index,
+        "feedback_sample_index": cursor.feedback_sample_index,
+        "acknowledged_sample_index": cursor.acknowledged_sample_index,
+        "displayed_sample_index": cursor.displayed_sample_index,
+        "lag_samples": cursor.lag_samples,
+        "acknowledgement_strategy": cursor.acknowledgement_strategy,
+    }
+
+
+def _replay_constraints_from_payload(payload: Mapping[str, Any]) -> ReplayConstraints:
+    kwargs: dict[str, Any] = {}
+    for field in (
+        "min_interval_s",
+        "max_interval_s",
+        "max_step",
+        "max_velocity",
+        "max_acceleration",
+        "tracking_tolerance",
+        "max_tracking_error",
+        "max_control_overrun_s",
+        "joint_max_step",
+        "joint_max_velocity",
+        "joint_max_acceleration",
+        "joint_tracking_error",
+        "gripper_max_step",
+        "gripper_settle_timeout_s",
+        "gripper_tracking_threshold",
+        "gripper_transition_hysteresis",
+        "feedback_poll_interval_s",
+        "acknowledgement_timeout_s",
+        "feedback_freshness_timeout_s",
+        "extreme_tracking_error",
+        "plan_expiration_s",
+    ):
+        value = payload.get(field)
+        if value is not None:
+            kwargs[field] = float(value)
+    for field in (
+        "lower_limits",
+        "upper_limits",
+        "joint_lower_limits",
+        "joint_upper_limits",
+        "gripper_min",
+        "gripper_max",
+    ):
+        value = payload.get(field)
+        if value is not None:
+            kwargs[field] = tuple(float(item) for item in value)
+    for field in ("gripper_indices",):
+        value = payload.get(field)
+        if value is not None:
+            kwargs[field] = tuple(int(item) for item in value)
+    for field in ("follower_window_samples", "state_trajectory_settle_cycles", "sustained_tracking_error_limit"):
+        value = payload.get(field)
+        if value is not None:
+            kwargs[field] = int(value)
+    if payload.get("acknowledgement_strategy") is not None:
+        kwargs["acknowledgement_strategy"] = ReplayAcknowledgementStrategy(str(payload["acknowledgement_strategy"]))
+    if payload.get("gripper_command_mode") is not None:
+        kwargs["gripper_command_mode"] = str(payload["gripper_command_mode"])
+    if payload.get("poll_feedback_while_paused") is not None:
+        kwargs["poll_feedback_while_paused"] = bool(payload["poll_feedback_while_paused"])
+    return ReplayConstraints(**kwargs)
+
+
 def _runtime_mode(value: Any) -> RuntimeMode:
     try:
         return RuntimeMode(str(value))
@@ -388,6 +468,29 @@ def _config_to_dict(
             "arm_port": args.arm_port,
             "joint_dof": args.joint_dof,
             "policy_joint_unit": args.policy_joint_unit,
+            "policy_gripper_unit": args.policy_gripper_unit,
+            "speed_percent": args.speed_percent,
+            "arm_command": args.arm_command,
+            "rm2_arm_command": args.arm_command,
+            "max_joint_step_deg": args.max_joint_step_deg,
+            "max_action_step_deg": args.max_action_step_deg,
+            "gripper_smoothing": args.gripper_smoothing,
+            "gripper_min": args.gripper_min,
+            "gripper_max": args.gripper_max,
+            "gripper_timeout": args.gripper_timeout,
+            "init_left_joints": args.init_left_joints,
+            "init_right_joints": args.init_right_joints,
+            "init_left_gripper": args.init_left_gripper,
+            "init_right_gripper": args.init_right_gripper,
+            "read_gripper_state": args.read_gripper_state,
+            "use_static_left_state": args.use_static_left_state,
+            "static_left_joints": args.static_left_joints,
+            "command_left_arm": args.command_left_arm,
+            "command_right_arm": args.command_right_arm,
+            "command_gripper": args.command_gripper,
+            "interpolate_actions": args.interpolate_actions,
+            "command_rate_hz": args.command_rate_hz,
+            "command_gripper_every_step": args.command_gripper_every_step,
             "cam_left_topic": args.cam_left_topic,
             "cam_right_topic": args.cam_right_topic,
             "cam_head_topic": args.cam_head_topic,
@@ -1069,11 +1172,22 @@ class RobotWebRuntime:
                 if field in payload:
                     value = str(payload[field]).strip()
                     setattr(args, field, pathlib.Path(value).expanduser() if value else None)
-            for field in ("fps", "camera_timeout", "action_smoothing", "gripper_smoothing"):
+            for field in (
+                "fps",
+                "camera_timeout",
+                "action_smoothing",
+                "gripper_smoothing",
+                "max_joint_step_deg",
+                "max_action_step_deg",
+                "command_rate_hz",
+                "rtc_exp_weight",
+            ):
                 if field in payload:
                     value = float(payload[field])
-                    if field in {"fps", "camera_timeout"} and value <= 0:
+                    if field in {"fps", "camera_timeout", "command_rate_hz"} and value <= 0:
                         raise ApiError(f"{field} must be positive")
+                    if field in {"max_joint_step_deg", "max_action_step_deg", "rtc_exp_weight"} and value < 0:
+                        raise ApiError(f"{field} must be non-negative")
                     setattr(args, field, value)
             for field in (
                 "replan_steps",
@@ -1084,23 +1198,72 @@ class RobotWebRuntime:
                 "joint_dof",
                 "rtc_replan_stride",
                 "rtc_prefetch_steps",
+                "speed_percent",
+                "gripper_min",
+                "gripper_max",
+                "gripper_timeout",
             ):
                 if field in payload:
                     value = int(payload[field])
-                    if value < 0 or (field not in {"rtc_replan_stride", "rtc_prefetch_steps"} and value == 0):
+                    if value < 0 or (
+                        field not in {"rtc_replan_stride", "rtc_prefetch_steps", "gripper_timeout"}
+                        and value == 0
+                    ):
                         raise ApiError(f"{field} must be positive")
                     setattr(args, field, value)
             if "max_steps" in payload:
                 args.max_steps = _coerce_optional_int(payload["max_steps"])
+            if "infer_only_chunks" in payload:
+                args.infer_only_chunks = int(payload["infer_only_chunks"])
+                if args.infer_only_chunks <= 0:
+                    raise ApiError("infer_only_chunks must be positive")
             if "camera_backend" in payload:
-                args.camera_backend = str(payload["camera_backend"])
+                value = str(payload["camera_backend"])
+                if value not in RM2_CAMERA_BACKENDS:
+                    raise ApiError(f"camera_backend must be one of {RM2_CAMERA_BACKENDS}")
+                args.camera_backend = value
             if "policy_joint_unit" in payload:
-                args.policy_joint_unit = str(payload["policy_joint_unit"])
+                value = str(payload["policy_joint_unit"])
+                if value not in RM2_POLICY_JOINT_UNITS:
+                    raise ApiError(f"policy_joint_unit must be one of {RM2_POLICY_JOINT_UNITS}")
+                args.policy_joint_unit = value
+            if "policy_gripper_unit" in payload:
+                value = str(payload["policy_gripper_unit"])
+                if value not in RM2_POLICY_GRIPPER_UNITS:
+                    raise ApiError(f"policy_gripper_unit must be one of {RM2_POLICY_GRIPPER_UNITS}")
+                args.policy_gripper_unit = value
+            arm_command_value = payload.get("rm2_arm_command", payload.get("arm_command"))
+            if arm_command_value is not None and str(arm_command_value):
+                value = str(arm_command_value)
+                if value not in RM2_ARM_COMMAND_MODES:
+                    raise ApiError(f"arm_command must be one of {RM2_ARM_COMMAND_MODES}")
+                args.arm_command = value
             if "arm_port" in payload:
                 args.arm_port = int(payload["arm_port"]) if payload["arm_port"] not in (None, "") else None
-            for field in ("dry_run", "infer_only", "use_rtc", "reset_on_start", "hold_last_action", "log_timing"):
+            for field in (
+                "dry_run",
+                "infer_only",
+                "use_rtc",
+                "reset_on_start",
+                "hold_last_action",
+                "log_timing",
+                "read_gripper_state",
+                "use_static_left_state",
+                "command_left_arm",
+                "command_right_arm",
+                "command_gripper",
+                "interpolate_actions",
+                "command_gripper_every_step",
+                "profile_timing",
+            ):
                 if field in payload:
                     setattr(args, field, _coerce_bool(payload[field]))
+            for field in ("init_left_joints", "init_right_joints", "static_left_joints"):
+                if field in payload:
+                    setattr(args, field, _coerce_float_tuple(payload[field], length=args.joint_dof, field=field))
+            for field in ("init_left_gripper", "init_right_gripper"):
+                if field in payload:
+                    setattr(args, field, float(payload[field]))
             for field in (
                 "policy_connect_timeout_s",
                 "policy_metadata_timeout_s",
@@ -1236,6 +1399,7 @@ class RobotWebRuntime:
         speed_scale = float(payload.get("speed_scale", 0.1))
         fps_value = payload.get("fps")
         fps = float(fps_value) if fps_value is not None else None
+        constraints = _replay_constraints_from_payload(payload)
         with self._lock:
             if self._recorded_data_view is None:
                 raise ApiError("No recorded-data root is configured for this Web server", HTTPStatus.CONFLICT)
@@ -1283,6 +1447,7 @@ class RobotWebRuntime:
                     timing_mode,
                     fps,
                     speed_scale,
+                    constraints,
                     generation_id,
                     self._resource_owner_id,
                     replay_safety_profile,
@@ -1307,6 +1472,7 @@ class RobotWebRuntime:
         timing_mode: ReplayTimingMode,
         fps: float | None,
         speed_scale: float,
+        constraints: ReplayConstraints,
         generation_id: int,
         resource_owner_id: str,
         safety_profile: Any,
@@ -1323,6 +1489,7 @@ class RobotWebRuntime:
                 timing_mode=timing_mode,
                 fps=fps,
                 speed_scale=speed_scale,
+                constraints=constraints,
                 generation_id=generation_id,
                 resource_owner_id=resource_owner_id,
                 safety_profile=safety_profile,
@@ -1601,6 +1768,7 @@ class RobotWebRuntime:
                 "plan": _replay_plan_json(self._replay_plan),
                 "safety_report": _replay_report_json(self._replay_report),
                 "cursor": _replay_cursor_json(cursor),
+                "progress": _replay_progress_json(cursor),
             }
 
     def _replay_active_locked(self) -> bool:

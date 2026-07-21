@@ -251,6 +251,11 @@ class WebRuntimeTests(unittest.TestCase):
                 and not runtime.replay_status()["view_cursor_locked"]
             )
             self.assertEqual(runtime.replay_status()["state"], "completed", runtime.replay_status())
+            progress = runtime.replay_status()["progress"]
+            self.assertEqual(progress["sent"], 1.0)
+            self.assertEqual(progress["feedback"], 1.0)
+            self.assertEqual(progress["acknowledged"], 1.0)
+            self.assertEqual(progress["displayed"], progress["acknowledged"])
             self.assertFalse(runtime.replay_status()["view_cursor_locked"])
             self.assertGreater(len(fake.executed), 0)
             self.assertEqual(factories["policy"], 0)

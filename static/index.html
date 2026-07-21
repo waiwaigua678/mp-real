@@ -100,6 +100,12 @@
             <button id="replayStopBtn" type="button" class="danger">停止</button>
             <button id="replayEmergencyBtn" type="button" class="danger">紧急停止</button>
           </div>
+          <div class="button-row replay-progress">
+            <span>sent <strong id="replaySentProgress">0%</strong></span>
+            <span>feedback <strong id="replayFeedbackProgress">0%</strong></span>
+            <span>ack <strong id="replayAckProgress">0%</strong></span>
+            <span>lag <strong id="replayLagSamples">0</strong></span>
+          </div>
           <pre class="metadata" id="replayDetails">未生成 replay plan</pre>
         </section>
 
@@ -348,11 +354,11 @@
               <span>速度 %</span>
               <input name="speed_percent" type="number" min="1" max="100" step="1" />
             </label>
-            <label>
+            <label data-piper-only="true">
               <span>关节反馈限幅</span>
               <input name="max_joint_step" type="number" step="0.01" />
             </label>
-            <label>
+            <label data-piper-only="true">
               <span>动作限幅</span>
               <input name="max_action_step" type="number" step="0.01" />
             </label>
@@ -360,7 +366,7 @@
               <span>动作平滑</span>
               <input name="action_smoothing" type="number" min="0" max="0.98" step="0.01" />
             </label>
-            <label>
+            <label data-piper-only="true">
               <span>关节死区</span>
               <input name="joint_deadband" type="number" min="0" step="0.001" />
             </label>
@@ -436,11 +442,11 @@
               <label><input name="policy_warmup_enabled" type="checkbox" data-connection-field="true" /> 启用预热</label>
               <label><input name="policy_prefetch_first_chunk" type="checkbox" data-connection-field="true" /> 预取首 chunk</label>
             </div>
-            <label data-deployment-only="true">
+            <label data-deployment-only="true" data-piper-only="true">
               <span>Enable 超时</span>
               <input name="enable_timeout_s" type="number" min="0" step="0.1" data-connection-field="true" />
             </label>
-            <label data-deployment-only="true">
+            <label data-deployment-only="true" data-piper-only="true">
               <span>Reset 超时</span>
               <input name="reset_timeout_s" type="number" min="0" step="0.1" data-connection-field="true" />
             </label>
@@ -496,12 +502,27 @@
             <label><span>Arm Port</span><input name="arm_port" type="number" min="1" step="1" /></label>
             <label><span>Joint DOF</span><input name="joint_dof" type="number" min="1" max="7" step="1" /></label>
             <label><span>Policy Unit</span><select name="policy_joint_unit"><option value="rad">rad</option><option value="deg">deg</option></select></label>
+            <label><span>Gripper Unit</span><select name="policy_gripper_unit"><option value="raw">raw</option><option value="normalized">normalized</option></select></label>
+            <label><span>Arm Command</span><select name="rm2_arm_command"><option value="follow">follow</option><option value="canfd">canfd</option><option value="movej">movej</option></select></label>
+            <label><span>反馈限幅 deg</span><input name="max_joint_step_deg" type="number" min="0" step="0.01" /></label>
+            <label><span>动作限幅 deg</span><input name="max_action_step_deg" type="number" min="0" step="0.01" /></label>
+            <label><span>左臂静态状态</span><input name="static_left_joints" type="text" /></label>
+            <label><span>夹爪最小</span><input name="gripper_min" type="number" step="1" /></label>
+            <label><span>夹爪最大</span><input name="gripper_max" type="number" step="1" /></label>
+            <label><span>夹爪超时</span><input name="gripper_timeout" type="number" min="0" step="1" /></label>
             <label><span>Left Topic</span><input name="cam_left_topic" type="text" /></label>
             <label><span>Right Topic</span><input name="cam_right_topic" type="text" /></label>
             <label><span>Head Topic</span><input name="cam_head_topic" type="text" /></label>
+            <div class="toggles wide">
+              <label><input name="use_static_left_state" type="checkbox" /> 静态左臂状态</label>
+              <label><input name="command_left_arm" type="checkbox" /> 下发左臂</label>
+              <label><input name="command_right_arm" type="checkbox" /> 下发右臂</label>
+              <label><input name="command_gripper" type="checkbox" /> 下发夹爪</label>
+              <label><input name="read_gripper_state" type="checkbox" /> 读取夹爪反馈</label>
+            </div>
           </section>
 
-          <section class="form-section" data-deployment-only="true" data-piper-only="true">
+          <section class="form-section" data-deployment-only="true">
             <h3>RTC / 插值</h3>
             <label>
               <span>RTC Stride</span>
@@ -519,7 +540,7 @@
               <span>下发频率</span>
               <input name="command_rate_hz" type="number" min="1" step="1" />
             </label>
-            <label>
+            <label data-piper-only="true">
               <span>Arm Command</span>
               <select name="arm_command">
                 <option value="move_j">move_j</option>
@@ -540,17 +561,17 @@
             </div>
           </section>
 
-          <section class="form-section" data-deployment-only="true" data-piper-only="true">
+          <section class="form-section" data-deployment-only="true">
             <h3>夹爪 / Reset</h3>
-            <label>
+            <label data-piper-only="true">
               <span>闭合角</span>
               <input name="gripper_closed_deg" type="number" step="0.1" />
             </label>
-            <label>
+            <label data-piper-only="true">
               <span>张开角</span>
               <input name="gripper_open_deg" type="number" step="0.1" />
             </label>
-            <label>
+            <label data-piper-only="true">
               <span>夹爪力</span>
               <input name="gripper_force" type="number" step="0.1" />
             </label>
@@ -576,7 +597,7 @@
             </label>
             <div class="toggles wide">
               <label><input name="reset_on_start" type="checkbox" data-connection-field="true" /> 启动归位</label>
-              <label><input name="enable_on_start" type="checkbox" data-connection-field="true" /> Enable</label>
+              <label data-piper-only="true"><input name="enable_on_start" type="checkbox" data-connection-field="true" /> Enable</label>
               <label><input name="dry_run" type="checkbox" /> Dry Run</label>
               <label><input name="infer_only" type="checkbox" /> Infer Only</label>
             </div>

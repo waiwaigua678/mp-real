@@ -222,20 +222,7 @@ def _piper_baseline_config(args: infer_piper.Args) -> Mapping[str, Mapping[str, 
 
 def _rm2_action_spec(args: infer_rm2.Args) -> ActionSpec:
     dimension = infer_rm2.action_dim(args)
-    fields = tuple(
-        [
-            *(
-                VectorField(f"left_joint_{index}", args.policy_joint_unit, "joint_position")
-                for index in range(1, args.joint_dof + 1)
-            ),
-            *(
-                VectorField(f"right_joint_{index}", args.policy_joint_unit, "joint_position")
-                for index in range(1, args.joint_dof + 1)
-            ),
-            VectorField("left_gripper", "normalized_0_closed_1_open", "gripper_open_fraction"),
-            VectorField("right_gripper", "normalized_0_closed_1_open", "gripper_open_fraction"),
-        ]
-    )
+    fields = infer_rm2._vector_fields(args)
     return ActionSpec(
         action_dim=dimension,
         state_dim=dimension,
@@ -315,9 +302,14 @@ def _rm2_baseline_config(args: infer_rm2.Args) -> Mapping[str, Mapping[str, Any]
             "connection": {"left_ip": args.left_ip, "right_ip": args.right_ip, "port": args.arm_port},
             "joint_dof": args.joint_dof,
             "policy_joint_unit": args.policy_joint_unit,
+            "policy_gripper_unit": args.policy_gripper_unit,
             "reset_on_start": args.reset_on_start,
             "speed_percent": args.speed_percent,
             "command": args.arm_command,
+            "command_left_arm": args.command_left_arm,
+            "command_right_arm": args.command_right_arm,
+            "use_static_left_state": args.use_static_left_state,
+            "static_left_joints": args.static_left_joints,
             "initial_joints": {"left": args.init_left_joints, "right": args.init_right_joints},
             "initial_grippers": {"left": args.init_left_gripper, "right": args.init_right_gripper},
         },

@@ -105,7 +105,7 @@ class ReplayRecordWriter:
                 stream.flush()
                 os.fsync(stream.fileno())
             manifest = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "kind": "mp_real_robot_trajectory_replay",
                 "source_dataset": self._plan.dataset_id,
                 "source_episode_index": self._plan.episode_index,
@@ -114,6 +114,7 @@ class ReplayRecordWriter:
                 "replay_mode": self._plan.mode.value,
                 "timing_mode": self._plan.timing_mode.value,
                 "speed_scale": self._plan.speed_scale,
+                "acknowledgement_strategy": self._plan.constraints.acknowledgement_strategy.value,
                 "plan_id": self._plan.plan_id,
                 "plan_hash": self._plan.plan_hash,
                 "session_id": self._plan.session_id,

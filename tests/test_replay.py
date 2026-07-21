@@ -15,6 +15,7 @@ from mp_real.data.models import FakeRecordedEpisodeSource, RecordedSample
 from mp_real.pose.models import PoseMoveProgress, PoseMoveResult, PoseValidationReport
 from mp_real.replay.controller import RobotReplayController
 from mp_real.replay.models import (
+    ReplayAcknowledgementStrategy,
     ReplayConstraints,
     ReplayMode,
     ReplayPlan,
@@ -45,22 +46,24 @@ def _source(
     info: dict | None = None,
     spec: ActionSpec | None = None,
     robot_name: str = "piper",
+    samples: tuple[RecordedSample, ...] | None = None,
 ) -> FakeRecordedEpisodeSource:
     action_spec = spec or _spec()
-    samples = tuple(
-        RecordedSample(
-            episode_index=0,
-            frame_index=index,
-            index=index,
-            timestamp=index * 0.02,
-            task_index=0,
-            state=np.asarray([index * 0.01, 1.0], dtype=np.float32),
-            action=np.asarray([index * 0.01, 1.0], dtype=np.float32),
-            images={},
-            telemetry={},
+    if samples is None:
+        samples = tuple(
+            RecordedSample(
+                episode_index=0,
+                frame_index=index,
+                index=index,
+                timestamp=index * 0.02,
+                task_index=0,
+                state=np.asarray([index * 0.01, 1.0], dtype=np.float32),
+                action=np.asarray([index * 0.01, 1.0], dtype=np.float32),
+                images={},
+                telemetry={},
+            )
+            for index in range(count)
         )
-        for index in range(count)
-    )
     return FakeRecordedEpisodeSource(action_spec, {0: samples}, robot_name=robot_name, info=info)
 
 
@@ -75,6 +78,25 @@ def _constraints() -> ReplayConstraints:
         max_tracking_error=0.1,
         max_control_overrun_s=0.5,
     )
+
+
+def _h5_constraints(**overrides: object) -> ReplayConstraints:
+    values = {
+        "min_interval_s": 0.001,
+        "max_interval_s": 0.2,
+        "max_step": 0.1,
+        "max_velocity": 10.0,
+        "max_acceleration": 1_000.0,
+        "tracking_tolerance": 0.03,
+        "max_tracking_error": 0.2,
+        "max_control_overrun_s": 0.5,
+        "feedback_poll_interval_s": 0.005,
+        "acknowledgement_timeout_s": 1.0,
+        "sustained_tracking_error_limit": 20,
+        "extreme_tracking_error": 1.0,
+    }
+    values.update(overrides)
+    return ReplayConstraints(**values)
 
 
 class _FakeReplayRobot:
@@ -142,6 +164,52 @@ class _FakeReplayRobot:
     def verify_target_reached(self, plan: object) -> PoseMoveResult:
         error = float(np.max(np.abs(self.state - plan.target_state)))
         return PoseMoveResult(plan.plan_id, "reached" if error <= 0.03 else "failed", self.read_state(), error)
+
+
+class _DelayedReplayRobot(_FakeReplayRobot):
+    def __init__(
+        self,
+        *,
+        feedback_cycles: int = 3,
+        stale_feedback: bool = False,
+        health_error: bool = False,
+    ) -> None:
+        super().__init__(stall=True)
+        self.feedback_cycles = feedback_cycles
+        self.stale_feedback = stale_feedback
+        self.health_error = health_error
+        self._target = self.state.copy()
+        self._remaining_feedback_cycles = 0
+
+    def read_state(self) -> RobotState:
+        if self._remaining_feedback_cycles > 0:
+            self.state = self.state + (self._target - self.state) / self._remaining_feedback_cycles
+            self._remaining_feedback_cycles -= 1
+        now_ns = time.monotonic_ns()
+        health = {
+            "robot_name": "piper",
+            "connected": True,
+            "enabled": True,
+            "healthy": not self.health_error,
+            "error_codes": ["fake_health_error"] if self.health_error else [],
+            "stale_feedback": self.stale_feedback,
+        }
+        source_timestamp_ns = now_ns - 1_000_000_000 if self.stale_feedback else now_ns
+        return RobotState(
+            self.state.copy(),
+            now_ns / 1e9,
+            now_ns,
+            source_timestamp_ns=source_timestamp_ns,
+            health=health,
+        )
+
+    def execute_transition(self, previous: np.ndarray | None, target: np.ndarray) -> np.ndarray:
+        del previous
+        target = np.asarray(target, dtype=np.float32).copy()
+        self.commands.append(target)
+        self._target = target
+        self._remaining_feedback_cycles = max(1, self.feedback_cycles)
+        return target
 
 
 def _wait(predicate: object, timeout: float = 2.0) -> None:
@@ -236,8 +304,8 @@ class ReplayPlanningTests(unittest.TestCase):
             constraints=ReplayConstraints(max_step=0.001, max_velocity=0.001, max_acceleration=0.001),
         )
         codes = {item.code for item in result.report.errors}
-        self.assertIn("max_step", codes)
-        self.assertIn("max_velocity", codes)
+        self.assertIn("joint_max_step", codes)
+        self.assertIn("joint_max_velocity", codes)
 
         limit_result = ReplayPlanner(_source()).plan(
             robot_name="piper",
@@ -251,7 +319,79 @@ class ReplayPlanningTests(unittest.TestCase):
                 upper_limits=(0.1, 0.5),
             ),
         )
-        self.assertTrue(any(item.code == "joint_limit_exceeded" for item in limit_result.report.errors))
+        self.assertTrue(any(item.code == "gripper_range" for item in limit_result.report.errors))
+
+    def test_h5_gripper_constraints_are_independent_from_joint_limits(self) -> None:
+        gripper_close = tuple(
+            RecordedSample(
+                episode_index=0,
+                frame_index=index,
+                index=index,
+                timestamp=index * 0.02,
+                task_index=0,
+                state=np.asarray([0.0, float(1 - index)], dtype=np.float32),
+                action=np.asarray([0.0, float(1 - index)], dtype=np.float32),
+                images={},
+                telemetry={},
+            )
+            for index in range(2)
+        )
+        result = ReplayPlanner(_source(samples=gripper_close)).plan(
+            robot_name="piper",
+            target_action_spec=_spec(),
+            episode_index=0,
+            speed_scale=1.0,
+            constraints=ReplayConstraints(
+                joint_max_step=0.05,
+                joint_max_velocity=10.0,
+                joint_max_acceleration=1_000.0,
+                gripper_min=(0.0,),
+                gripper_max=(1.0,),
+            ),
+        )
+        self.assertTrue(result.report.valid, result.report.errors)
+        self.assertEqual(result.report.maximum_observed_joint_delta, 0.0)
+        self.assertEqual(result.report.maximum_observed_gripper_delta, 1.0)
+
+        gripper_limited = ReplayPlanner(_source(samples=gripper_close)).plan(
+            robot_name="piper",
+            target_action_spec=_spec(),
+            episode_index=0,
+            speed_scale=1.0,
+            constraints=ReplayConstraints(
+                joint_max_step=0.05,
+                joint_max_velocity=10.0,
+                joint_max_acceleration=1_000.0,
+                gripper_min=(0.0,),
+                gripper_max=(1.0,),
+                gripper_max_step=0.25,
+            ),
+        )
+        self.assertTrue(any(item.code == "gripper_max_step" for item in gripper_limited.report.errors))
+
+        gripper_out_of_range = tuple(
+            dataclasses.replace(sample, action=np.asarray([0.0, 1.2], dtype=np.float32))
+            for sample in gripper_close
+        )
+        result = ReplayPlanner(_source(samples=gripper_out_of_range)).plan(
+            robot_name="piper",
+            target_action_spec=_spec(),
+            episode_index=0,
+            constraints=ReplayConstraints(gripper_min=(0.0,), gripper_max=(1.0,)),
+        )
+        self.assertTrue(any(item.code == "gripper_range" for item in result.report.errors))
+
+        joint_out_of_range = tuple(
+            dataclasses.replace(sample, action=np.asarray([0.2, 1.0], dtype=np.float32))
+            for sample in gripper_close
+        )
+        result = ReplayPlanner(_source(samples=joint_out_of_range)).plan(
+            robot_name="piper",
+            target_action_spec=_spec(),
+            episode_index=0,
+            constraints=ReplayConstraints(joint_lower_limits=(-0.1,), joint_upper_limits=(0.1,)),
+        )
+        self.assertTrue(any(item.code == "joint_limit_exceeded" for item in result.report.errors))
 
     def test_h3_replay_plan_arrays_are_readonly_and_inputs_are_copied(self) -> None:
         target = np.asarray([0.1, 1.0], dtype=np.float32)
@@ -354,7 +494,13 @@ class ReplayPlanningTests(unittest.TestCase):
 
 class ReplayControllerTests(unittest.TestCase):
     def _armed_controller(
-        self, *, start: int = 0, robot: _FakeReplayRobot | None = None, count: int = 8, speed_scale: float = 0.1
+        self,
+        *,
+        start: int = 0,
+        robot: _FakeReplayRobot | None = None,
+        count: int = 8,
+        speed_scale: float = 0.1,
+        constraints: ReplayConstraints | None = None,
     ) -> tuple[RobotReplayController, _FakeReplayRobot]:
         plan = (
             ReplayPlanner(_source(count=count))
@@ -364,7 +510,7 @@ class ReplayControllerTests(unittest.TestCase):
                 episode_index=0,
                 start_sample=start,
                 speed_scale=speed_scale,
-                constraints=_constraints(),
+                constraints=constraints or _constraints(),
             )
             .plan
         )
@@ -412,6 +558,145 @@ class ReplayControllerTests(unittest.TestCase):
         self.assertTrue(controller.join(timeout=2.0))
         self.assertEqual(controller.cursor().state, ReplayState.ABORTED)
         self.assertIn("tracking error", controller.cursor().message or "")
+
+    def test_h5_send_feedback_acknowledged_cursors_are_separate_and_recorded(self) -> None:
+        events: list[dict] = []
+        plan = (
+            ReplayPlanner(_source(count=4))
+            .plan(
+                robot_name="piper",
+                target_action_spec=_spec(),
+                episode_index=0,
+                speed_scale=1.0,
+                constraints=_h5_constraints(joint_tracking_error=0.0001, sustained_tracking_error_limit=50),
+            )
+            .plan
+        )
+        assert plan is not None
+        controller = RobotReplayController(_DelayedReplayRobot(feedback_cycles=3), plan, record_callback=events.append)
+        controller.prepare()
+        _wait(lambda: controller.cursor().state is ReplayState.ARMED)
+        controller.confirm_and_start(plan.plan_hash)
+        _wait(lambda: any(event["type"] == "replay_command_sent" for event in events))
+        command_event = next(event for event in events if event["type"] == "replay_command_sent")
+        self.assertEqual(command_event["cursors"]["sent_sample_index"], plan.start_sample)
+        self.assertIsNone(command_event["cursors"]["acknowledged_sample_index"])
+        self.assertTrue(controller.join(timeout=2.0, raise_on_error=True))
+        cursor = controller.cursor()
+        self.assertEqual(cursor.state, ReplayState.COMPLETED)
+        self.assertEqual(cursor.sent_sample_index, plan.end_sample)
+        self.assertEqual(cursor.feedback_sample_index, plan.end_sample)
+        self.assertEqual(cursor.acknowledged_sample_index, plan.end_sample)
+        self.assertEqual(cursor.displayed_sample_index, plan.end_sample)
+        self.assertEqual(cursor.progress_ratio, cursor.acknowledged_progress_ratio)
+        replay_step = next(event for event in events if event["type"] == "replay_step")
+        self.assertIn("sent_sample_index", replay_step["cursors"])
+        self.assertIn("feedback_sample_index", replay_step["cursors"])
+        self.assertIn("acknowledged_sample_index", replay_step["cursors"])
+
+    def test_h5_immediate_interface_ack_does_not_claim_state_arrival(self) -> None:
+        plan = (
+            ReplayPlanner(_source(count=2))
+            .plan(
+                robot_name="piper",
+                target_action_spec=_spec(),
+                episode_index=0,
+                speed_scale=1.0,
+                constraints=_h5_constraints(
+                    acknowledgement_strategy=ReplayAcknowledgementStrategy.IMMEDIATE_INTERFACE_ACK
+                ),
+            )
+            .plan
+        )
+        assert plan is not None
+        controller = RobotReplayController(_DelayedReplayRobot(feedback_cycles=10), plan)
+        controller.prepare()
+        _wait(lambda: controller.cursor().state is ReplayState.ARMED)
+        controller.confirm_and_start(plan.plan_hash)
+        self.assertTrue(controller.join(timeout=2.0, raise_on_error=True))
+        cursor = controller.cursor()
+        self.assertEqual(cursor.state, ReplayState.COMPLETED)
+        self.assertEqual(cursor.sent_sample_index, plan.end_sample)
+        self.assertIsNone(cursor.feedback_sample_index)
+        self.assertIsNone(cursor.acknowledged_sample_index)
+        self.assertEqual(cursor.acknowledged_progress_ratio, 0.0)
+
+    def test_h5_follower_window_and_state_settle_strategies_accept_delayed_feedback(self) -> None:
+        for strategy in (
+            ReplayAcknowledgementStrategy.FOLLOWER_WINDOW,
+            ReplayAcknowledgementStrategy.STATE_TRAJECTORY_SETTLE,
+        ):
+            with self.subTest(strategy=strategy):
+                controller, _ = self._armed_controller(
+                    robot=_DelayedReplayRobot(feedback_cycles=2),
+                    count=5,
+                    speed_scale=0.1,
+                    constraints=_h5_constraints(
+                        acknowledgement_strategy=strategy,
+                        follower_window_samples=2,
+                        state_trajectory_settle_cycles=2,
+                    ),
+                )
+                controller.confirm_and_start(controller.plan.plan_hash)
+                self.assertTrue(controller.join(timeout=3.0, raise_on_error=True))
+                self.assertEqual(controller.cursor().state, ReplayState.COMPLETED)
+
+    def test_h5_tracking_stale_feedback_and_health_errors_abort(self) -> None:
+        controller, _ = self._armed_controller(
+            robot=_FakeReplayRobot(stall=True),
+            count=6,
+            speed_scale=1.0,
+            constraints=_h5_constraints(joint_tracking_error=0.0001, sustained_tracking_error_limit=2),
+        )
+        controller.confirm_and_start(controller.plan.plan_hash)
+        self.assertTrue(controller.join(timeout=2.0))
+        self.assertEqual(controller.cursor().state, ReplayState.ABORTED)
+        self.assertIn("sustained tracking error", controller.cursor().message or "")
+
+        stale, _ = self._armed_controller(
+            robot=_DelayedReplayRobot(stale_feedback=True),
+            count=2,
+            speed_scale=1.0,
+            constraints=_h5_constraints(feedback_freshness_timeout_s=0.001),
+        )
+        stale.confirm_and_start(stale.plan.plan_hash)
+        self.assertTrue(stale.join(timeout=2.0))
+        self.assertEqual(stale.cursor().state, ReplayState.ABORTED)
+        self.assertIn("stale", stale.cursor().message or "")
+
+        unhealthy, _ = self._armed_controller(
+            robot=_DelayedReplayRobot(health_error=True),
+            count=2,
+            speed_scale=1.0,
+            constraints=_h5_constraints(),
+        )
+        unhealthy.confirm_and_start(unhealthy.plan.plan_hash)
+        self.assertTrue(unhealthy.join(timeout=2.0))
+        self.assertEqual(unhealthy.cursor().state, ReplayState.ABORTED)
+        self.assertIn("health", unhealthy.cursor().message or "")
+
+    def test_h5_pause_resume_uses_acknowledged_state_not_sent_state(self) -> None:
+        controller, robot = self._armed_controller(
+            robot=_DelayedReplayRobot(feedback_cycles=10),
+            count=6,
+            speed_scale=1.0,
+            constraints=_h5_constraints(joint_tracking_error=0.0001, sustained_tracking_error_limit=50),
+        )
+        controller.confirm_and_start(controller.plan.plan_hash)
+        _wait(
+            lambda: (
+                controller.cursor().sent_sample_index is not None
+                and controller.cursor().sent_sample_index > controller.plan.start_sample
+                and controller.cursor().sent_sample_index != controller.cursor().acknowledged_sample_index
+            )
+        )
+        cursor_before_pause = controller.cursor()
+        self.assertTrue(controller.pause())
+        sent_position = cursor_before_pause.sent_sample_index - controller.plan.start_sample
+        robot.state = controller.plan.steps[sent_position].expected_state.copy()
+        self.assertFalse(controller.resume())
+        self.assertEqual(controller.cursor().state, ReplayState.PAUSED)
+        self.assertTrue(controller.stop(wait=True, timeout=2.0))
 
     def test_resume_state_mismatch_and_resource_lease_conflict(self) -> None:
         controller, robot = self._armed_controller()

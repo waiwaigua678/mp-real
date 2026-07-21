@@ -67,6 +67,10 @@ function setForm(config) {
   if (config.robot) robotSelect.value = config.robot;
   ensureCameraPanels(config.camera_roles || []);
   for (const [key, value] of Object.entries(config)) {
+    if (config.robot === "rm2" && key === "arm_command" && form.elements.rm2_arm_command) {
+      form.elements.rm2_arm_command.value = numberOrEmpty(value);
+      continue;
+    }
     const field = form.elements[key];
     if (!field) continue;
     if (field.type === "checkbox") {
@@ -424,8 +428,10 @@ async function selectRobot() {
 
 function collectForm() {
   const data = {};
+  const robot = robotSelect.value;
   for (const field of form.elements) {
     if (!field.name) continue;
+    if (robot === "rm2" && field.name === "arm_command") continue;
     if (field.type === "checkbox") {
       data[field.name] = field.checked;
     } else if (field.type === "number") {
@@ -433,6 +439,9 @@ function collectForm() {
     } else {
       data[field.name] = field.value;
     }
+  }
+  if (robot === "rm2" && form.elements.rm2_arm_command) {
+    data.arm_command = form.elements.rm2_arm_command.value;
   }
   return data;
 }
@@ -611,11 +620,17 @@ function applyReplay(replay) {
   replayStatus = replay;
   const state = replay?.state || "idle";
   const locked = Boolean(replay?.view_cursor_locked);
+  const progress = replay?.progress || {};
   document.querySelector("#replayState").textContent = state;
+  document.querySelector("#replaySentProgress").textContent = formatReplayPercent(progress.sent);
+  document.querySelector("#replayFeedbackProgress").textContent = formatReplayPercent(progress.feedback);
+  document.querySelector("#replayAckProgress").textContent = formatReplayPercent(progress.acknowledged);
+  document.querySelector("#replayLagSamples").textContent = String(progress.lag_samples || 0);
   document.querySelector("#replayDetails").textContent = JSON.stringify(
     {
       safety_report: replay?.safety_report || null,
       plan: replay?.plan || null,
+      progress: replay?.progress || null,
       robot_cursor: replay?.cursor || null,
       view_cursor_locked: locked,
       error: replay?.error || null,
@@ -644,6 +659,11 @@ function applyReplay(replay) {
   document.querySelector("#replayResumeBtn").disabled = state !== "paused";
   document.querySelector("#replayStopBtn").disabled = !["connecting", "moving_to_start", "armed", "running", "paused", "stopping"].includes(state);
   document.querySelector("#replayEmergencyBtn").disabled = document.querySelector("#replayStopBtn").disabled;
+}
+
+function formatReplayPercent(value) {
+  const number = Number(value || 0);
+  return `${Math.round(Math.max(0, Math.min(1, number)) * 100)}%`;
 }
 
 function replayPlanPayload() {

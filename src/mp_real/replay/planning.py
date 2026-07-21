@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -144,50 +144,129 @@ class ReplayPlanner:
         )
         warnings.extend(timing_warnings)
         values = np.vstack([sample[3] for sample in samples])
+        target_fields = (
+            target_action_spec.action_fields if mode is ReplayMode.COMMAND_REPLAY else target_action_spec.state_fields
+        )
+        gripper_indices = tuple(
+            constraints.gripper_indices
+            if constraints.gripper_indices is not None
+            else source_contract.gripper_indices
+        )
+        invalid_gripper_indices = [index for index in gripper_indices if index < 0 or index >= values.shape[1]]
+        if invalid_gripper_indices:
+            errors.append(
+                ReplaySafetyIssue(
+                    "gripper_index",
+                    f"configured gripper indices are outside target dimension: {invalid_gripper_indices}",
+                )
+            )
+        joint_indices = _joint_indices(target_fields, values.shape[1], gripper_indices)
         if values.shape[1] != target_action_spec.action_dim and mode is ReplayMode.COMMAND_REPLAY:
             errors.append(ReplaySafetyIssue("action_dimension_mismatch", "target action dimension differs from robot"))
         if values.shape[1] != target_action_spec.state_dim and mode is ReplayMode.STATE_TRAJECTORY_FOLLOWING:
             errors.append(ReplaySafetyIssue("state_dimension_mismatch", "target state dimension differs from robot"))
-        if constraints.lower_limits is None:
+        joint_lower, joint_upper = _resolved_bounds(
+            explicit_lower=constraints.joint_lower_limits,
+            explicit_upper=constraints.joint_upper_limits,
+            legacy_lower=constraints.lower_limits,
+            legacy_upper=constraints.upper_limits,
+            total_dim=values.shape[1],
+            indices=joint_indices,
+            label="joint limits",
+            errors=errors,
+        )
+        if joint_indices and joint_lower is None:
             warnings.append(
                 ReplaySafetyIssue(
                     "joint_limits_not_provided",
                     "generic trajectory limits are absent; connected vendor validation remains required",
                 )
             )
-        elif len(constraints.lower_limits) != values.shape[1]:
-            errors.append(
-                ReplaySafetyIssue("joint_limit_dimension", "configured joint limits do not match replay target")
-            )
-        else:
-            lower = np.asarray(constraints.lower_limits, dtype=np.float32)
-            upper = np.asarray(constraints.upper_limits, dtype=np.float32)
-            violations = np.argwhere((values < lower) | (values > upper))
+        elif joint_indices:
+            joint_values = values[:, joint_indices]
+            violations = np.argwhere((joint_values < joint_lower) | (joint_values > joint_upper))
             for sample_offset, dimension in violations:
                 errors.append(
                     ReplaySafetyIssue(
                         "joint_limit_exceeded",
                         "replay target is outside configured joint limits",
                         int(samples[int(sample_offset)][0]),
-                        int(dimension),
+                        int(joint_indices[int(dimension)]),
                     )
                 )
-        max_delta, max_velocity, max_acceleration = self._kinematics(values, offsets_s)
-        if max_delta > constraints.max_step:
-            errors.append(
-                ReplaySafetyIssue("max_step", f"maximum step {max_delta:.6f} exceeds {constraints.max_step:.6f}")
-            )
-        if max_velocity > constraints.max_velocity:
-            errors.append(
+        gripper_lower, gripper_upper = _resolved_gripper_bounds(
+            constraints=constraints,
+            total_dim=values.shape[1],
+            indices=gripper_indices,
+            errors=errors,
+        )
+        if gripper_indices and gripper_lower is None:
+            warnings.append(
                 ReplaySafetyIssue(
-                    "max_velocity", f"maximum velocity {max_velocity:.6f} exceeds {constraints.max_velocity:.6f}"
+                    "gripper_range_not_provided",
+                    "gripper range is absent; connected vendor validation remains required",
                 )
             )
-        if max_acceleration > constraints.max_acceleration:
+        elif gripper_indices:
+            gripper_values = values[:, gripper_indices]
+            violations = np.argwhere((gripper_values < gripper_lower) | (gripper_values > gripper_upper))
+            for sample_offset, dimension in violations:
+                errors.append(
+                    ReplaySafetyIssue(
+                        "gripper_range",
+                        "gripper target is outside configured range",
+                        int(samples[int(sample_offset)][0]),
+                        int(gripper_indices[int(dimension)]),
+                    )
+                )
+            if constraints.gripper_command_mode in {"open", "closed", "open_closed"}:
+                midpoint = (gripper_lower + gripper_upper) / 2.0
+                hysteresis = constraints.gripper_transition_hysteresis
+                discrete_ok = (gripper_values <= midpoint - hysteresis) | (gripper_values >= midpoint + hysteresis)
+                for sample_offset, dimension in np.argwhere(~discrete_ok):
+                    errors.append(
+                        ReplaySafetyIssue(
+                            "gripper_discrete_position",
+                            "discrete gripper command must be near an open or closed endpoint",
+                            int(samples[int(sample_offset)][0]),
+                            int(gripper_indices[int(dimension)]),
+                        )
+                    )
+        max_joint_delta, max_joint_velocity, max_joint_acceleration = self._kinematics(values, offsets_s, joint_indices)
+        max_gripper_delta, max_gripper_velocity, max_gripper_acceleration = self._kinematics(
+            values, offsets_s, gripper_indices
+        )
+        max_delta = max(max_joint_delta, max_gripper_delta)
+        max_velocity = max(max_joint_velocity, max_gripper_velocity)
+        max_acceleration = max(max_joint_acceleration, max_gripper_acceleration)
+        if max_joint_delta > constraints.effective_joint_max_step:
             errors.append(
                 ReplaySafetyIssue(
-                    "max_acceleration",
-                    f"maximum acceleration {max_acceleration:.6f} exceeds {constraints.max_acceleration:.6f}",
+                    "joint_max_step",
+                    f"maximum joint step {max_joint_delta:.6f} exceeds {constraints.effective_joint_max_step:.6f}",
+                )
+            )
+        if max_joint_velocity > constraints.effective_joint_max_velocity:
+            errors.append(
+                ReplaySafetyIssue(
+                    "joint_max_velocity",
+                    "maximum joint velocity "
+                    f"{max_joint_velocity:.6f} exceeds {constraints.effective_joint_max_velocity:.6f}",
+                )
+            )
+        if max_joint_acceleration > constraints.effective_joint_max_acceleration:
+            errors.append(
+                ReplaySafetyIssue(
+                    "joint_max_acceleration",
+                    "maximum joint acceleration "
+                    f"{max_joint_acceleration:.6f} exceeds {constraints.effective_joint_max_acceleration:.6f}",
+                )
+            )
+        if constraints.gripper_max_step is not None and max_gripper_delta > constraints.gripper_max_step:
+            errors.append(
+                ReplaySafetyIssue(
+                    "gripper_max_step",
+                    f"maximum gripper step {max_gripper_delta:.6f} exceeds {constraints.gripper_max_step:.6f}",
                 )
             )
         safety_unavailable: list[ReplaySafetyIssue] = []
@@ -264,6 +343,12 @@ class ReplayPlanner:
             maximum_observed_delta=max_delta,
             maximum_observed_velocity=max_velocity,
             maximum_observed_acceleration=max_acceleration,
+            maximum_observed_joint_delta=max_joint_delta,
+            maximum_observed_joint_velocity=max_joint_velocity,
+            maximum_observed_joint_acceleration=max_joint_acceleration,
+            maximum_observed_gripper_delta=max_gripper_delta,
+            maximum_observed_gripper_velocity=max_gripper_velocity,
+            maximum_observed_gripper_acceleration=max_gripper_acceleration,
             expected_duration_s=offsets_s[-1] if offsets_s else 0.0,
             start_state=samples[0][4].copy() if samples else None,
             end_state=samples[-1][4].copy() if samples else None,
@@ -397,10 +482,11 @@ class ReplayPlanner:
         return offsets, warnings
 
     @staticmethod
-    def _kinematics(values: np.ndarray, offsets_s: list[float]) -> tuple[float, float, float]:
-        if len(values) < 2:
+    def _kinematics(values: np.ndarray, offsets_s: list[float], indices: Sequence[int]) -> tuple[float, float, float]:
+        if len(values) < 2 or not indices:
             return 0.0, 0.0, 0.0
-        deltas = np.abs(np.diff(values, axis=0))
+        selected = values[:, tuple(indices)]
+        deltas = np.abs(np.diff(selected, axis=0))
         maximum_delta = float(np.max(deltas))
         intervals = np.diff(np.asarray(offsets_s, dtype=np.float64))
         velocity = deltas / intervals[:, None]
@@ -409,6 +495,98 @@ class ReplayPlanner:
             return maximum_delta, maximum_velocity, 0.0
         acceleration = np.abs(np.diff(velocity, axis=0)) / intervals[1:, None]
         return maximum_delta, maximum_velocity, float(np.max(acceleration))
+
+
+def _joint_indices(fields: Sequence[Any], total_dim: int, gripper_indices: Sequence[int]) -> tuple[int, ...]:
+    gripper_set = set(gripper_indices)
+    if fields:
+        return tuple(
+            index
+            for index, field in enumerate(fields)
+            if index < total_dim and field.semantics == "joint_position" and index not in gripper_set
+        )
+    return tuple(index for index in range(total_dim) if index not in gripper_set)
+
+
+def _bounds_from_vector(
+    lower: tuple[float, ...] | None,
+    upper: tuple[float, ...] | None,
+    *,
+    total_dim: int,
+    indices: Sequence[int],
+    label: str,
+    errors: list[ReplaySafetyIssue],
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    if lower is None or upper is None:
+        return None, None
+    lower_array = np.asarray(lower, dtype=np.float32)
+    upper_array = np.asarray(upper, dtype=np.float32)
+    if lower_array.shape == (len(indices),):
+        return lower_array, upper_array
+    if lower_array.shape == (total_dim,):
+        return lower_array[list(indices)], upper_array[list(indices)]
+    errors.append(ReplaySafetyIssue(f"{label}_dimension", f"configured {label} do not match replay target"))
+    return None, None
+
+
+def _resolved_bounds(
+    *,
+    explicit_lower: tuple[float, ...] | None,
+    explicit_upper: tuple[float, ...] | None,
+    legacy_lower: tuple[float, ...] | None,
+    legacy_upper: tuple[float, ...] | None,
+    total_dim: int,
+    indices: Sequence[int],
+    label: str,
+    errors: list[ReplaySafetyIssue],
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    lower, upper = _bounds_from_vector(
+        explicit_lower,
+        explicit_upper,
+        total_dim=total_dim,
+        indices=indices,
+        label=label,
+        errors=errors,
+    )
+    if lower is not None:
+        return lower, upper
+    return _bounds_from_vector(
+        legacy_lower,
+        legacy_upper,
+        total_dim=total_dim,
+        indices=indices,
+        label=label,
+        errors=errors,
+    )
+
+
+def _resolved_gripper_bounds(
+    *,
+    constraints: ReplayConstraints,
+    total_dim: int,
+    indices: Sequence[int],
+    errors: list[ReplaySafetyIssue],
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    lower, upper = _bounds_from_vector(
+        constraints.gripper_min,
+        constraints.gripper_max,
+        total_dim=total_dim,
+        indices=indices,
+        label="gripper_range",
+        errors=errors,
+    )
+    if lower is not None or constraints.lower_limits is None:
+        return lower, upper
+    if len(constraints.lower_limits) == total_dim:
+        return _bounds_from_vector(
+            constraints.lower_limits,
+            constraints.upper_limits,
+            total_dim=total_dim,
+            indices=indices,
+            label="gripper_range",
+            errors=errors,
+        )
+    return lower, upper
 
 
 def build_replay_source_hash(

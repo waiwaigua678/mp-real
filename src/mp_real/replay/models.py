@@ -66,6 +66,13 @@ class ReplayMode(enum.StrEnum):
     STATE_TRAJECTORY_FOLLOWING = "state"
 
 
+class ReplayAcknowledgementStrategy(enum.StrEnum):
+    IMMEDIATE_INTERFACE_ACK = "immediate_interface_ack"
+    FEEDBACK_THRESHOLD = "feedback_threshold"
+    FOLLOWER_WINDOW = "follower_window"
+    STATE_TRAJECTORY_SETTLE = "state_trajectory_settle"
+
+
 @dataclasses.dataclass(frozen=True)
 class ReplaySafetyIssue:
     code: str
@@ -89,6 +96,12 @@ class ReplaySafetyReport:
     maximum_observed_delta: float | None = None
     maximum_observed_velocity: float | None = None
     maximum_observed_acceleration: float | None = None
+    maximum_observed_joint_delta: float | None = None
+    maximum_observed_joint_velocity: float | None = None
+    maximum_observed_joint_acceleration: float | None = None
+    maximum_observed_gripper_delta: float | None = None
+    maximum_observed_gripper_velocity: float | None = None
+    maximum_observed_gripper_acceleration: float | None = None
     expected_duration_s: float | None = None
     start_state: np.ndarray | None = None
     end_state: np.ndarray | None = None
@@ -125,6 +138,8 @@ class ReplayConstraints:
 
     min_interval_s: float = 0.002
     max_interval_s: float = 1.0
+    # Backward-compatible generic aliases. H5 applies these only to non-gripper
+    # joint dimensions unless explicit joint_* values are supplied.
     max_step: float = 0.05
     max_velocity: float = 0.5
     max_acceleration: float = 2.0
@@ -133,32 +148,171 @@ class ReplayConstraints:
     max_control_overrun_s: float = 0.10
     lower_limits: tuple[float, ...] | None = None
     upper_limits: tuple[float, ...] | None = None
+    joint_max_step: float | None = None
+    joint_max_velocity: float | None = None
+    joint_max_acceleration: float | None = None
+    joint_tracking_error: float | None = None
+    joint_lower_limits: tuple[float, ...] | None = None
+    joint_upper_limits: tuple[float, ...] | None = None
+    gripper_min: tuple[float, ...] | None = None
+    gripper_max: tuple[float, ...] | None = None
+    gripper_max_step: float | None = None
+    gripper_command_mode: str = "position"
+    gripper_settle_timeout_s: float = 1.0
+    gripper_tracking_threshold: float | None = None
+    gripper_transition_hysteresis: float = 0.0
+    gripper_indices: tuple[int, ...] | None = None
+    acknowledgement_strategy: ReplayAcknowledgementStrategy = ReplayAcknowledgementStrategy.FEEDBACK_THRESHOLD
+    feedback_poll_interval_s: float = 0.01
+    acknowledgement_timeout_s: float = 1.0
+    feedback_freshness_timeout_s: float | None = None
+    follower_window_samples: int = 1
+    state_trajectory_settle_cycles: int = 2
+    sustained_tracking_error_limit: int = 3
+    extreme_tracking_error: float | None = None
+    poll_feedback_while_paused: bool = False
     move_to_start_constraints: Any | None = None
     plan_expiration_s: float | None = 300.0
 
     def __post_init__(self) -> None:
-        for field in dataclasses.fields(self):
-            if field.name in {"lower_limits", "upper_limits", "move_to_start_constraints", "plan_expiration_s"}:
-                continue
-            if getattr(self, field.name) <= 0:
-                raise ValueError(f"{field.name} must be positive")
+        for field_name in (
+            "min_interval_s",
+            "max_interval_s",
+            "max_step",
+            "max_velocity",
+            "max_acceleration",
+            "tracking_tolerance",
+            "max_tracking_error",
+            "max_control_overrun_s",
+            "gripper_settle_timeout_s",
+            "feedback_poll_interval_s",
+            "acknowledgement_timeout_s",
+        ):
+            if getattr(self, field_name) <= 0:
+                raise ValueError(f"{field_name} must be positive")
+        for field_name in (
+            "joint_max_step",
+            "joint_max_velocity",
+            "joint_max_acceleration",
+            "joint_tracking_error",
+            "gripper_max_step",
+            "gripper_tracking_threshold",
+            "feedback_freshness_timeout_s",
+            "extreme_tracking_error",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and value <= 0:
+                raise ValueError(f"{field_name} must be positive")
         if self.plan_expiration_s is not None and self.plan_expiration_s <= 0:
             raise ValueError("plan_expiration_s must be positive when configured")
         if self.min_interval_s > self.max_interval_s:
             raise ValueError("min_interval_s must not exceed max_interval_s")
         if self.tracking_tolerance > self.max_tracking_error:
             raise ValueError("tracking_tolerance must not exceed max_tracking_error")
-        if (self.lower_limits is None) != (self.upper_limits is None):
-            raise ValueError("lower_limits and upper_limits must be configured together")
-        if self.lower_limits is not None and self.upper_limits is not None:
-            if len(self.lower_limits) != len(self.upper_limits):
-                raise ValueError("joint limit vectors must have matching dimensions")
-            if not np.isfinite(self.lower_limits).all() or not np.isfinite(self.upper_limits).all():
-                raise ValueError("joint limits must be finite")
-            if any(lower >= upper for lower, upper in zip(self.lower_limits, self.upper_limits, strict=True)):
-                raise ValueError("each joint lower limit must be less than upper limit")
-            object.__setattr__(self, "lower_limits", tuple(float(value) for value in self.lower_limits))
-            object.__setattr__(self, "upper_limits", tuple(float(value) for value in self.upper_limits))
+        if self.joint_tracking_error is not None and self.joint_tracking_error > self.effective_extreme_tracking_error:
+            raise ValueError("joint_tracking_error must not exceed extreme tracking error")
+        if (
+            self.gripper_tracking_threshold is not None
+            and self.gripper_tracking_threshold > self.effective_extreme_tracking_error
+        ):
+            raise ValueError("gripper_tracking_threshold must not exceed extreme tracking error")
+        if self.gripper_transition_hysteresis < 0:
+            raise ValueError("gripper_transition_hysteresis cannot be negative")
+        if self.follower_window_samples < 0:
+            raise ValueError("follower_window_samples cannot be negative")
+        if self.state_trajectory_settle_cycles <= 0:
+            raise ValueError("state_trajectory_settle_cycles must be positive")
+        if self.sustained_tracking_error_limit <= 0:
+            raise ValueError("sustained_tracking_error_limit must be positive")
+        strategy = (
+            self.acknowledgement_strategy
+            if isinstance(self.acknowledgement_strategy, ReplayAcknowledgementStrategy)
+            else ReplayAcknowledgementStrategy(str(self.acknowledgement_strategy))
+        )
+        object.__setattr__(self, "acknowledgement_strategy", strategy)
+        mode = self.gripper_command_mode.lower()
+        if mode not in {"position", "open", "closed", "open_closed"}:
+            raise ValueError("gripper_command_mode must be one of position, open, closed, open_closed")
+        object.__setattr__(self, "gripper_command_mode", mode)
+        self._normalize_limit_pair("lower_limits", "upper_limits", "limit vectors")
+        self._normalize_limit_pair("joint_lower_limits", "joint_upper_limits", "joint limit vectors")
+        self._normalize_limit_pair("gripper_min", "gripper_max", "gripper range vectors")
+        if self.gripper_indices is not None:
+            object.__setattr__(self, "gripper_indices", tuple(int(index) for index in self.gripper_indices))
+
+    @property
+    def effective_joint_max_step(self) -> float:
+        return self.max_step if self.joint_max_step is None else self.joint_max_step
+
+    @property
+    def effective_joint_max_velocity(self) -> float:
+        return self.max_velocity if self.joint_max_velocity is None else self.joint_max_velocity
+
+    @property
+    def effective_joint_max_acceleration(self) -> float:
+        return self.max_acceleration if self.joint_max_acceleration is None else self.joint_max_acceleration
+
+    @property
+    def effective_joint_tracking_error(self) -> float:
+        return self.tracking_tolerance if self.joint_tracking_error is None else self.joint_tracking_error
+
+    @property
+    def effective_gripper_tracking_threshold(self) -> float:
+        if self.gripper_tracking_threshold is not None:
+            return self.gripper_tracking_threshold
+        return self.effective_joint_tracking_error
+
+    @property
+    def effective_extreme_tracking_error(self) -> float:
+        return self.max_tracking_error if self.extreme_tracking_error is None else self.extreme_tracking_error
+
+    def _normalize_limit_pair(self, lower_name: str, upper_name: str, label: str) -> None:
+        lower = getattr(self, lower_name)
+        upper = getattr(self, upper_name)
+        if (lower is None) != (upper is None):
+            raise ValueError(f"{lower_name} and {upper_name} must be configured together")
+        if lower is None or upper is None:
+            return
+        if len(lower) != len(upper):
+            raise ValueError(f"{label} must have matching dimensions")
+        lower_tuple = tuple(float(value) for value in lower)
+        upper_tuple = tuple(float(value) for value in upper)
+        if not np.isfinite(lower_tuple).all() or not np.isfinite(upper_tuple).all():
+            raise ValueError(f"{label} must be finite")
+        if any(lo >= hi for lo, hi in zip(lower_tuple, upper_tuple, strict=True)):
+            raise ValueError(f"each {label} lower bound must be less than upper bound")
+        object.__setattr__(self, lower_name, lower_tuple)
+        object.__setattr__(self, upper_name, upper_tuple)
+
+
+@dataclasses.dataclass(frozen=True)
+class ReplayCommandRecord:
+    command_id: str
+    source_sample_index: int
+    sent_timestamp_ns: int
+    target: np.ndarray
+    expected_state: np.ndarray
+    acknowledgement_deadline_ns: int
+    joint_tracking_threshold: float
+    gripper_tracking_threshold: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "target", readonly_array(self.target))
+        object.__setattr__(self, "expected_state", readonly_array(self.expected_state))
+
+
+@dataclasses.dataclass(frozen=True)
+class ReplayFeedbackRecord:
+    feedback_timestamp_ns: int
+    robot_state: np.ndarray
+    feedback_age_s: float | None
+    matched_command_id: str | None
+    instantaneous_tracking_error: float | None
+    lag_adjusted_tracking_error: float | None
+    acknowledged: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "robot_state", readonly_array(self.robot_state))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -395,12 +549,26 @@ class RobotReplayCursor:
     """Read-only controller snapshot.  Only RobotReplayController creates it."""
 
     state: ReplayState
+    planned_sample_index: int | None = None
+    # Backward-compatible alias for older UI/tests; H5 treats it as the last
+    # planned source sample, not as proof of execution.
     source_sample_index: int | None = None
     sent_sample_index: int | None = None
+    feedback_sample_index: int | None = None
     acknowledged_sample_index: int | None = None
+    displayed_sample_index: int | None = None
     progress_ratio: float = 0.0
+    sent_progress_ratio: float = 0.0
+    feedback_progress_ratio: float = 0.0
+    acknowledged_progress_ratio: float = 0.0
+    lag_samples: int = 0
     elapsed_s: float = 0.0
     tracking_error: float | None = None
+    instantaneous_tracking_error: float | None = None
+    lag_adjusted_tracking_error: float | None = None
+    max_tracking_error: float | None = None
+    sustained_tracking_error_count: int = 0
+    acknowledgement_strategy: str | None = None
     timestamp_monotonic_ns: int = 0
     session_id: str | None = None
     generation_id: int | None = None
@@ -408,8 +576,13 @@ class RobotReplayCursor:
     message: str | None = None
 
     def __post_init__(self) -> None:
-        if not 0.0 <= self.progress_ratio <= 1.0:
-            raise ValueError("progress_ratio must be in [0, 1]")
+        for name in ("progress_ratio", "sent_progress_ratio", "feedback_progress_ratio", "acknowledged_progress_ratio"):
+            if not 0.0 <= getattr(self, name) <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if self.lag_samples < 0:
+            raise ValueError("lag_samples cannot be negative")
+        if self.sustained_tracking_error_count < 0:
+            raise ValueError("sustained_tracking_error_count cannot be negative")
         if self.timestamp_monotonic_ns <= 0:
             object.__setattr__(self, "timestamp_monotonic_ns", time.monotonic_ns())
 

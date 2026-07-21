@@ -767,25 +767,25 @@ class HardeningPoseReplaySafetyTests(unittest.TestCase):
         finally:
             controller.stop(wait=True, timeout=2.0)
 
-    @unittest.expectedFailure
     def test_h5_replay_controller_should_not_acknowledge_sent_with_nonzero_tracking_error(self) -> None:
-        """Expected to pass after H5 separates sent, observed, and acknowledged replay states."""
+        """H5 separates sent, feedback, and acknowledged replay states."""
 
         plan = _replay_plan(count=2)
-        robot = _FakeReplayRobot(state_bias=0.01)
+        robot = _FakeReplayRobot()
         controller = RobotReplayController(robot, plan)
         controller.prepare()
         _wait(lambda: controller.cursor().state in {ReplayState.ARMED, ReplayState.ERROR})
         self.assertEqual(controller.cursor().state, ReplayState.ARMED, controller.cursor().message)
+        robot.state_bias = 0.2
         controller.confirm_and_start(plan.plan_hash)
-        self.assertTrue(controller.join(timeout=2.0, raise_on_error=True))
+        self.assertTrue(controller.join(timeout=2.0))
         cursor = controller.cursor()
-        self.assertEqual(cursor.state, ReplayState.COMPLETED)
+        self.assertEqual(cursor.state, ReplayState.ABORTED)
+        self.assertEqual(cursor.sent_sample_index, plan.start_sample)
         self.assertIsNone(cursor.acknowledged_sample_index)
 
-    @unittest.expectedFailure
     def test_h5_replay_planner_should_not_apply_arm_limits_to_gripper_only_changes(self) -> None:
-        """Expected to pass after H5 splits arm and gripper kinematic safety semantics."""
+        """H5 splits arm and gripper kinematic safety semantics."""
 
         samples = tuple(
             RecordedSample(
