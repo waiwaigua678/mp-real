@@ -98,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
                     mapping_fingerprint=validated.report.mapping_fingerprint,
                 )
             )
+            plan.require_integrity(check_expiration=True)
             print(f"plan_hash={plan.plan_hash}")
             if args.confirm_plan_hash != plan.plan_hash:
                 raise RuntimeError("--execute requires --confirm-plan-hash matching the newly revalidated plan")

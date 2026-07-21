@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-import hashlib
-import json
+import secrets
 import time
 import uuid
 from collections.abc import Mapping, Sequence
@@ -10,6 +9,15 @@ from typing import Any
 
 import numpy as np
 
+from mp_real.common.plan_integrity import (
+    PLAN_HASH_SCHEMA_VERSION,
+    PlanIntegrityError,
+    canonical_hash,
+    freeze_action_spec,
+    freeze_jsonish,
+    freeze_robot_state,
+    readonly_array,
+)
 from mp_real.runtime.models import ActionSpec, RobotState, VectorField
 
 
@@ -23,6 +31,10 @@ class PoseValidationError(PoseMoveError):
 
 class PosePlanStaleError(PoseMoveError):
     """A previously reviewed plan no longer matches live state or identity."""
+
+
+class PosePlanIntegrityError(PosePlanStaleError, PlanIntegrityError):
+    """A pose plan's stored hash no longer matches its canonical payload."""
 
 
 class PoseMoveAborted(PoseMoveError):
@@ -71,6 +83,8 @@ class PoseMappingConfig:
             raise ValueError("mapping config has duplicate source names")
         if len({entry.target_name for entry in self.entries}) != len(self.entries):
             raise ValueError("mapping config has duplicate target names")
+        object.__setattr__(self, "entries", tuple(self.entries))
+        object.__setattr__(self, "metadata", freeze_jsonish(self.metadata))
 
     @property
     def fingerprint(self) -> str:
@@ -102,7 +116,7 @@ class RecordedPoseTarget:
     target_id: str = ""
 
     def __post_init__(self) -> None:
-        values = np.asarray(self.state_values, dtype=np.float32).copy()
+        values = readonly_array(self.state_values)
         if not self.dataset_id or not self.robot_name:
             raise ValueError("dataset_id and robot_name cannot be empty")
         if self.episode_index < 0 or self.sample_index < 0:
@@ -116,7 +130,9 @@ class RecordedPoseTarget:
         if tuple(field.name for field in self.state_fields) != self.state_schema:
             raise ValueError("state_schema must preserve the ActionSpec state field order")
         object.__setattr__(self, "state_values", values)
-        object.__setattr__(self, "source_metadata", dict(self.source_metadata))
+        object.__setattr__(self, "state_fields", tuple(self.state_fields))
+        object.__setattr__(self, "source_metadata", freeze_jsonish(self.source_metadata))
+        object.__setattr__(self, "action_spec", freeze_action_spec(self.action_spec))
         if not self.target_id:
             object.__setattr__(
                 self,
@@ -138,6 +154,22 @@ class RecordedPoseTarget:
             index for index, field in enumerate(self.state_fields) if field.semantics == "gripper_open_fraction"
         )
 
+    def canonical_payload(self) -> Mapping[str, Any]:
+        return {
+            "target_id": self.target_id,
+            "dataset_id": self.dataset_id,
+            "episode_index": self.episode_index,
+            "sample_index": self.sample_index,
+            "robot_name": self.robot_name,
+            "state_schema": self.state_schema,
+            "state_values": self.state_values,
+            "state_fields": self.state_fields,
+            "joint_unit": self.joint_unit,
+            "timestamp": self.timestamp,
+            "source_metadata": self.source_metadata,
+            "action_spec": self.action_spec,
+        }
+
 
 @dataclasses.dataclass(frozen=True)
 class PoseMotionConstraints:
@@ -153,13 +185,16 @@ class PoseMotionConstraints:
     max_control_overrun_s: float = 0.10
     verify_timeout_s: float = 3.0
     keep_gripper: bool = False
+    plan_expiration_s: float | None = 300.0
 
     def __post_init__(self) -> None:
         for field in dataclasses.fields(self):
-            if field.name == "keep_gripper":
+            if field.name in {"keep_gripper", "plan_expiration_s"}:
                 continue
             if getattr(self, field.name) <= 0:
                 raise ValueError(f"{field.name} must be positive")
+        if self.plan_expiration_s is not None and self.plan_expiration_s <= 0:
+            raise ValueError("plan_expiration_s must be positive when configured")
         if self.tracking_tolerance > self.max_tracking_error:
             raise ValueError("tracking_tolerance must not exceed max_tracking_error")
 
@@ -199,8 +234,8 @@ class PoseSafetyLimits:
     upper: np.ndarray
 
     def __post_init__(self) -> None:
-        lower = np.asarray(self.lower, dtype=np.float32).copy()
-        upper = np.asarray(self.upper, dtype=np.float32).copy()
+        lower = readonly_array(self.lower)
+        upper = readonly_array(self.upper)
         if lower.shape != upper.shape or lower.ndim != 1:
             raise ValueError("joint limit vectors must have matching one-dimensional shapes")
         if not np.isfinite(lower).all() or not np.isfinite(upper).all() or np.any(lower >= upper):
@@ -220,7 +255,7 @@ class ValidatedPoseTarget:
     report: PoseValidationReport
 
     def __post_init__(self) -> None:
-        values = np.asarray(self.values, dtype=np.float32).copy()
+        values = readonly_array(self.values)
         if values.ndim != 1 or len(values) != len(self.field_names):
             raise ValueError("validated target values and fields must have matching dimensions")
         object.__setattr__(self, "values", values)
@@ -233,10 +268,17 @@ class PoseWaypoint:
     scheduled_at_monotonic_ns: int
 
     def __post_init__(self) -> None:
-        target = np.asarray(self.target, dtype=np.float32).copy()
+        target = readonly_array(self.target)
         if target.ndim != 1 or not np.isfinite(target).all():
             raise ValueError("pose waypoint must be a finite vector")
         object.__setattr__(self, "target", target)
+
+    def canonical_payload(self) -> Mapping[str, Any]:
+        return {
+            "index": self.index,
+            "target": self.target,
+            "scheduled_at_monotonic_ns": self.scheduled_at_monotonic_ns,
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -260,18 +302,46 @@ class MoveToRecordedStatePlan:
     session_id: str
     generation_id: int
     created_at_monotonic_ns: int
-    plan_hash: str
+    plan_hash: str = ""
+    safety_flags: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    resource_owner_id: str | None = None
+    resource_lease_id: str | None = None
+    created_from_robot_state_hash: str | None = None
+    expires_at_monotonic_ns: int | None = None
 
     def __post_init__(self) -> None:
-        target_state = np.asarray(self.target_state, dtype=np.float32).copy()
-        delta = np.asarray(self.per_dimension_delta, dtype=np.float32).copy()
+        current_state = freeze_robot_state(self.current_state)
+        target_state = readonly_array(self.target_state)
+        delta = readonly_array(self.per_dimension_delta)
         dimension = self.target.action_spec.state_dim
         if target_state.shape != (dimension,) or delta.shape != (dimension,):
             raise ValueError("plan target and delta must match state dimension")
         if len(self.waypoints) == 0:
             raise ValueError("plan must contain at least one waypoint")
+        object.__setattr__(self, "current_state", current_state)
         object.__setattr__(self, "target_state", target_state)
         object.__setattr__(self, "per_dimension_delta", delta)
+        object.__setattr__(self, "mapped_joint_names", tuple(str(item) for item in self.mapped_joint_names))
+        object.__setattr__(self, "unit_conversions", tuple(self.unit_conversions))
+        object.__setattr__(self, "gripper_indices", tuple(int(index) for index in self.gripper_indices))
+        object.__setattr__(self, "waypoints", tuple(self.waypoints))
+        object.__setattr__(self, "safety_warnings", tuple(str(item) for item in self.safety_warnings))
+        object.__setattr__(self, "required_confirmations", tuple(str(item) for item in self.required_confirmations))
+        object.__setattr__(self, "safety_flags", freeze_jsonish(self.safety_flags))
+        if self.created_from_robot_state_hash is None:
+            object.__setattr__(self, "created_from_robot_state_hash", _hash_payload({"current_state": current_state}))
+        if self.expires_at_monotonic_ns is None and self.constraints.plan_expiration_s is not None:
+            object.__setattr__(
+                self,
+                "expires_at_monotonic_ns",
+                self.created_at_monotonic_ns + int(self.constraints.plan_expiration_s * 1e9),
+            )
+        computed = self.recompute_plan_hash()
+        if self.plan_hash:
+            if not secrets.compare_digest(self.plan_hash, computed):
+                raise PosePlanIntegrityError("pose plan hash does not match its canonical payload")
+        else:
+            object.__setattr__(self, "plan_hash", computed)
 
     @classmethod
     def build(
@@ -289,6 +359,8 @@ class MoveToRecordedStatePlan:
         mapping_fingerprint: str | None = None,
         session_id: str | None = None,
         generation_id: int = 0,
+        resource_owner_id: str | None = None,
+        resource_lease_id: str | None = None,
     ) -> MoveToRecordedStatePlan:
         now_ns = time.monotonic_ns()
         current = np.asarray(current_state.values, dtype=np.float32)
@@ -339,15 +411,6 @@ class MoveToRecordedStatePlan:
             )
         actual_duration_s = steps * constraints.control_period_s
         sid = session_id or uuid.uuid4().hex
-        plan_payload = {
-            "target_id": target.target_id,
-            "current_state": current.tolist(),
-            "target_state": desired.tolist(),
-            "constraints": dataclasses.asdict(constraints),
-            "mapping_fingerprint": mapping_fingerprint,
-            "generation_id": generation_id,
-            "waypoints": [waypoint.target.tolist() for waypoint in waypoints],
-        }
         return cls(
             plan_id=uuid.uuid4().hex,
             target=target,
@@ -366,8 +429,51 @@ class MoveToRecordedStatePlan:
             session_id=sid,
             generation_id=generation_id,
             created_at_monotonic_ns=now_ns,
-            plan_hash=_hash_payload(plan_payload),
+            resource_owner_id=resource_owner_id,
+            resource_lease_id=resource_lease_id,
         )
+
+    def canonical_payload(self) -> Mapping[str, Any]:
+        return {
+            "schema_version": PLAN_HASH_SCHEMA_VERSION,
+            "plan_type": "move_to_recorded_state",
+            "plan_id": self.plan_id,
+            "target": self.target.canonical_payload(),
+            "current_state": self.current_state,
+            "target_state": self.target_state,
+            "per_dimension_delta": self.per_dimension_delta,
+            "mapped_joint_names": self.mapped_joint_names,
+            "unit_conversions": self.unit_conversions,
+            "gripper_indices": self.gripper_indices,
+            "waypoints": [waypoint.canonical_payload() for waypoint in self.waypoints],
+            "expected_duration_s": self.expected_duration_s,
+            "constraints": self.constraints,
+            "safety_warnings": self.safety_warnings,
+            "required_confirmations": self.required_confirmations,
+            "mapping_fingerprint": self.mapping_fingerprint,
+            "session_id": self.session_id,
+            "generation_id": self.generation_id,
+            "safety_flags": self.safety_flags,
+            "resource_owner_id": self.resource_owner_id,
+            "resource_lease_id": self.resource_lease_id,
+            "created_from_robot_state_hash": self.created_from_robot_state_hash,
+            "created_at_monotonic_ns": self.created_at_monotonic_ns,
+            "expires_at_monotonic_ns": self.expires_at_monotonic_ns,
+        }
+
+    def recompute_plan_hash(self) -> str:
+        return _hash_payload(self.canonical_payload())
+
+    def require_integrity(self, *, now_monotonic_ns: int | None = None, check_expiration: bool = False) -> None:
+        computed = self.recompute_plan_hash()
+        if not secrets.compare_digest(self.plan_hash, computed):
+            raise PosePlanIntegrityError("pose plan payload changed after review")
+        if (
+            check_expiration
+            and self.expires_at_monotonic_ns is not None
+            and (now_monotonic_ns or time.monotonic_ns()) > self.expires_at_monotonic_ns
+        ):
+            raise PosePlanStaleError("pose plan expired; generate a fresh plan")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -405,5 +511,5 @@ def _json_safe(value: Any) -> Any:
 
 
 def _hash_payload(value: Any) -> str:
-    encoded = json.dumps(_json_safe(value), sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    payload = value if isinstance(value, Mapping) else {"value": value}
+    return canonical_hash(payload)

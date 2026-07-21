@@ -34,6 +34,7 @@ class PoseMoveController:
         self._plan: MoveToRecordedStatePlan | None = None
 
     def revalidate(self, plan: MoveToRecordedStatePlan) -> None:
+        plan.require_integrity(check_expiration=True)
         current = self._capability.get_current_pose_state()
         values = np.asarray(current.values, dtype=np.float32)
         expected = np.asarray(plan.current_state.values, dtype=np.float32)
@@ -103,6 +104,7 @@ class PoseMoveController:
 
     def _run(self, plan: MoveToRecordedStatePlan, on_progress: Callable[[PoseMoveProgress], None] | None) -> None:
         try:
+            plan.require_integrity(check_expiration=True)
             result = self._capability.execute_pose_plan(plan, stop_event=self._stop_event, on_progress=on_progress)
             if self._stop_event.is_set() and result.status not in {"aborted", "failed"}:
                 raise PoseMoveAborted("pose move stopped before verification")

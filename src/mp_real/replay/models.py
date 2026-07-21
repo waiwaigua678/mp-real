@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-import hashlib
-import json
+import secrets
 import time
 import uuid
 from collections.abc import Mapping
@@ -13,6 +12,16 @@ from typing import Any
 
 import numpy as np
 
+from mp_real.common.plan_integrity import (
+    PLAN_HASH_SCHEMA_VERSION,
+    FrozenMapping,
+    PlanIntegrityError,
+    canonical_hash,
+    freeze_action_spec,
+    freeze_jsonish,
+    readonly_array,
+    readonly_optional_array,
+)
 from mp_real.runtime.models import ActionSpec
 
 
@@ -26,6 +35,10 @@ class ReplayValidationError(ReplayError):
 
 class ReplayPlanStaleError(ReplayError):
     """A reviewed plan no longer matches the active replay identity."""
+
+
+class ReplayPlanIntegrityError(ReplayPlanStaleError, PlanIntegrityError):
+    """A replay plan's stored hash no longer matches its canonical payload."""
 
 
 class ReplayState(enum.StrEnum):
@@ -79,6 +92,10 @@ class ReplaySafetyReport:
     source_dataset_id: str | None = None
     source_dataset_hash: str | None = None
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "start_state", readonly_optional_array(self.start_state))
+        object.__setattr__(self, "end_state", readonly_optional_array(self.end_state))
+
     @property
     def valid(self) -> bool:
         return not self.errors
@@ -103,13 +120,16 @@ class ReplayConstraints:
     lower_limits: tuple[float, ...] | None = None
     upper_limits: tuple[float, ...] | None = None
     move_to_start_constraints: Any | None = None
+    plan_expiration_s: float | None = 300.0
 
     def __post_init__(self) -> None:
         for field in dataclasses.fields(self):
-            if field.name in {"lower_limits", "upper_limits", "move_to_start_constraints"}:
+            if field.name in {"lower_limits", "upper_limits", "move_to_start_constraints", "plan_expiration_s"}:
                 continue
             if getattr(self, field.name) <= 0:
                 raise ValueError(f"{field.name} must be positive")
+        if self.plan_expiration_s is not None and self.plan_expiration_s <= 0:
+            raise ValueError("plan_expiration_s must be positive when configured")
         if self.min_interval_s > self.max_interval_s:
             raise ValueError("min_interval_s must not exceed max_interval_s")
         if self.tracking_tolerance > self.max_tracking_error:
@@ -123,6 +143,8 @@ class ReplayConstraints:
                 raise ValueError("joint limits must be finite")
             if any(lower >= upper for lower, upper in zip(self.lower_limits, self.upper_limits, strict=True)):
                 raise ValueError("each joint lower limit must be less than upper limit")
+            object.__setattr__(self, "lower_limits", tuple(float(value) for value in self.lower_limits))
+            object.__setattr__(self, "upper_limits", tuple(float(value) for value in self.upper_limits))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -139,6 +161,9 @@ class ReplayActionSource:
     def __post_init__(self) -> None:
         if not self.action_source or not self.action_mode or self.arm_count <= 0:
             raise ValueError("action source and action mode cannot be empty")
+        object.__setattr__(self, "action_spec", freeze_action_spec(self.action_spec))
+        object.__setattr__(self, "gripper_indices", tuple(int(index) for index in self.gripper_indices))
+        object.__setattr__(self, "gripper_semantics", tuple(str(item) for item in self.gripper_semantics))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -151,6 +176,11 @@ class StateTrajectorySource:
     gripper_semantics: tuple[str, ...]
     interpolation: str = "none"
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "state_spec", freeze_action_spec(self.state_spec))
+        object.__setattr__(self, "gripper_indices", tuple(int(index) for index in self.gripper_indices))
+        object.__setattr__(self, "gripper_semantics", tuple(str(item) for item in self.gripper_semantics))
+
 
 @dataclasses.dataclass(frozen=True)
 class ReplayStep:
@@ -162,14 +192,24 @@ class ReplayStep:
     expected_state: np.ndarray
 
     def __post_init__(self) -> None:
-        target = np.asarray(self.target, dtype=np.float32).copy()
-        state = np.asarray(self.expected_state, dtype=np.float32).copy()
+        target = readonly_array(self.target)
+        state = readonly_array(self.expected_state)
         if target.ndim != 1 or state.ndim != 1 or not np.isfinite(target).all() or not np.isfinite(state).all():
             raise ValueError("replay step target/state must be finite vectors")
         if self.source_sample_index < 0 or self.frame_index < 0 or self.target_offset_ns < 0:
             raise ValueError("replay step indices and target time must be non-negative")
         object.__setattr__(self, "target", target)
         object.__setattr__(self, "expected_state", state)
+
+    def canonical_payload(self) -> Mapping[str, Any]:
+        return {
+            "source_sample_index": self.source_sample_index,
+            "frame_index": self.frame_index,
+            "source_timestamp_s": self.source_timestamp_s,
+            "target_offset_ns": self.target_offset_ns,
+            "target": self.target,
+            "expected_state": self.expected_state,
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -193,9 +233,32 @@ class ReplayPlan:
     steps: tuple[ReplayStep, ...]
     constraints: ReplayConstraints
     created_at_monotonic_ns: int
-    plan_hash: str
+    plan_hash: str = ""
+    safety_flags: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    resource_owner_id: str | None = None
+    resource_lease_id: str | None = None
+    source_data_identity: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    created_from_robot_state_hash: str | None = None
+    expires_at_monotonic_ns: int | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "action_spec", freeze_action_spec(self.action_spec))
+        object.__setattr__(self, "steps", tuple(self.steps))
+        object.__setattr__(self, "safety_flags", freeze_jsonish(self.safety_flags))
+        if not self.source_data_identity:
+            object.__setattr__(
+                self,
+                "source_data_identity",
+                FrozenMapping({"dataset_id": self.dataset_id, "dataset_hash": self.dataset_hash}),
+            )
+        else:
+            object.__setattr__(self, "source_data_identity", freeze_jsonish(self.source_data_identity))
+        if self.expires_at_monotonic_ns is None and self.constraints.plan_expiration_s is not None:
+            object.__setattr__(
+                self,
+                "expires_at_monotonic_ns",
+                self.created_at_monotonic_ns + int(self.constraints.plan_expiration_s * 1e9),
+            )
         if (
             self.generation_id < 0
             or self.episode_index < 0
@@ -213,6 +276,12 @@ class ReplayPlan:
             raise ValueError("first replay step must equal start_sample")
         if self.steps[-1].source_sample_index != self.end_sample:
             raise ValueError("last replay step must equal end_sample")
+        computed = self.recompute_plan_hash()
+        if self.plan_hash:
+            if not secrets.compare_digest(self.plan_hash, computed):
+                raise ReplayPlanIntegrityError("replay plan hash does not match its canonical payload")
+        else:
+            object.__setattr__(self, "plan_hash", computed)
 
     @property
     def expected_duration_s(self) -> float:
@@ -225,6 +294,72 @@ class ReplayPlan:
     @property
     def end_state(self) -> np.ndarray:
         return self.steps[-1].expected_state.copy()
+
+    def canonical_payload(self) -> Mapping[str, Any]:
+        return {
+            "schema_version": PLAN_HASH_SCHEMA_VERSION,
+            "plan_type": "replay",
+            "plan_id": self.plan_id,
+            "session_id": self.session_id,
+            "generation_id": self.generation_id,
+            "dataset_id": self.dataset_id,
+            "dataset_hash": self.dataset_hash,
+            "source_data_identity": self.source_data_identity,
+            "episode_index": self.episode_index,
+            "start_sample": self.start_sample,
+            "end_sample": self.end_sample,
+            "robot_name": self.robot_name,
+            "mode": self.mode.value,
+            "timing_mode": self.timing_mode.value,
+            "speed_scale": self.speed_scale,
+            "action_spec": self.action_spec,
+            "state_schema": self.action_spec.state_fields,
+            "action_schema": self.action_spec.action_fields,
+            "source": self.source,
+            "steps": [step.canonical_payload() for step in self.steps],
+            "constraints": self.constraints,
+            "safety_flags": self.safety_flags,
+            "resource_owner_id": self.resource_owner_id,
+            "resource_lease_id": self.resource_lease_id,
+            "created_from_robot_state_hash": self.created_from_robot_state_hash,
+            "created_at_monotonic_ns": self.created_at_monotonic_ns,
+            "expires_at_monotonic_ns": self.expires_at_monotonic_ns,
+        }
+
+    def recompute_plan_hash(self) -> str:
+        return build_plan_hash(self.canonical_payload())
+
+    def require_integrity(self, *, now_monotonic_ns: int | None = None, check_expiration: bool = False) -> None:
+        computed = self.recompute_plan_hash()
+        if not secrets.compare_digest(self.plan_hash, computed):
+            raise ReplayPlanIntegrityError("replay plan payload changed after review")
+        if (
+            check_expiration
+            and self.expires_at_monotonic_ns is not None
+            and (now_monotonic_ns or time.monotonic_ns()) > self.expires_at_monotonic_ns
+        ):
+            raise ReplayPlanStaleError("replay plan expired; generate a fresh plan")
+
+    def with_integrity_context(
+        self,
+        *,
+        generation_id: int | None = None,
+        resource_owner_id: str | None = None,
+        resource_lease_id: str | None = None,
+        created_from_robot_state_hash: str | None = None,
+    ) -> ReplayPlan:
+        return dataclasses.replace(
+            self,
+            generation_id=self.generation_id if generation_id is None else generation_id,
+            resource_owner_id=self.resource_owner_id if resource_owner_id is None else resource_owner_id,
+            resource_lease_id=self.resource_lease_id if resource_lease_id is None else resource_lease_id,
+            created_from_robot_state_hash=(
+                self.created_from_robot_state_hash
+                if created_from_robot_state_hash is None
+                else created_from_robot_state_hash
+            ),
+            plan_hash="",
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -258,9 +393,7 @@ class RobotReplayCursor:
 
 
 def build_plan_hash(payload: Mapping[str, Any]) -> str:
-    return hashlib.sha256(
-        json.dumps(_json_safe(payload), sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
-    ).hexdigest()
+    return canonical_hash(payload)
 
 
 def new_plan_identity() -> tuple[str, str]:

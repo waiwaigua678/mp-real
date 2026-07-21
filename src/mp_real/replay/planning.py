@@ -47,6 +47,7 @@ class ReplayPlanner:
         speed_scale: float = 0.1,
         constraints: ReplayConstraints | None = None,
         generation_id: int = 1,
+        resource_owner_id: str | None = None,
     ) -> ReplayPlanningResult:
         constraints = constraints or ReplayConstraints()
         errors: list[ReplaySafetyIssue] = []
@@ -186,34 +187,8 @@ class ReplayPlanner:
                     f"maximum acceleration {max_acceleration:.6f} exceeds {constraints.max_acceleration:.6f}",
                 )
             )
-        dataset_hash = build_plan_hash(
-            {
-                "dataset": dataset_id,
-                "info": info,
-                "episode": episode_index,
-                "range": (start, end),
-                "timestamps": [sample[2] for sample in samples],
-                "frame_indices": [sample[1] for sample in samples],
-                "targets": values,
-            }
-        )
+        dataset_hash = build_replay_source_hash(dataset_id, info, episode_index, start, end, samples, values)
         plan_id, session_id = new_plan_identity()
-        plan_payload: Mapping[str, Any] = {
-            "dataset_hash": dataset_hash,
-            "episode_index": episode_index,
-            "start_sample": start,
-            "end_sample": end,
-            "robot_name": robot_name,
-            "mode": mode.value,
-            "timing_mode": timing_mode.value,
-            "speed_scale": speed_scale,
-            "action_spec": target_action_spec,
-            "source": source_contract,
-            "offsets_s": offsets_s,
-            "constraints": constraints,
-            "generation_id": generation_id,
-        }
-        plan_hash = build_plan_hash(plan_payload)
         plan = None
         if not errors:
             steps = tuple(
@@ -240,7 +215,7 @@ class ReplayPlanner:
                 steps=steps,
                 constraints=constraints,
                 created_at_monotonic_ns=time.monotonic_ns(),
-                plan_hash=plan_hash,
+                resource_owner_id=resource_owner_id,
             )
         report = ReplaySafetyReport(
             errors=tuple(errors),
@@ -253,7 +228,7 @@ class ReplayPlanner:
             expected_duration_s=offsets_s[-1] if offsets_s else 0.0,
             start_state=samples[0][4].copy() if samples else None,
             end_state=samples[-1][4].copy() if samples else None,
-            plan_hash=plan_hash if plan is not None else None,
+            plan_hash=plan.plan_hash if plan is not None else None,
             source_dataset_id=dataset_id,
             source_dataset_hash=dataset_hash,
         )
@@ -391,3 +366,28 @@ class ReplayPlanner:
             return maximum_delta, maximum_velocity, 0.0
         acceleration = np.abs(np.diff(velocity, axis=0)) / intervals[1:, None]
         return maximum_delta, maximum_velocity, float(np.max(acceleration))
+
+
+def build_replay_source_hash(
+    dataset_id: str,
+    info: Mapping[str, Any],
+    episode_index: int,
+    start_sample: int,
+    end_sample: int,
+    samples: list[tuple[int, int, float, np.ndarray, np.ndarray]],
+    targets: np.ndarray,
+) -> str:
+    """Hash the source data that affects replay motion and expected tracking."""
+
+    return build_plan_hash(
+        {
+            "dataset": dataset_id,
+            "info": info,
+            "episode": episode_index,
+            "range": (start_sample, end_sample),
+            "timestamps": [sample[2] for sample in samples],
+            "frame_indices": [sample[1] for sample in samples],
+            "targets": targets,
+            "expected_states": np.vstack([sample[4] for sample in samples]) if samples else np.empty((0, 0)),
+        }
+    )

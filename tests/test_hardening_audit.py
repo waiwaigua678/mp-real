@@ -730,9 +730,8 @@ class HardeningPoseReplaySafetyTests(unittest.TestCase):
                 with self.assertRaises(PoseValidationError):
                     report.require_valid()
 
-    @unittest.expectedFailure
     def test_h3_replay_plan_hash_should_reject_step_array_mutation(self) -> None:
-        """Expected to pass after H3 recomputes payload hashes before arming/running."""
+        """H3 recomputes payload hashes before arming/running."""
 
         plan = _replay_plan()
         robot = _FakeReplayRobot()
@@ -741,19 +740,26 @@ class HardeningPoseReplaySafetyTests(unittest.TestCase):
             controller.prepare()
             _wait(lambda: controller.cursor().state in {ReplayState.ARMED, ReplayState.ERROR})
             self.assertEqual(controller.cursor().state, ReplayState.ARMED, controller.cursor().message)
-            plan.steps[1].target[0] += 0.25
+            with self.assertRaises(ValueError):
+                plan.steps[1].target[0] += 0.25
+            replacement = plan.steps[1].target.copy()
+            replacement[0] += 0.25
+            object.__setattr__(plan.steps[1], "target", replacement)
             with self.assertRaises(ReplayPlanStaleError):
                 controller.confirm_and_start(plan.plan_hash)
         finally:
             controller.stop(wait=True, timeout=2.0)
 
-    @unittest.expectedFailure
     def test_h3_pose_plan_hash_should_reject_waypoint_array_mutation(self) -> None:
-        """Expected to pass after H3 revalidates MoveToRecordedStatePlan payload hashes."""
+        """H3 revalidates MoveToRecordedStatePlan payload hashes."""
 
         robot = _FakeReplayRobot()
         plan = _pose_plan(robot)
-        plan.waypoints[-1].target[0] += 0.25
+        with self.assertRaises(ValueError):
+            plan.waypoints[-1].target[0] += 0.25
+        replacement = plan.waypoints[-1].target.copy()
+        replacement[0] += 0.25
+        object.__setattr__(plan.waypoints[-1], "target", replacement)
         controller = PoseMoveController(robot)
         try:
             with self.assertRaises(PosePlanStaleError):
@@ -762,8 +768,8 @@ class HardeningPoseReplaySafetyTests(unittest.TestCase):
             controller.stop(wait=True, timeout=2.0)
 
     @unittest.expectedFailure
-    def test_h3_replay_controller_should_not_acknowledge_sent_with_nonzero_tracking_error(self) -> None:
-        """Expected to pass after H3 separates sent, observed, and acknowledged replay states."""
+    def test_h5_replay_controller_should_not_acknowledge_sent_with_nonzero_tracking_error(self) -> None:
+        """Expected to pass after H5 separates sent, observed, and acknowledged replay states."""
 
         plan = _replay_plan(count=2)
         robot = _FakeReplayRobot(state_bias=0.01)
@@ -778,8 +784,8 @@ class HardeningPoseReplaySafetyTests(unittest.TestCase):
         self.assertIsNone(cursor.acknowledged_sample_index)
 
     @unittest.expectedFailure
-    def test_h3_replay_planner_should_not_apply_arm_limits_to_gripper_only_changes(self) -> None:
-        """Expected to pass after H3 splits arm and gripper kinematic safety semantics."""
+    def test_h5_replay_planner_should_not_apply_arm_limits_to_gripper_only_changes(self) -> None:
+        """Expected to pass after H5 splits arm and gripper kinematic safety semantics."""
 
         samples = tuple(
             RecordedSample(

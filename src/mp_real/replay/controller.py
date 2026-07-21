@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 
+from mp_real.common.plan_integrity import PlanIntegrityError
 from mp_real.pose.controller import PoseMoveController
 from mp_real.pose.models import (
     MoveToRecordedStatePlan,
@@ -48,6 +49,7 @@ class RobotReplayController:
         record_callback: ReplayRecordCallback | None = None,
         thread_name: str = "robot-replay-controller",
     ) -> None:
+        plan.require_integrity()
         self._robot = robot
         self._plan = plan
         self._lease_valid = lease_valid or (lambda: True)
@@ -80,6 +82,7 @@ class RobotReplayController:
         """Start a background connect/revalidate/move-to-start lifecycle."""
         with self._lock:
             self._require_state(ReplayState.IDLE)
+            self._require_plan_integrity(check_expiration=True)
             self._set_cursor_locked(ReplayState.CONNECTING)
             self._thread = threading.Thread(
                 target=self._run_prepare,
@@ -92,6 +95,8 @@ class RobotReplayController:
         """Run only after a fresh user confirmation of the immutable plan."""
         with self._lock:
             self._require_state(ReplayState.ARMED)
+            self._require_plan_integrity(check_expiration=True)
+            self._require_action_spec()
             if not secrets.compare_digest(self._plan.plan_hash, str(plan_hash)):
                 raise ReplayPlanStaleError("confirmation plan hash does not match the armed plan")
             self._require_live_identity()
@@ -121,6 +126,8 @@ class RobotReplayController:
             if expected is None:
                 self._set_cursor_locked(ReplayState.ERROR, message="pause has no expected state")
                 return False
+            self._require_plan_integrity(check_expiration=True)
+            self._require_action_spec()
         actual = self._robot.read_state()
         error = self._tracking_error(actual, expected)
         if error > self._plan.constraints.tracking_tolerance:
@@ -167,6 +174,7 @@ class RobotReplayController:
 
     def _run_prepare(self) -> None:
         try:
+            self._require_plan_integrity(check_expiration=True)
             self._require_live_identity()
             if not isinstance(self._robot, PoseControlCapability):
                 raise RuntimeError("robot lacks required PoseControlCapability")
@@ -186,6 +194,7 @@ class RobotReplayController:
             self._finish_error(_ReplayStopped() if self._stop_event.is_set() else exc)
 
     def _move_to_start(self, capability: PoseControlCapability) -> None:
+        self._require_plan_integrity(check_expiration=True)
         current = capability.get_current_pose_state()
         target = RecordedPoseTarget(
             dataset_id=self._plan.dataset_id,
@@ -241,6 +250,8 @@ class RobotReplayController:
         started_ns = time.monotonic_ns()
         previous_action: np.ndarray | None = None
         try:
+            self._require_plan_integrity(check_expiration=True)
+            self._require_action_spec()
             for step_number, step in enumerate(self._plan.steps):
                 self._wait_until(started_ns + step.target_offset_ns)
                 self._require_live_identity()
@@ -327,6 +338,9 @@ class RobotReplayController:
         if not self._lease_valid():
             raise ReplayPlanStaleError("replay resource lease or generation is stale")
 
+    def _require_plan_integrity(self, *, check_expiration: bool = False) -> None:
+        self._plan.require_integrity(check_expiration=check_expiration)
+
     def _require_action_spec(self) -> None:
         if self._robot.action_spec != self._plan.action_spec:
             raise ReplayPlanStaleError("connected robot ActionSpec does not match the reviewed replay plan")
@@ -361,6 +375,8 @@ class RobotReplayController:
 
     def _finish_error(self, error: BaseException, *, abort: bool = False) -> None:
         self._safe_stop_motion()
+        if isinstance(error, PlanIntegrityError):
+            self._record_event("plan_integrity_error", error=str(error))
         with self._lock:
             self._error = error
             state = ReplayState.ABORTED if abort or isinstance(error, _ReplayStopped) else ReplayState.ERROR

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+import json
 import threading
 import time
 import unittest
@@ -8,10 +10,21 @@ from tempfile import TemporaryDirectory
 
 import numpy as np
 
+from mp_real.common.plan_integrity import canonical_hash, canonical_json
 from mp_real.data.models import FakeRecordedEpisodeSource, RecordedSample
 from mp_real.pose.models import PoseMoveProgress, PoseMoveResult, PoseValidationReport
 from mp_real.replay.controller import RobotReplayController
-from mp_real.replay.models import ReplayConstraints, ReplayMode, ReplayState, ReplayTimingMode
+from mp_real.replay.models import (
+    ReplayConstraints,
+    ReplayMode,
+    ReplayPlan,
+    ReplayPlanIntegrityError,
+    ReplayPlanStaleError,
+    ReplayState,
+    ReplayStep,
+    ReplayTimingMode,
+    json_safe,
+)
 from mp_real.replay.planning import ReplayPlanner
 from mp_real.replay.recording import ReplayRecordingConfig, ReplayRecordWriter
 from mp_real.runtime.models import ActionSpec, RobotState, VectorField
@@ -141,6 +154,20 @@ def _wait(predicate: object, timeout: float = 2.0) -> None:
 
 
 class ReplayPlanningTests(unittest.TestCase):
+    def _plan(self, *, robot_name: str = "piper", constraints: ReplayConstraints | None = None) -> ReplayPlan:
+        plan = (
+            ReplayPlanner(_source(robot_name=robot_name))
+            .plan(
+                robot_name=robot_name,
+                target_action_spec=_spec(),
+                episode_index=0,
+                constraints=constraints or _constraints(),
+            )
+            .plan
+        )
+        assert plan is not None
+        return plan
+
     def test_command_and_state_plans_are_explicit_and_hardware_free(self) -> None:
         source = _source()
         planner = ReplayPlanner(source)
@@ -225,6 +252,104 @@ class ReplayPlanningTests(unittest.TestCase):
             ),
         )
         self.assertTrue(any(item.code == "joint_limit_exceeded" for item in limit_result.report.errors))
+
+    def test_h3_replay_plan_arrays_are_readonly_and_inputs_are_copied(self) -> None:
+        target = np.asarray([0.1, 1.0], dtype=np.float32)
+        expected_state = np.asarray([0.2, 1.0], dtype=np.float32)
+        step = ReplayStep(1, 1, 0.02, 20_000_000, target, expected_state)
+        target[0] = 99.0
+        expected_state[0] = 88.0
+        np.testing.assert_allclose(step.target, [0.1, 1.0])
+        np.testing.assert_allclose(step.expected_state, [0.2, 1.0])
+        with self.assertRaises(ValueError):
+            step.target[0] = 0.5
+        with self.assertRaises(ValueError):
+            step.expected_state[0] = 0.5
+
+        result = ReplayPlanner(_source()).plan(
+            robot_name="piper", target_action_spec=_spec(), episode_index=0, constraints=_constraints()
+        )
+        assert result.plan is not None
+        self.assertFalse(result.plan.steps[0].target.flags.writeable)
+        self.assertFalse(result.plan.steps[0].expected_state.flags.writeable)
+        self.assertFalse(result.report.start_state.flags.writeable)
+        self.assertFalse(result.report.end_state.flags.writeable)
+
+    def test_h3_replay_plan_hash_covers_motion_fields_and_json_is_independent(self) -> None:
+        def assert_tamper_rejected(mutator) -> None:
+            plan = self._plan()
+            original_hash = plan.plan_hash
+            mutator(plan)
+            self.assertNotEqual(plan.recompute_plan_hash(), original_hash)
+            with self.assertRaises(ReplayPlanIntegrityError):
+                plan.require_integrity()
+
+        assert_tamper_rejected(
+            lambda plan: object.__setattr__(
+                plan.steps[1], "target", plan.steps[1].target.copy() + np.asarray([0.01, 0.0], dtype=np.float32)
+            )
+        )
+        assert_tamper_rejected(
+            lambda plan: object.__setattr__(
+                plan.steps[1],
+                "expected_state",
+                plan.steps[1].expected_state.copy() + np.asarray([0.01, 0.0], dtype=np.float32),
+            )
+        )
+        assert_tamper_rejected(
+            lambda plan: object.__setattr__(plan.steps[1], "target_offset_ns", plan.steps[1].target_offset_ns + 1)
+        )
+        assert_tamper_rejected(
+            lambda plan: object.__setattr__(
+                plan,
+                "action_spec",
+                dataclasses.replace(plan.action_spec, action_mode="alternate_joint_position_target"),
+            )
+        )
+        assert_tamper_rejected(lambda plan: object.__setattr__(plan, "dataset_hash", "replaced-source"))
+
+        plan = self._plan(
+            constraints=dataclasses.replace(_constraints(), lower_limits=(-1.0, 0.0), upper_limits=(1.0, 1.0))
+        )
+        changed_limits = dataclasses.replace(plan.constraints, lower_limits=(-0.5, 0.0), upper_limits=(0.5, 1.0))
+        changed = dataclasses.replace(plan, constraints=changed_limits, plan_hash="")
+        self.assertNotEqual(changed.plan_hash, plan.plan_hash)
+
+        payload = json_safe(plan)
+        payload["steps"][0]["target"][0] = 123.0
+        np.testing.assert_allclose(plan.steps[0].target, [0.0, 1.0])
+        plan.require_integrity()
+
+        encoded = canonical_json(plan.canonical_payload())
+        self.assertEqual(canonical_hash(json.loads(encoded)), plan.plan_hash)
+
+    def test_h3_replay_source_dataset_replacement_changes_plan_identity(self) -> None:
+        original = self._plan()
+        replaced_samples = tuple(
+            RecordedSample(
+                episode_index=0,
+                frame_index=index,
+                index=index,
+                timestamp=index * 0.02,
+                task_index=0,
+                state=np.asarray([index * 0.01, 1.0], dtype=np.float32),
+                action=np.asarray([index * 0.02, 1.0], dtype=np.float32),
+                images={},
+                telemetry={},
+            )
+            for index in range(4)
+        )
+        replaced = (
+            ReplayPlanner(FakeRecordedEpisodeSource(_spec(), {0: replaced_samples}, robot_name="piper"))
+            .plan(robot_name="piper", target_action_spec=_spec(), episode_index=0, constraints=_constraints())
+            .plan
+        )
+        assert replaced is not None
+        self.assertNotEqual(replaced.dataset_hash, original.dataset_hash)
+
+        object.__setattr__(original, "dataset_hash", replaced.dataset_hash)
+        with self.assertRaises(ReplayPlanIntegrityError):
+            original.require_integrity()
 
 
 class ReplayControllerTests(unittest.TestCase):
@@ -348,6 +473,68 @@ class ReplayControllerTests(unittest.TestCase):
             manifest = (record / "manifest.json").read_text(encoding="utf-8")
             self.assertIn(plan.plan_hash, manifest)
             self.assertIn("replay_step", (record / "events.jsonl").read_text(encoding="utf-8"))
+
+    def test_h3_replay_rehashes_before_arm_execute_resume_and_stale_identity(self) -> None:
+        plan = (
+            ReplayPlanner(_source())
+            .plan(robot_name="piper", target_action_spec=_spec(), episode_index=0, constraints=_constraints())
+            .plan
+        )
+        assert plan is not None
+        arm_robot = _FakeReplayRobot()
+        arm_controller = RobotReplayController(arm_robot, plan)
+        object.__setattr__(plan, "speed_scale", 0.2)
+        with self.assertRaises(ReplayPlanIntegrityError):
+            arm_controller.prepare()
+        self.assertEqual(arm_robot.commands, [])
+
+        execute_controller, execute_robot = self._armed_controller()
+        try:
+            target = execute_controller.plan.steps[1].target.copy()
+            target[0] += 0.25
+            object.__setattr__(execute_controller.plan.steps[1], "target", target)
+            with self.assertRaises(ReplayPlanIntegrityError):
+                execute_controller.confirm_and_start(execute_controller.plan.plan_hash)
+            self.assertEqual(execute_robot.commands, [])
+        finally:
+            execute_controller.stop(wait=True, timeout=2.0)
+
+        generation = {"value": 1}
+        stale_plan = (
+            ReplayPlanner(_source())
+            .plan(robot_name="piper", target_action_spec=_spec(), episode_index=0, constraints=_constraints())
+            .plan
+        )
+        assert stale_plan is not None
+        stale_controller = RobotReplayController(
+            _FakeReplayRobot(), stale_plan, lease_valid=lambda: generation["value"] == stale_plan.generation_id
+        )
+        stale_controller.prepare()
+        _wait(lambda: stale_controller.cursor().state is ReplayState.ARMED)
+        generation["value"] = stale_plan.generation_id + 1
+        with self.assertRaises(ReplayPlanStaleError):
+            stale_controller.confirm_and_start(stale_plan.plan_hash)
+        stale_controller.stop(wait=True, timeout=2.0)
+
+        reconnect_controller, reconnect_robot = self._armed_controller()
+        try:
+            reconnect_robot.action_spec = dataclasses.replace(_spec(), action_mode="reconnected-layout")
+            with self.assertRaises(ReplayPlanStaleError):
+                reconnect_controller.confirm_and_start(reconnect_controller.plan.plan_hash)
+            self.assertEqual(reconnect_robot.commands, [])
+        finally:
+            reconnect_controller.stop(wait=True, timeout=2.0)
+
+        resume_controller, resume_robot = self._armed_controller(count=20, speed_scale=1.0)
+        try:
+            resume_controller.confirm_and_start(resume_controller.plan.plan_hash)
+            _wait(lambda: len(resume_robot.commands) >= 2)
+            self.assertTrue(resume_controller.pause())
+            object.__setattr__(resume_controller.plan, "dataset_hash", "changed-during-pause")
+            with self.assertRaises(ReplayPlanIntegrityError):
+                resume_controller.resume()
+        finally:
+            resume_controller.stop(wait=True, timeout=2.0)
 
 
 if __name__ == "__main__":

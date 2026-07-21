@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import threading
+import uuid
 from collections.abc import Iterable
 
 
@@ -37,6 +38,7 @@ class ResourceLease:
     def __init__(self, manager: ResourceLeaseManager, owner_id: str, requests: tuple[ResourceRequest, ...]) -> None:
         self._manager = manager
         self.owner_id = owner_id
+        self.lease_id = uuid.uuid4().hex
         self.requests = requests
         self._released = False
         self._lock = threading.Lock()

@@ -69,8 +69,10 @@ def cli(argv: list[str] | None = None) -> int:
         print(json.dumps(json_safe(result.report), ensure_ascii=False, indent=2))
         if not result.report.valid or result.plan is None:
             return 2
+        result.plan.require_integrity()
         if not args.execute:
             return 0
+        result.plan.require_integrity(check_expiration=True)
         if args.confirm_plan_hash != result.plan.plan_hash:
             print("--execute requires --confirm-plan-hash matching the reviewed plan", file=sys.stderr)
             return 2
@@ -95,7 +97,7 @@ def cli(argv: list[str] | None = None) -> int:
             if not controller.join(timeout=30.0) or controller.cursor().state.value != "armed":
                 print(json.dumps(json_safe(controller.cursor()), ensure_ascii=False, indent=2), file=sys.stderr)
                 return 3
-            controller.confirm_and_start(result.plan.plan_hash)
+            controller.confirm_and_start(args.confirm_plan_hash)
             if not controller.join(timeout=result.plan.expected_duration_s + 30.0):
                 controller.stop(emergency=True, wait=True, timeout=5.0)
                 print("replay worker did not stop before timeout", file=sys.stderr)

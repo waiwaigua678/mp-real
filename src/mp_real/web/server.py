@@ -74,13 +74,14 @@ from mp_real.replay.controller import RobotReplayController
 from mp_real.replay.models import (
     ReplayMode,
     ReplayPlan,
+    ReplayPlanStaleError,
     ReplaySafetyReport,
     ReplayState,
     ReplayTimingMode,
     RobotReplayCursor,
     json_safe as _replay_json_safe,
 )
-from mp_real.replay.planning import ReplayPlanner
+from mp_real.replay.planning import ReplayPlanner, build_replay_source_hash
 from mp_real.replay.recording import ReplayRecordWriter, ReplayRecordingConfig
 from mp_real.web.runtime import CachedFrameObservationSource, WebInferenceAdapter, WebLoopHooks
 from mp_real.web.profiles import (
@@ -189,9 +190,12 @@ def _pose_validation_json(report: PoseValidationReport | None) -> dict[str, Any]
 def _pose_plan_json(plan: MoveToRecordedStatePlan | None) -> dict[str, Any] | None:
     if plan is None:
         return None
+    plan.require_integrity()
     return {
         "plan_id": plan.plan_id,
         "plan_hash": plan.plan_hash,
+        "generation_id": plan.generation_id,
+        "expires_at_monotonic_ns": plan.expires_at_monotonic_ns,
         "current_state": plan.current_state.values.tolist(),
         "target_state": plan.target_state.tolist(),
         "per_dimension_delta": plan.per_dimension_delta.tolist(),
@@ -213,9 +217,12 @@ def _replay_report_json(report: ReplaySafetyReport | None) -> dict[str, Any] | N
 def _replay_plan_json(plan: ReplayPlan | None) -> dict[str, Any] | None:
     if plan is None:
         return None
+    plan.require_integrity()
     return {
         "plan_id": plan.plan_id,
         "plan_hash": plan.plan_hash,
+        "generation_id": plan.generation_id,
+        "expires_at_monotonic_ns": plan.expires_at_monotonic_ns,
         "dataset_id": plan.dataset_id,
         "episode_index": plan.episode_index,
         "start_sample": plan.start_sample,
@@ -1257,6 +1264,7 @@ class RobotWebRuntime:
                     fps,
                     speed_scale,
                     generation_id,
+                    self._resource_owner_id,
                 ),
                 name=f"{profile.robot_name}-replay-plan-g{generation_id}",
                 daemon=False,
@@ -1279,6 +1287,7 @@ class RobotWebRuntime:
         fps: float | None,
         speed_scale: float,
         generation_id: int,
+        resource_owner_id: str,
     ) -> None:
         try:
             result = ReplayPlanner(viewer.replay_source(dataset_id)).plan(
@@ -1293,6 +1302,7 @@ class RobotWebRuntime:
                 fps=fps,
                 speed_scale=speed_scale,
                 generation_id=generation_id,
+                resource_owner_id=resource_owner_id,
             )
         except BaseException as exc:
             with self._lock:
@@ -1331,8 +1341,19 @@ class RobotWebRuntime:
             args = copy.deepcopy(self._args)
             self._replay_generation_id += 1
             generation_id = self._replay_generation_id
+            try:
+                plan = plan.with_integrity_context(
+                    generation_id=generation_id,
+                    resource_owner_id=lease.owner_id,
+                    resource_lease_id=lease.lease_id,
+                )
+                plan.require_integrity(check_expiration=True)
+            except BaseException:
+                lease.release()
+                raise
             self._replay_stop_event.clear()
             self._replay_lease = lease
+            self._replay_plan = plan
             self._replay_phase = ReplayState.CONNECTING
             self._replay_error = None
             self._replay_view_locked = True
@@ -1350,6 +1371,8 @@ class RobotWebRuntime:
         robot: Robot | None = None
         recorder: ReplayRecordWriter | None = None
         try:
+            plan.require_integrity(check_expiration=True)
+            self._require_replay_source_integrity(plan)
             args.reset_on_start = False
             if hasattr(args, "enable_on_start"):
                 args.enable_on_start = False
@@ -1436,6 +1459,7 @@ class RobotWebRuntime:
             ):
                 raise ApiError("Replay must reach ARMED before it can start", HTTPStatus.CONFLICT)
             try:
+                controller.plan.require_integrity(check_expiration=True)
                 controller.confirm_and_start(plan_hash)
             except BaseException as exc:
                 raise ApiError(f"{type(exc).__name__}: {exc}", HTTPStatus.CONFLICT) from exc
@@ -1463,6 +1487,39 @@ class RobotWebRuntime:
         if controller is None or not controller.resume():
             raise ApiError("Replay resume was rejected; move to the recorded pause state first", HTTPStatus.CONFLICT)
         return self.replay_status()
+
+    def _require_replay_source_integrity(self, plan: ReplayPlan) -> None:
+        viewer = self._recorded_data_view
+        if viewer is None:
+            return
+        source = viewer.replay_source(plan.dataset_id)
+        info = source.get_dataset_metadata().info
+        samples = []
+        targets = []
+        for sample_index in range(plan.start_sample, plan.end_sample + 1):
+            sample = source.get_sample(plan.episode_index, sample_index)
+            target = sample.action if plan.mode is ReplayMode.COMMAND_REPLAY else sample.state
+            samples.append(
+                (
+                    sample_index,
+                    sample.frame_index,
+                    float(sample.timestamp),
+                    np.asarray(target, dtype=np.float32).copy(),
+                    np.asarray(sample.state, dtype=np.float32).copy(),
+                )
+            )
+            targets.append(np.asarray(target, dtype=np.float32).copy())
+        current_hash = build_replay_source_hash(
+            plan.dataset_id,
+            info,
+            plan.episode_index,
+            plan.start_sample,
+            plan.end_sample,
+            samples,
+            np.vstack(targets) if targets else np.empty((0, 0), dtype=np.float32),
+        )
+        if current_hash != plan.dataset_hash:
+            raise ReplayPlanStaleError("source dataset changed after replay plan generation")
 
     def replay_stop(self, *, emergency: bool = False) -> dict[str, Any]:
         with self._lock:
@@ -1650,9 +1707,12 @@ class RobotWebRuntime:
                 safety_warnings=("vendor command speed capped at 10 percent",),
                 mapping_fingerprint=validation.report.mapping_fingerprint,
                 session_id=f"pose-{target.target_id[:16]}",
-                generation_id=1,
+                generation_id=generation_id,
+                resource_owner_id=lease.owner_id,
+                resource_lease_id=lease.lease_id,
             )
             plan = robot.plan_move_to_state(plan)
+            plan.require_integrity(check_expiration=True)
             self._require_pose_active(generation_id)
         except BaseException as exc:
             if robot is not None:
@@ -1687,15 +1747,16 @@ class RobotWebRuntime:
             robot = self._pose_robot
             if self._pose_phase != "awaiting_move_confirmation" or plan is None or robot is None:
                 raise ApiError("A connected, revalidated pose plan is required", HTTPStatus.CONFLICT)
-            if not secrets.compare_digest(plan.plan_hash, str(plan_hash)):
-                raise ApiError("The confirmation plan hash does not match the current plan", HTTPStatus.CONFLICT)
-            if not isinstance(robot, PoseControlCapability):
-                raise ApiError("Robot no longer supports recorded-state pose control", HTTPStatus.CONFLICT)
             controller = PoseMoveController(robot, thread_name=f"{self._profile.robot_name}-pose")
             self._pose_controller = controller
             self._pose_phase = "moving"
             self._pose_progress = None
             try:
+                plan.require_integrity(check_expiration=True)
+                if not secrets.compare_digest(plan.plan_hash, str(plan_hash)):
+                    raise ApiError("The confirmation plan hash does not match the current plan", HTTPStatus.CONFLICT)
+                if not isinstance(robot, PoseControlCapability):
+                    raise ApiError("Robot no longer supports recorded-state pose control", HTTPStatus.CONFLICT)
                 controller.start(plan, on_progress=self._record_pose_progress)
             except BaseException as exc:
                 self._pose_controller = None
@@ -1759,6 +1820,7 @@ class RobotWebRuntime:
                     "A reached recorded-state pose is required before deployment handoff",
                     HTTPStatus.CONFLICT,
                 )
+            plan.require_integrity(check_expiration=True)
             if not secrets.compare_digest(plan.plan_hash, str(plan_hash)):
                 raise ApiError("The handoff plan hash does not match the reached plan", HTTPStatus.CONFLICT)
             if self._pose_handoff_thread is not None and self._pose_handoff_thread.is_alive():
@@ -1789,6 +1851,7 @@ class RobotWebRuntime:
         controller: RuntimeController | None = None
         replacement: ResourceLease | None = None
         try:
+            plan.require_integrity(check_expiration=True)
             requested = (
                 *self._resource_requests(RuntimeMode.DEPLOYMENT, args),
                 ResourceRequest(ResourceType.RECORDED_DATA, plan.target.dataset_id),
@@ -1882,6 +1945,7 @@ class RobotWebRuntime:
                     "Recorded-state policy warmup must finish before deployment can start",
                     HTTPStatus.CONFLICT,
                 )
+            plan.require_integrity(check_expiration=True)
             if not secrets.compare_digest(plan.plan_hash, str(plan_hash)):
                 raise ApiError("The deployment plan hash does not match the reached plan", HTTPStatus.CONFLICT)
             current = controller.robot.read_state()

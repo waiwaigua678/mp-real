@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import time
 import unittest
 from pathlib import Path
@@ -16,6 +17,8 @@ from mp_real.pose.models import (
     PoseMotionConstraints,
     PoseMoveProgress,
     PoseMoveResult,
+    PosePlanIntegrityError,
+    PosePlanStaleError,
     PoseSafetyLimits,
     RecordedPoseTarget,
 )
@@ -218,6 +221,113 @@ class PoseValidationTests(unittest.TestCase):
 
 
 class PoseMoveControllerTests(unittest.TestCase):
+    def test_h3_pose_plan_arrays_are_readonly_and_inputs_are_copied(self) -> None:
+        source_values = np.asarray([0.1, -0.1, 1.0], dtype=np.float32)
+        target = _target(values=source_values)
+        source_values[0] = 99.0
+        np.testing.assert_allclose(target.state_values, [0.1, -0.1, 1.0])
+        with self.assertRaises(ValueError):
+            target.state_values[0] = 0.2
+
+        limits = PoseSafetyLimits(np.full(3, -2.0), np.full(3, 2.0))
+        with self.assertRaises(ValueError):
+            limits.lower[0] = -3.0
+
+        robot = _FakePoseRobot(np.zeros(3, dtype=np.float32))
+        plan = _plan(robot, target)
+        robot.state[:] = 42.0
+        self.assertFalse(plan.current_state.values.flags.writeable)
+        self.assertFalse(plan.target_state.flags.writeable)
+        self.assertFalse(plan.per_dimension_delta.flags.writeable)
+        self.assertFalse(plan.waypoints[0].target.flags.writeable)
+        with self.assertRaises(ValueError):
+            plan.target_state[0] = 0.3
+        with self.assertRaises(ValueError):
+            plan.current_state.values[0] = 0.3
+        with self.assertRaises(ValueError):
+            plan.waypoints[0].target[0] = 0.3
+
+    def test_h3_pose_plan_hash_covers_motion_fields_and_json_is_independent(self) -> None:
+        def make_plan() -> MoveToRecordedStatePlan:
+            return _plan(_FakePoseRobot(np.zeros(3, dtype=np.float32)), _target())
+
+        def assert_tamper_rejected(mutator) -> None:
+            plan = make_plan()
+            original_hash = plan.plan_hash
+            mutator(plan)
+            self.assertNotEqual(plan.recompute_plan_hash(), original_hash)
+            with self.assertRaises(PosePlanIntegrityError):
+                plan.require_integrity()
+
+        assert_tamper_rejected(
+            lambda plan: object.__setattr__(
+                plan.target,
+                "state_values",
+                plan.target.state_values.copy() + np.asarray([0.01, 0.0, 0.0], dtype=np.float32),
+            )
+        )
+        assert_tamper_rejected(
+            lambda plan: object.__setattr__(
+                plan,
+                "target_state",
+                plan.target_state.copy() + np.asarray([0.01, 0.0, 0.0], dtype=np.float32),
+            )
+        )
+        assert_tamper_rejected(
+            lambda plan: object.__setattr__(
+                plan.waypoints[-1],
+                "target",
+                plan.waypoints[-1].target.copy() + np.asarray([0.01, 0.0, 0.0], dtype=np.float32),
+            )
+        )
+        assert_tamper_rejected(
+            lambda plan: object.__setattr__(
+                plan.waypoints[-1],
+                "scheduled_at_monotonic_ns",
+                plan.waypoints[-1].scheduled_at_monotonic_ns + 1,
+            )
+        )
+        assert_tamper_rejected(
+            lambda plan: object.__setattr__(
+                plan.target,
+                "action_spec",
+                dataclasses.replace(plan.target.action_spec, action_mode="alternate_joint_position_target"),
+            )
+        )
+
+        plan = make_plan()
+        changed_gripper_constraints = dataclasses.replace(plan.constraints, max_gripper_step=0.01)
+        changed = dataclasses.replace(plan, constraints=changed_gripper_constraints, plan_hash="")
+        self.assertNotEqual(changed.plan_hash, plan.plan_hash)
+
+        review_json = {
+            "plan_hash": plan.plan_hash,
+            "target_state": plan.target_state.tolist(),
+            "waypoints": [waypoint.target.tolist() for waypoint in plan.waypoints],
+        }
+        review_json["target_state"][0] = 123.0
+        review_json["waypoints"][0][0] = 123.0
+        np.testing.assert_allclose(plan.target_state, [0.1, -0.1, 1.0])
+        plan.require_integrity()
+
+    def test_h3_pose_controller_rehashes_before_execute_and_rejects_expired_plan(self) -> None:
+        robot = _FakePoseRobot(np.zeros(3, dtype=np.float32))
+        plan = _plan(robot, _target())
+        object.__setattr__(
+            plan.waypoints[-1],
+            "target",
+            plan.waypoints[-1].target.copy() + np.asarray([0.25, 0.0, 0.0], dtype=np.float32),
+        )
+        with self.assertRaises(PosePlanIntegrityError):
+            PoseMoveController(robot).start(plan)
+        self.assertEqual(robot.commands, [])
+
+        fresh = _plan(robot, _target(values=np.asarray([0.01, -0.01, 1.0], dtype=np.float32)))
+        expired = dataclasses.replace(fresh, expires_at_monotonic_ns=time.monotonic_ns() - 1, plan_hash="")
+        with self.assertRaises(PosePlanStaleError):
+            PoseMoveController(robot).start(expired)
+        self.assertEqual(robot.commands, [])
+
     def test_plan_obeys_joint_step_velocity_and_acceleration_constraints(self) -> None:
         robot = _FakePoseRobot(np.zeros(3, dtype=np.float32))
         constraints = PoseMotionConstraints(
@@ -245,6 +355,27 @@ class PoseMoveControllerTests(unittest.TestCase):
                 self.assertTrue(controller.join(timeout=2.0, raise_on_error=True))
                 self.assertEqual(controller.result().status, "reached")
                 self.assertGreater(len(robot.commands), 1)
+
+        for robot_name in ("piper", "rm2"):
+            with self.subTest(plan_robot=robot_name):
+                robot = _FakePoseRobot(np.zeros(3, dtype=np.float32))
+                target = _target(robot_name=robot_name)
+                validated = MoveToStateValidator(
+                    robot_name,
+                    target.action_spec,
+                    safety_limits=PoseSafetyLimits(np.full(3, -2.0), np.full(3, 2.0)),
+                ).validate(target)
+                validated.report.require_valid()
+                plan = MoveToRecordedStatePlan.build(
+                    target=target,
+                    current_state=robot.get_current_pose_state(),
+                    target_state=validated.values,
+                    gripper_indices=validated.gripper_indices,
+                    mapped_joint_names=validated.field_names,
+                    conversions=validated.mappings,
+                    constraints=PoseMotionConstraints(control_period_s=0.001, max_joint_step=0.05),
+                )
+                plan.require_integrity()
 
     def test_stop_tracking_error_and_stale_plan_abort(self) -> None:
         slow = _FakePoseRobot(np.zeros(3, dtype=np.float32), delay_s=0.02)
