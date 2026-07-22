@@ -6,9 +6,10 @@ import dataclasses
 import logging
 import os
 import pathlib
+import queue
 import threading
 import time
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import numpy as np
 import tyro
@@ -146,6 +147,10 @@ class Args:
     gripper_max: int = 1000
     gripper_timeout: int = 0
     command_gripper: bool = True
+    async_gripper: bool = True
+    gripper_command_rate_hz: float = 10.0
+    gripper_command_deadband: float = 0.02
+    gripper_flush_timeout: float = 2.0
 
     interpolate_actions: bool = True
     command_rate_hz: float = 50.0
@@ -328,6 +333,7 @@ class RmArm:
     def command_gripper(self, value: float, args: Args) -> None:
         self._require_handle()
         value = clip_policy_gripper(value, args)
+        self.last_gripper = value
         position = policy_gripper_to_robot_position(value, args)
         t0 = time.monotonic()
         rc = self.sdk.lib.rm_set_gripper_position(self.handle, position, False, int(args.gripper_timeout))
@@ -335,8 +341,7 @@ class RmArm:
         if args.profile_timing:
             logging.info("%s command_gripper rc=%s elapsed=%.3fs", self.name, rc, elapsed)
         if rc != 0:
-            logging.warning("%s gripper command failed with code %s", self.name, rc)
-        self.last_gripper = value
+            raise RuntimeError(f"{self.name} gripper command failed with code {rc}")
 
     def stop(self) -> None:
         if self.handle is not None:
@@ -455,6 +460,302 @@ class MockArm:
         )
 
 
+class GripperTransport(Protocol):
+    def cache_pair(self, left_value: float, right_value: float) -> None: ...
+    def send_pair(self, left_value: float, right_value: float) -> None: ...
+    def close(self) -> None: ...
+
+
+class GripperCommander(Protocol):
+    def command(self, left_value: float, right_value: float, *, force: bool = False) -> int: ...
+    def flush(self, seq: int | None, *, timeout: float) -> bool: ...
+    def raise_error(self) -> None: ...
+    def close(self) -> None: ...
+
+
+class SdkGripperTransport:
+    """The RM SDK gripper boundary shared by synchronous and asynchronous dispatch."""
+
+    def __init__(self, left: Any, right: Any, args: Args) -> None:
+        self.left = left
+        self.right = right
+        self.args = args
+
+    def cache_pair(self, left_value: float, right_value: float) -> None:
+        self.left.last_gripper = clip_policy_gripper(left_value, self.args)
+        self.right.last_gripper = clip_policy_gripper(right_value, self.args)
+
+    def send_pair(self, left_value: float, right_value: float) -> None:
+        self.left.command_gripper(left_value, self.args)
+        self.right.command_gripper(right_value, self.args)
+
+    def close(self) -> None:
+        pass
+
+
+class SyncGripperCommander:
+    """Compatibility path retaining the former inline SDK calls."""
+
+    def __init__(self, transport: GripperTransport) -> None:
+        self._transport = transport
+        self._seq = 0
+
+    def command(self, left_value: float, right_value: float, *, force: bool = False) -> int:
+        del force
+        self._seq += 1
+        self._transport.cache_pair(left_value, right_value)
+        self._transport.send_pair(left_value, right_value)
+        return self._seq
+
+    def flush(self, seq: int | None, *, timeout: float) -> bool:
+        del seq, timeout
+        return True
+
+    def raise_error(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self._transport.close()
+
+
+@dataclasses.dataclass(frozen=True)
+class _GripperCommand:
+    seq: int
+    left_value: float
+    right_value: float
+    force: bool
+
+
+class AsyncGripperCommander:
+    """Bounded latest-value gripper worker that never blocks the control loop.
+
+    The one-element queue deliberately coalesces commands while an SDK call is
+    in flight. Sequence numbers make flushes deterministic: a coalesced
+    sequence is considered complete only after the newer command replacing it
+    has completed.
+    """
+
+    _STOP = object()
+    _MIN_JOIN_TIMEOUT_S = 0.1
+
+    def __init__(self, transport: GripperTransport, args: Args) -> None:
+        self._transport = transport
+        self._args = args
+        self._min_interval = 1.0 / float(args.gripper_command_rate_hz)
+        self._deadband = gripper_deadband_to_policy(args)
+        self._profile_timing = bool(args.profile_timing)
+        self._commands: queue.Queue[_GripperCommand | object] = queue.Queue(maxsize=1)
+        self._cond = threading.Condition()
+        self._stop_event = threading.Event()
+        self._seq = 0
+        self._completed_seq = 0
+        self._latest_values: tuple[float, float] | None = None
+        self._last_sent: tuple[float, float] | None = None
+        self._last_send_t = 0.0
+        self._coalesced_count = 0
+        self._error: BaseException | None = None
+        self._closing = False
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="rm2-gripper-commander",
+            daemon=False,
+        )
+        self._thread.start()
+
+    @property
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    @property
+    def thread_daemon(self) -> bool:
+        return self._thread.daemon
+
+    @property
+    def coalesced_count(self) -> int:
+        with self._cond:
+            return self._coalesced_count
+
+    def command(self, left_value: float, right_value: float, *, force: bool = False) -> int:
+        left_value = clip_policy_gripper(left_value, self._args)
+        right_value = clip_policy_gripper(right_value, self._args)
+        with self._cond:
+            self._raise_error_unlocked()
+            if self._closing or self._closed or self._stop_event.is_set():
+                raise RuntimeError("Async gripper commander is stopped")
+            self._seq += 1
+            command = _GripperCommand(self._seq, left_value, right_value, bool(force))
+            self._latest_values = (left_value, right_value)
+            self._transport.cache_pair(left_value, right_value)
+            self._put_latest_unlocked(command)
+            self._cond.notify_all()
+            return command.seq
+
+    def flush(self, seq: int | None, *, timeout: float) -> bool:
+        if seq is None:
+            return True
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._cond:
+            while self._completed_seq < seq:
+                self._raise_error_unlocked()
+                if self._stop_event.is_set():
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
+            self._raise_error_unlocked()
+            return True
+
+    def raise_error(self) -> None:
+        with self._cond:
+            self._raise_error_unlocked()
+
+    def close(self) -> None:
+        flush_timeout = max(0.0, float(self._args.gripper_flush_timeout))
+        deadline = time.monotonic() + flush_timeout
+        error: BaseException | None = None
+        with self._cond:
+            self._closing = True
+            target_seq = self._seq
+        try:
+            if not self.flush(target_seq, timeout=max(0.0, deadline - time.monotonic())):
+                error = TimeoutError(
+                    f"Timed out flushing RM2 gripper command {target_seq} "
+                    f"after {self._args.gripper_flush_timeout:.3f}s"
+                )
+        except BaseException as exc:
+            error = exc
+
+        self._request_stop()
+        join_timeout = max(self._MIN_JOIN_TIMEOUT_S, flush_timeout)
+        self._thread.join(timeout=join_timeout)
+        if self._thread.is_alive():
+            if error is None:
+                error = TimeoutError(
+                    f"RM2 gripper worker did not stop within {join_timeout:.3f}s"
+                )
+        else:
+            try:
+                self._transport.close()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+            with self._cond:
+                self._closed = True
+
+        if error is not None:
+            raise error
+        self.raise_error()
+
+    def _run(self) -> None:
+        while True:
+            item = self._commands.get()
+            try:
+                if item is self._STOP or self._stop_event.is_set():
+                    return
+                assert isinstance(item, _GripperCommand)
+                if self._should_skip(item):
+                    self._mark_completed(item.seq)
+                    continue
+
+                if not item.force:
+                    delay = self._min_interval - (time.monotonic() - self._last_send_t)
+                    if delay > 0 and self._stop_event.wait(delay):
+                        return
+                    if not self._commands.empty():
+                        continue
+
+                started = time.monotonic()
+                try:
+                    self._transport.send_pair(item.left_value, item.right_value)
+                except BaseException as exc:
+                    self._record_error(exc)
+                    return
+                elapsed = time.monotonic() - started
+
+                with self._cond:
+                    self._last_sent = (item.left_value, item.right_value)
+                    self._last_send_t = time.monotonic()
+                    if self._latest_values is not None:
+                        self._transport.cache_pair(*self._latest_values)
+                if self._profile_timing:
+                    logging.info("async command_gripper elapsed=%.3fs", elapsed)
+                self._mark_completed(item.seq)
+            finally:
+                self._commands.task_done()
+
+    def _should_skip(self, command: _GripperCommand) -> bool:
+        if command.force or self._last_sent is None or self._deadband <= 0:
+            return False
+        return (
+            abs(command.left_value - self._last_sent[0]) < self._deadband
+            and abs(command.right_value - self._last_sent[1]) < self._deadband
+        )
+
+    def _mark_completed(self, seq: int) -> None:
+        with self._cond:
+            self._completed_seq = max(self._completed_seq, seq)
+            self._cond.notify_all()
+
+    def _record_error(self, error: BaseException) -> None:
+        with self._cond:
+            if self._error is None:
+                self._error = error
+            self._stop_event.set()
+            self._discard_pending_unlocked()
+            self._cond.notify_all()
+
+    def _request_stop(self) -> None:
+        with self._cond:
+            self._stop_event.set()
+            self._discard_pending_unlocked()
+            try:
+                self._commands.put_nowait(self._STOP)
+            except queue.Full:
+                # The queue is drained while holding the condition, so this is
+                # only possible if the worker raced us and a wake-up is no
+                # longer needed.
+                pass
+            self._cond.notify_all()
+
+    def _put_latest_unlocked(self, command: _GripperCommand) -> None:
+        while True:
+            try:
+                self._commands.put_nowait(command)
+                return
+            except queue.Full:
+                try:
+                    pending = self._commands.get_nowait()
+                except queue.Empty:
+                    continue
+                self._commands.task_done()
+                if pending is not self._STOP:
+                    self._coalesced_count += 1
+
+    def _discard_pending_unlocked(self) -> None:
+        while True:
+            try:
+                self._commands.get_nowait()
+            except queue.Empty:
+                return
+            else:
+                self._commands.task_done()
+
+    def _raise_error_unlocked(self) -> None:
+        if self._error is not None:
+            raise self._error
+
+
+def create_gripper_commander(left: Any, right: Any, args: Args) -> GripperCommander | None:
+    if args.dry_run or not args.command_gripper:
+        return None
+    transport = SdkGripperTransport(left, right, args)
+    if args.async_gripper:
+        return AsyncGripperCommander(transport, args)
+    return SyncGripperCommander(transport)
+
+
 @dataclasses.dataclass
 class Rm2Robot(Robot):
     """RM2 SDK adapter exposing the robot-independent runtime boundary."""
@@ -465,6 +766,18 @@ class Rm2Robot(Robot):
     robot_lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
     safety_profile: RobotSafetyProfile | None = None
     action_spec: ActionSpec = dataclasses.field(init=False)
+    gripper_commander: GripperCommander | None = dataclasses.field(default=None, init=False, repr=False)
+    _gripper_commander_lock: threading.Lock = dataclasses.field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+    _close_lock: threading.Lock = dataclasses.field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+    _close_complete: bool = dataclasses.field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.action_spec = ActionSpec(
@@ -475,9 +788,27 @@ class Rm2Robot(Robot):
             camera_roles=("left_color", "right_color", "head_color"),
             state_fields=_vector_fields(self.args),
             action_fields=_vector_fields(self.args),
-    )
+        )
+
+    def _get_gripper_commander(self) -> GripperCommander | None:
+        if self.args.dry_run or not self.args.command_gripper:
+            return None
+        with self._gripper_commander_lock:
+            if self.gripper_commander is None:
+                self.gripper_commander = create_gripper_commander(self.left, self.right, self.args)
+            return self.gripper_commander
+
+    def _raise_gripper_error(self) -> None:
+        commander = self.gripper_commander
+        if commander is not None:
+            commander.raise_error()
+
+    @property
+    def close_complete(self) -> bool:
+        return self._close_complete
 
     def read_state(self) -> RobotState:
+        self._raise_gripper_error()
         timestamp_ns = time.monotonic_ns()
         with self.robot_lock:
             values = np.concatenate(
@@ -497,6 +828,9 @@ class Rm2Robot(Robot):
         )
 
     def execute_transition(self, previous: np.ndarray | None, target: np.ndarray) -> np.ndarray:
+        commander = self._get_gripper_commander()
+        if commander is not None:
+            commander.raise_error()
         return execute_action_transition(
             previous,
             target,
@@ -504,10 +838,19 @@ class Rm2Robot(Robot):
             self.right,
             self.args,
             robot_lock=self.robot_lock,
+            gripper_commander=commander,
         )
 
     def reset(self) -> None:
-        maybe_reset_arms(self.left, self.right, self.args, self.robot_lock)
+        if not self.args.reset_on_start:
+            return
+        maybe_reset_arms(
+            self.left,
+            self.right,
+            self.args,
+            self.robot_lock,
+            gripper_commander=self._get_gripper_commander(),
+        )
 
     def get_current_pose_state(self) -> RobotState:
         return self.read_state()
@@ -558,6 +901,7 @@ class Rm2Robot(Robot):
 
     def execute_pose_plan(self, plan, *, stop_event, on_progress=None) -> PoseMoveResult:
         previous = self.get_current_pose_state()
+        gripper_commander = self._get_gripper_commander()
         for waypoint in plan.waypoints:
             if stop_event.is_set():
                 return PoseMoveResult(plan.plan_id, "aborted", previous, None, "stop requested")
@@ -566,7 +910,13 @@ class Rm2Robot(Robot):
             if error > plan.constraints.max_tracking_error:
                 return PoseMoveResult(plan.plan_id, "failed", previous, error, "tracking error exceeded")
             with self.robot_lock:
-                _send_action_unlocked(waypoint.target, self.left, self.right, self.args)
+                _send_action_unlocked(
+                    waypoint.target,
+                    self.left,
+                    self.right,
+                    self.args,
+                    gripper_commander=gripper_commander,
+                )
             if stop_event.wait(plan.constraints.control_period_s):
                 return PoseMoveResult(plan.plan_id, "aborted", self.get_current_pose_state(), None, "stop requested")
             previous = self.get_current_pose_state()
@@ -605,11 +955,44 @@ class Rm2Robot(Robot):
         return PoseMoveResult(plan.plan_id, status, current, error, None if status == "reached" else "tracking error")
 
     def close(self) -> None:
+        # Web disconnect requests can arrive concurrently. Keep commander
+        # shutdown and RM SDK handle deletion in one serialized transaction.
+        with self._close_lock:
+            self._close_unlocked()
+
+    def _close_unlocked(self) -> None:
+        if self._close_complete:
+            return
+        errors: list[BaseException] = []
+        commander = self.gripper_commander
+        if commander is not None:
+            try:
+                commander.close()
+            except BaseException as exc:
+                errors.append(exc)
+            if bool(getattr(commander, "is_alive", False)):
+                # Never delete an RM arm handle while the SDK worker may still
+                # be using it. The non-daemon worker and propagated timeout
+                # make this lifecycle failure explicit to the caller.
+                if errors:
+                    raise errors[0]
+                raise RuntimeError("RM2 gripper worker is still alive during robot close")
+
+        arm_close_failed = False
         for arm in (self.left, self.right):
             try:
                 arm.stop()
-            finally:
+            except BaseException as exc:
+                errors.append(exc)
+            try:
                 close_arm(arm)
+            except BaseException as exc:
+                errors.append(exc)
+                arm_close_failed = True
+        if not arm_close_failed:
+            self._close_complete = True
+        if errors:
+            raise errors[0]
 
 
 def resolve_existing_path(
@@ -928,6 +1311,35 @@ def policy_gripper_to_robot_position(value: float, args: Args) -> int:
     return int(round(args.gripper_min + value * gripper_span(args)))
 
 
+def gripper_deadband_to_policy(args: Args) -> float:
+    deadband = float(args.gripper_command_deadband)
+    if args.policy_gripper_unit == "raw" and deadband <= 1.0:
+        return deadband * gripper_span(args)
+    return deadband
+
+
+def policy_state_from_feedback(state: RobotState, args: Args) -> RobotState:
+    """Build policy state without changing the robot's real feedback boundary."""
+
+    values = np.asarray(state.values).copy()
+    if args.use_static_left_state:
+        if values.ndim != 1 or values.shape[0] < args.joint_dof:
+            raise ValueError(
+                f"RM2 feedback state needs at least {args.joint_dof} values, got shape {values.shape}"
+            )
+        values[: args.joint_dof] = np.asarray(
+            args.static_left_joints[: args.joint_dof],
+            dtype=values.dtype,
+        )
+    return RobotState(
+        values=values,
+        timestamp_monotonic=state.timestamp_monotonic,
+        timestamp_monotonic_ns=state.timestamp_monotonic_ns,
+        source_timestamp_ns=state.source_timestamp_ns,
+        health=state.health,
+    )
+
+
 def left_state_joints(left: Any, args: Args) -> np.ndarray:
     if args.use_static_left_state:
         return np.asarray(args.static_left_joints[: args.joint_dof], dtype=np.float32)
@@ -1063,21 +1475,35 @@ def limit_action_to_feedback(action: np.ndarray, left: RmArm, right: RmArm, args
 
 
 def _send_action_unlocked(
-    action: np.ndarray, left: RmArm, right: RmArm, args: Args, *, send_gripper: bool = True
-) -> None:
+    action: np.ndarray,
+    left: RmArm,
+    right: RmArm,
+    args: Args,
+    *,
+    send_gripper: bool = True,
+    force_gripper: bool = False,
+    gripper_commander: GripperCommander | None = None,
+) -> int | None:
     lj, lg, rj, rg = action_to_targets(action, args)
     left.last_gripper = clip_policy_gripper(lg, args)
     right.last_gripper = clip_policy_gripper(rg, args)
     if args.dry_run:
         logging.info("dry-run left=%s lg=%.3f right=%s rg=%.3f", lj, left.last_gripper, rj, right.last_gripper)
-        return
+        return None
     if args.command_left_arm:
         left.command_joints(policy_joints_to_robot(lj, args), args)
     if args.command_right_arm:
         right.command_joints(policy_joints_to_robot(rj, args), args)
     if args.command_gripper and send_gripper:
+        if gripper_commander is not None:
+            return gripper_commander.command(
+                left.last_gripper,
+                right.last_gripper,
+                force=force_gripper,
+            )
         left.command_gripper(left.last_gripper, args)
         right.command_gripper(right.last_gripper, args)
+    return None
 
 
 def execute_action_transition(
@@ -1088,6 +1514,7 @@ def execute_action_transition(
     args: Args,
     *,
     robot_lock: threading.Lock,
+    gripper_commander: GripperCommander | None = None,
 ) -> np.ndarray:
     with robot_lock:
         limited_target = limit_action_to_feedback(target_action, left, right, args)
@@ -1095,7 +1522,13 @@ def execute_action_transition(
     steps = interpolation_steps(args)
     if start_action is None or steps <= 1:
         with robot_lock:
-            _send_action_unlocked(limited_target, left, right, args)
+            _send_action_unlocked(
+                limited_target,
+                left,
+                right,
+                args,
+                gripper_commander=gripper_commander,
+            )
         return limited_target
 
     start_action = np.asarray(start_action, dtype=np.float32)
@@ -1106,7 +1539,14 @@ def execute_action_transition(
         command = start_action + ratio * (limited_target - start_action)
         send_gripper = args.command_gripper_every_step or i == steps
         with robot_lock:
-            _send_action_unlocked(command, left, right, args, send_gripper=send_gripper)
+            _send_action_unlocked(
+                command,
+                left,
+                right,
+                args,
+                send_gripper=send_gripper,
+                gripper_commander=gripper_commander,
+            )
         next_t += interval_s
         if i < steps:
             sleep_until(next_t)
@@ -1119,7 +1559,13 @@ def interpolation_steps(args: Args) -> int:
     return max(1, round(args.command_rate_hz / args.fps))
 
 
-def maybe_reset_arms(left: RmArm, right: RmArm, args: Args, robot_lock: threading.Lock) -> None:
+def maybe_reset_arms(
+    left: RmArm,
+    right: RmArm,
+    args: Args,
+    robot_lock: threading.Lock,
+    gripper_commander: GripperCommander | None = None,
+) -> None:
     if not args.reset_on_start:
         return
     action = np.concatenate(
@@ -1131,7 +1577,22 @@ def maybe_reset_arms(left: RmArm, right: RmArm, args: Args, robot_lock: threadin
         ]
     )
     with robot_lock:
-        _send_action_unlocked(action, left, right, args)
+        seq = _send_action_unlocked(
+            action,
+            left,
+            right,
+            args,
+            force_gripper=True,
+            gripper_commander=gripper_commander,
+        )
+    if gripper_commander is not None and not gripper_commander.flush(
+        seq,
+        timeout=args.gripper_flush_timeout,
+    ):
+        raise TimeoutError(
+            "Timed out waiting for RM2 reset gripper command after "
+            f"{args.gripper_flush_timeout:.3f}s"
+        )
 
 
 @dataclasses.dataclass
@@ -1161,7 +1622,7 @@ class Rm2InferenceAdapter:
         return response_to_action_chunk(response, self.args)
 
     def initial_action(self) -> np.ndarray:
-        return self.robot.read_state().values
+        return policy_state_from_feedback(self.robot.read_state(), self.args).values
 
     def stabilize_action(self, action: np.ndarray, previous: np.ndarray | None) -> np.ndarray:
         return stabilize_action(action, previous, self.args)
@@ -1194,11 +1655,12 @@ def run_infer_only(
     args: Args,
     robot_lock: threading.Lock,
 ) -> None:
-    run_generic_infer_only(
-        client,
-        _adapter(cameras, left, right, args, robot_lock),
-        InferenceLoopConfig.from_args(args),
-    )
+    adapter = _adapter(cameras, left, right, args, robot_lock)
+    try:
+        run_generic_infer_only(client, adapter, InferenceLoopConfig.from_args(args))
+    finally:
+        if adapter.robot.gripper_commander is not None:
+            adapter.robot.gripper_commander.close()
 
 
 def run_sync_loop(
@@ -1209,7 +1671,12 @@ def run_sync_loop(
     args: Args,
     robot_lock: threading.Lock,
 ) -> None:
-    run_generic_sync_loop(client, _adapter(cameras, left, right, args, robot_lock), InferenceLoopConfig.from_args(args))
+    adapter = _adapter(cameras, left, right, args, robot_lock)
+    try:
+        run_generic_sync_loop(client, adapter, InferenceLoopConfig.from_args(args))
+    finally:
+        if adapter.robot.gripper_commander is not None:
+            adapter.robot.gripper_commander.close()
 
 
 def run_rtc_loop(
@@ -1220,7 +1687,12 @@ def run_rtc_loop(
     args: Args,
     robot_lock: threading.Lock,
 ) -> None:
-    run_generic_rtc_loop(client, _adapter(cameras, left, right, args, robot_lock), InferenceLoopConfig.from_args(args))
+    adapter = _adapter(cameras, left, right, args, robot_lock)
+    try:
+        run_generic_rtc_loop(client, adapter, InferenceLoopConfig.from_args(args))
+    finally:
+        if adapter.robot.gripper_commander is not None:
+            adapter.robot.gripper_commander.close()
 
 
 def validate_args(args: Args) -> None:
@@ -1232,6 +1704,12 @@ def validate_args(args: Args) -> None:
         raise ValueError("static_left_joints must contain at least joint_dof values")
     if args.gripper_max <= args.gripper_min:
         raise ValueError("gripper_max must be greater than gripper_min")
+    if args.command_gripper and args.gripper_command_rate_hz <= 0:
+        raise ValueError("gripper_command_rate_hz must be positive when command_gripper is enabled")
+    if args.gripper_command_deadband < 0:
+        raise ValueError("gripper_command_deadband must be non-negative")
+    if args.gripper_flush_timeout < 0:
+        raise ValueError("gripper_flush_timeout must be non-negative")
     if not args.command_left_arm and not args.command_right_arm:
         raise ValueError("at least one arm command must be enabled")
     if args.command_rate_hz <= 0:

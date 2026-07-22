@@ -492,9 +492,19 @@
             </label>
           </section>
 
+          <section class="form-section" data-rm2-only="true">
+            <h3>RM2 相机</h3>
+            <label><span>Camera Backend</span><select name="camera_backend" data-connection-field="true"><option value="ros">ros</option><option value="realsense">realsense</option><option value="black">black</option></select></label>
+            <label><span>Left Topic</span><input name="cam_left_topic" type="text" data-connection-field="true" /></label>
+            <label><span>Right Topic</span><input name="cam_right_topic" type="text" data-connection-field="true" /></label>
+            <label><span>Head Topic</span><input name="cam_head_topic" type="text" data-connection-field="true" /></label>
+            <label><span>Left Serial</span><input name="cam_left_serial" type="text" data-connection-field="true" /></label>
+            <label><span>Right Serial</span><input name="cam_right_serial" type="text" data-connection-field="true" /></label>
+            <label><span>Head Serial</span><input name="cam_head_serial" type="text" data-connection-field="true" /></label>
+          </section>
+
           <section class="form-section" data-deployment-only="true" data-rm2-only="true">
-            <h3>RM2</h3>
-            <label><span>Camera Backend</span><select name="camera_backend"><option value="ros">ros</option><option value="realsense">realsense</option><option value="black">black</option></select></label>
+            <h3>RM2 机器人</h3>
             <label><span>RM Config</span><input name="rm_config" type="text" /></label>
             <label><span>RM SDK Lib</span><input name="rm_sdk_lib" type="text" /></label>
             <label><span>Left IP</span><input name="left_ip" type="text" /></label>
@@ -510,14 +520,15 @@
             <label><span>夹爪最小</span><input name="gripper_min" type="number" step="1" /></label>
             <label><span>夹爪最大</span><input name="gripper_max" type="number" step="1" /></label>
             <label><span>夹爪超时</span><input name="gripper_timeout" type="number" min="0" step="1" /></label>
-            <label><span>Left Topic</span><input name="cam_left_topic" type="text" /></label>
-            <label><span>Right Topic</span><input name="cam_right_topic" type="text" /></label>
-            <label><span>Head Topic</span><input name="cam_head_topic" type="text" /></label>
+            <label><span>异步夹爪频率 Hz</span><input name="gripper_command_rate_hz" type="number" min="0.1" step="0.1" data-connection-field="true" /></label>
+            <label><span>异步夹爪死区</span><input name="gripper_command_deadband" type="number" min="0" step="0.01" data-connection-field="true" /></label>
+            <label><span>夹爪退出等待 s</span><input name="gripper_flush_timeout" type="number" min="0" step="0.1" data-connection-field="true" /></label>
             <div class="toggles wide">
               <label><input name="use_static_left_state" type="checkbox" /> 静态左臂状态</label>
               <label><input name="command_left_arm" type="checkbox" /> 下发左臂</label>
               <label><input name="command_right_arm" type="checkbox" /> 下发右臂</label>
               <label><input name="command_gripper" type="checkbox" /> 下发夹爪</label>
+              <label><input name="async_gripper" type="checkbox" data-connection-field="true" checked /> 异步夹爪</label>
               <label><input name="read_gripper_state" type="checkbox" /> 读取夹爪反馈</label>
             </div>
           </section>

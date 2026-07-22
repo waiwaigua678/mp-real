@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import time
 import unittest
 from typing import Any
@@ -11,7 +12,7 @@ from mp_real.common.camera import BlackCamera
 from mp_real.runtime.models import ActionSpec, RobotState
 from mp_real.web.profiles import PIPER_WEB_PROFILE, RM2_WEB_PROFILE
 from mp_real.web.resources import ResourceLeaseConflict, ResourceLeaseManager, ResourceRequest, ResourceType
-from mp_real.web.server import RobotWebRuntime
+from mp_real.web.server import ApiError, PiperWebHandler, PiperWebServer, RobotWebRuntime
 
 
 class _Robot:
@@ -56,6 +57,58 @@ class _Policy:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _TrackedBlackCamera(BlackCamera):
+    def __init__(self, name: str) -> None:
+        super().__init__(name, width=8, height=6)
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _RetryCloseRobot(_Robot):
+    def __init__(self, action_spec: ActionSpec) -> None:
+        super().__init__(action_spec)
+        self.close_calls = 0
+        self.close_complete = False
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.close_calls == 1:
+            raise TimeoutError("fake worker is still stopping")
+        self.closed = True
+        self.close_complete = True
+
+
+class _ResetFailRetryCloseRobot(_RetryCloseRobot):
+    def reset(self) -> None:
+        raise RuntimeError("fake reset failed")
+
+
+class _SlowCloseRobot(_Robot):
+    def __init__(self, action_spec: ActionSpec) -> None:
+        super().__init__(action_spec)
+        self.close_entered = threading.Event()
+        self.release_close = threading.Event()
+        self.close_calls = 0
+        self.concurrent_closes = 0
+        self.max_concurrent_closes = 0
+        self.close_complete = False
+        self._close_tracking_lock = threading.Lock()
+
+    def close(self) -> None:
+        with self._close_tracking_lock:
+            self.close_calls += 1
+            self.concurrent_closes += 1
+            self.max_concurrent_closes = max(self.max_concurrent_closes, self.concurrent_closes)
+        self.close_entered.set()
+        self.release_close.wait(timeout=2.0)
+        with self._close_tracking_lock:
+            self.concurrent_closes -= 1
+            self.closed = True
+            self.close_complete = True
 
 
 def _wait(predicate: Any, timeout: float = 2.0) -> None:
@@ -136,6 +189,478 @@ class RobotWebProfileTests(unittest.TestCase):
                 _wait(lambda: runtime.status()["connected"] or runtime.status()["phase"] == "error")
                 self.assertTrue(runtime.status()["connected"], runtime.status()["last_error"])
                 self.assertEqual(calls, [profile.robot_name])
+
+    def test_deployment_initializes_resources_in_profile_specific_order(self) -> None:
+        expected_orders = {
+            "piper": ["robot", "reset", "policy", "camera"],
+            "rm2": ["policy", "camera", "robot", "reset"],
+        }
+        for profile in (PIPER_WEB_PROFILE, RM2_WEB_PROFILE):
+            with self.subTest(robot=profile.robot_name):
+                args = profile.default_args()
+                if profile.robot_name == "piper":
+                    args.cam_head_backend = args.cam_left_wrist_backend = args.cam_right_wrist_backend = "black"
+                    args.enable_on_start = False
+                    args.reset_on_start = False
+                else:
+                    args.camera_backend = "black"
+                    args.reset_on_start = False
+                args.dry_run = True
+                events: list[str] = []
+
+                class _OrderRobot(_Robot):
+                    def reset(self) -> None:
+                        events.append("reset")
+                        super().reset()
+
+                robot = _OrderRobot(profile.action_spec_for_args(args))
+
+                def make_robot(name: str, config: Any) -> _Robot:
+                    del name, config
+                    events.append("robot")
+                    return robot
+
+                def make_policy(server_url: str, api_key: str | None, timeout: float) -> _Policy:
+                    del server_url, api_key, timeout
+                    events.append("policy")
+                    return _Policy(robot.action_spec.action_dim)
+
+                def make_cameras(config: Any) -> dict[str, BlackCamera]:
+                    events.append("camera")
+                    return {
+                        role: BlackCamera(role, width=8, height=6)
+                        for role in profile.camera_roles_for_args(config)
+                    }
+
+                runtime = RobotWebRuntime(
+                    args,
+                    profile=profile,
+                    robot_factory=make_robot,
+                    policy_client_factory=make_policy,
+                    camera_factory=make_cameras,
+                )
+                self.addCleanup(runtime.disconnect)
+
+                runtime.connect()
+                _wait(lambda: runtime.status()["connected"] or runtime.status()["phase"] == "error")
+
+                self.assertTrue(runtime.status()["connected"], runtime.status()["last_error"])
+                self.assertEqual(events, expected_orders[profile.robot_name])
+                runtime.disconnect()
+
+    def test_rm2_robot_factory_failure_closes_earlier_resources_and_releases_leases(self) -> None:
+        args = RM2_WEB_PROFILE.default_args()
+        args.camera_backend = "black"
+        args.reset_on_start = False
+        policy = _Policy(RM2_WEB_PROFILE.action_spec_for_args(args).action_dim)
+        cameras = {
+            role: _TrackedBlackCamera(role)
+            for role in RM2_WEB_PROFILE.camera_roles_for_args(args)
+        }
+
+        def fail_robot_factory(name: str, config: Any) -> _Robot:
+            del name, config
+            raise RuntimeError("rm2 robot factory failed")
+
+        runtime = RobotWebRuntime(
+            args,
+            profile=RM2_WEB_PROFILE,
+            robot_factory=fail_robot_factory,
+            policy_client_factory=lambda server_url, api_key, timeout: policy,
+            camera_factory=lambda config: cameras,
+        )
+        self.addCleanup(runtime.disconnect)
+
+        runtime.connect()
+        _wait(lambda: runtime.status()["phase"] == "error")
+        status = runtime.status()
+
+        self.assertFalse(status["connected"])
+        self.assertIn("RuntimeError: rm2 robot factory failed", status["last_error"])
+        self.assertTrue(policy.closed)
+        self.assertTrue(all(camera.closed for camera in cameras.values()))
+        self.assertEqual(status["resource_leases"], {})
+
+    def test_disconnect_retains_cleanup_ownership_until_robot_close_can_be_retried(self) -> None:
+        args = RM2_WEB_PROFILE.default_args()
+        args.camera_backend = "black"
+        args.reset_on_start = False
+        robot = _RetryCloseRobot(RM2_WEB_PROFILE.action_spec_for_args(args))
+        policy = _Policy(robot.action_spec.action_dim)
+        runtime = RobotWebRuntime(
+            args,
+            profile=RM2_WEB_PROFILE,
+            robot_factory=lambda name, config: robot,
+            policy_client_factory=lambda server_url, api_key, timeout: policy,
+            camera_factory=lambda config: {
+                role: _TrackedBlackCamera(role)
+                for role in RM2_WEB_PROFILE.camera_roles_for_args(config)
+            },
+        )
+        self.addCleanup(runtime.disconnect)
+
+        runtime.connect()
+        _wait(lambda: runtime.status()["connected"] or runtime.status()["phase"] == "error")
+        self.assertTrue(runtime.status()["connected"], runtime.status()["last_error"])
+
+        with self.assertRaises(ApiError):
+            runtime.disconnect()
+
+        failed = runtime.status()
+        self.assertTrue(failed["cleanup_pending"])
+        self.assertFalse(failed["can_connect"])
+        self.assertNotEqual(failed["resource_leases"], {})
+        self.assertEqual(robot.close_calls, 1)
+
+        disconnected = runtime.disconnect()
+
+        self.assertFalse(disconnected["cleanup_pending"])
+        self.assertFalse(disconnected["connected"])
+        self.assertEqual(disconnected["resource_leases"], {})
+        self.assertEqual(robot.close_calls, 2)
+        self.assertTrue(robot.closed)
+
+    def test_connect_failure_retains_robot_until_cleanup_retry_succeeds(self) -> None:
+        args = RM2_WEB_PROFILE.default_args()
+        args.camera_backend = "black"
+        robot = _ResetFailRetryCloseRobot(RM2_WEB_PROFILE.action_spec_for_args(args))
+        policy = _Policy(robot.action_spec.action_dim)
+        runtime = RobotWebRuntime(
+            args,
+            profile=RM2_WEB_PROFILE,
+            robot_factory=lambda name, config: robot,
+            policy_client_factory=lambda server_url, api_key, timeout: policy,
+            camera_factory=lambda config: {
+                role: _TrackedBlackCamera(role)
+                for role in RM2_WEB_PROFILE.camera_roles_for_args(config)
+            },
+        )
+        self.addCleanup(runtime.disconnect)
+
+        runtime.connect()
+        _wait(lambda: runtime.status()["phase"] == "cleanup_failed")
+        failed = runtime.status()
+
+        self.assertTrue(failed["cleanup_pending"])
+        self.assertFalse(failed["connected"])
+        self.assertFalse(failed["can_connect"])
+        self.assertNotEqual(failed["resource_leases"], {})
+        self.assertTrue(policy.closed)
+        self.assertEqual(robot.close_calls, 1)
+
+        disconnected = runtime.disconnect()
+
+        self.assertFalse(disconnected["cleanup_pending"])
+        self.assertEqual(disconnected["resource_leases"], {})
+        self.assertEqual(robot.close_calls, 2)
+        self.assertTrue(robot.closed)
+
+    def test_concurrent_disconnect_serializes_deployment_resource_close(self) -> None:
+        args = RM2_WEB_PROFILE.default_args()
+        args.camera_backend = "black"
+        args.reset_on_start = False
+        robot = _SlowCloseRobot(RM2_WEB_PROFILE.action_spec_for_args(args))
+        runtime = RobotWebRuntime(
+            args,
+            profile=RM2_WEB_PROFILE,
+            robot_factory=lambda name, config: robot,
+            policy_client_factory=lambda server_url, api_key, timeout: _Policy(robot.action_spec.action_dim),
+            camera_factory=lambda config: {
+                role: _TrackedBlackCamera(role)
+                for role in RM2_WEB_PROFILE.camera_roles_for_args(config)
+            },
+        )
+        self.addCleanup(runtime.disconnect)
+        runtime.connect()
+        _wait(lambda: runtime.status()["connected"] or runtime.status()["phase"] == "error")
+        self.assertTrue(runtime.status()["connected"], runtime.status()["last_error"])
+
+        errors: list[BaseException] = []
+
+        def disconnect() -> None:
+            try:
+                runtime.disconnect()
+            except BaseException as exc:
+                errors.append(exc)
+
+        first = threading.Thread(target=disconnect)
+        second = threading.Thread(target=disconnect)
+        first.start()
+        self.assertTrue(robot.close_entered.wait(timeout=1.0))
+        second.start()
+        time.sleep(0.02)
+        robot.release_close.set()
+        first.join(timeout=2.0)
+        second.join(timeout=2.0)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(robot.close_calls, 1)
+        self.assertEqual(robot.max_concurrent_closes, 1)
+        self.assertFalse(runtime.status()["cleanup_pending"])
+        self.assertEqual(runtime.status()["resource_leases"], {})
+
+    def test_robot_switch_is_rejected_while_deployment_cleanup_is_pending(self) -> None:
+        args = RM2_WEB_PROFILE.default_args()
+        args.camera_backend = "black"
+        args.reset_on_start = False
+        robot = _RetryCloseRobot(RM2_WEB_PROFILE.action_spec_for_args(args))
+        runtime = RobotWebRuntime(
+            args,
+            profile=RM2_WEB_PROFILE,
+            robot_factory=lambda name, config: robot,
+            policy_client_factory=lambda server_url, api_key, timeout: _Policy(robot.action_spec.action_dim),
+            camera_factory=lambda config: {
+                role: _TrackedBlackCamera(role)
+                for role in RM2_WEB_PROFILE.camera_roles_for_args(config)
+            },
+        )
+        self.addCleanup(runtime.disconnect)
+        runtime.connect()
+        _wait(lambda: runtime.status()["connected"] or runtime.status()["phase"] == "error")
+        self.assertTrue(runtime.status()["connected"], runtime.status()["last_error"])
+        with self.assertRaises(ApiError):
+            runtime.disconnect()
+        self.assertTrue(runtime.status()["cleanup_pending"])
+
+        server = object.__new__(PiperWebServer)
+        server.runtime = runtime
+        server._runtime_switch_lock = threading.Lock()
+
+        with self.assertRaisesRegex(ApiError, "cleanup completes"):
+            server.select_robot("piper")
+
+        self.assertIs(server.runtime, runtime)
+        runtime.disconnect()
+
+    def test_robot_switch_is_rejected_while_policy_connect_is_in_progress(self) -> None:
+        args = RM2_WEB_PROFILE.default_args()
+        args.camera_backend = "black"
+        args.reset_on_start = False
+        entered = threading.Event()
+        release = threading.Event()
+        robot = _Robot(RM2_WEB_PROFILE.action_spec_for_args(args))
+
+        def make_policy(server_url: str, api_key: str | None, timeout: float) -> _Policy:
+            del server_url, api_key, timeout
+            entered.set()
+            release.wait(timeout=2.0)
+            return _Policy(robot.action_spec.action_dim)
+
+        runtime = RobotWebRuntime(
+            args,
+            profile=RM2_WEB_PROFILE,
+            robot_factory=lambda name, config: robot,
+            policy_client_factory=make_policy,
+            camera_factory=lambda config: {
+                role: _TrackedBlackCamera(role)
+                for role in RM2_WEB_PROFILE.camera_roles_for_args(config)
+            },
+        )
+        self.addCleanup(runtime.disconnect)
+        self.addCleanup(release.set)
+        runtime.connect()
+        self.assertTrue(entered.wait(timeout=1.0))
+        self.assertEqual(runtime.status()["phase"], "connecting")
+
+        server = object.__new__(PiperWebServer)
+        server.runtime = runtime
+        server._runtime_switch_lock = threading.RLock()
+
+        with self.assertRaisesRegex(ApiError, "active runtime"):
+            server.select_robot("piper")
+
+        self.assertIs(server.runtime, runtime)
+        release.set()
+        _wait(lambda: runtime.status()["connected"] or runtime.status()["phase"] == "error")
+
+    def test_connect_post_and_robot_switch_share_one_server_lock(self) -> None:
+        class _BlockingRuntime:
+            def __init__(self) -> None:
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.connected = False
+
+            def connect(self) -> dict[str, Any]:
+                self.entered.set()
+                self.release.wait(timeout=2.0)
+                self.connected = True
+                return self.status()
+
+            def status(self) -> dict[str, Any]:
+                return {
+                    "cleanup_pending": False,
+                    "connected": self.connected,
+                    "running": False,
+                    "stop_requested": False,
+                    "can_stop": self.connected,
+                }
+
+            def pose_status(self) -> dict[str, str]:
+                return {"phase": "idle"}
+
+        runtime = _BlockingRuntime()
+        server = object.__new__(PiperWebServer)
+        server.runtime = runtime
+        server.access_key = None
+        server._runtime_switch_lock = threading.RLock()
+
+        handler = object.__new__(PiperWebHandler)
+        handler.server = server
+        handler.path = "/api/connect"
+        handler.headers = {}
+        responses: list[dict[str, Any]] = []
+        handler._send_json = lambda payload, status=None: responses.append(payload)
+
+        switch_errors: list[BaseException] = []
+        request_thread = threading.Thread(target=handler.do_POST)
+
+        def switch_robot() -> None:
+            try:
+                server.select_robot("piper")
+            except BaseException as exc:
+                switch_errors.append(exc)
+
+        switch_thread = threading.Thread(target=switch_robot)
+        request_thread.start()
+        self.assertTrue(runtime.entered.wait(timeout=1.0))
+        switch_thread.start()
+        time.sleep(0.02)
+        self.assertTrue(switch_thread.is_alive())
+        runtime.release.set()
+        request_thread.join(timeout=2.0)
+        switch_thread.join(timeout=2.0)
+
+        self.assertFalse(request_thread.is_alive())
+        self.assertFalse(switch_thread.is_alive())
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(len(switch_errors), 1)
+        self.assertIsInstance(switch_errors[0], ApiError)
+        self.assertIs(server.runtime, runtime)
+
+    def test_switch_lock_excludes_request_io_and_does_not_block_stop(self) -> None:
+        class _Runtime:
+            def __init__(self) -> None:
+                self.stop_called = threading.Event()
+
+            def connect(self) -> dict[str, bool]:
+                return {"connected": True}
+
+            def update_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+                return payload
+
+            def stop(self, *, wait: bool) -> dict[str, bool]:
+                self.stop_called.set()
+                return {"wait": wait}
+
+        runtime = _Runtime()
+        server = object.__new__(PiperWebServer)
+        server.runtime = runtime
+        server.access_key = None
+        server._runtime_switch_lock = threading.RLock()
+
+        def make_handler(path: str) -> PiperWebHandler:
+            handler = object.__new__(PiperWebHandler)
+            handler.server = server
+            handler.path = path
+            handler.headers = {}
+            return handler
+
+        read_entered = threading.Event()
+        release_read = threading.Event()
+        config_handler = make_handler("/api/config")
+
+        def read_json() -> dict[str, float]:
+            read_entered.set()
+            release_read.wait(timeout=2.0)
+            return {"fps": 10.0}
+
+        config_handler._read_json = read_json
+        config_handler._send_json = lambda payload, status=None: None
+        config_thread = threading.Thread(target=config_handler.do_POST)
+        config_thread.start()
+        self.assertTrue(read_entered.wait(timeout=1.0))
+        self.assertTrue(server._runtime_switch_lock.acquire(timeout=0.2))
+        server._runtime_switch_lock.release()
+        release_read.set()
+        config_thread.join(timeout=2.0)
+        self.assertFalse(config_thread.is_alive())
+
+        send_entered = threading.Event()
+        release_send = threading.Event()
+        connect_handler = make_handler("/api/connect")
+
+        def send_json(payload: dict[str, Any], status: Any = None) -> None:
+            del payload, status
+            send_entered.set()
+            release_send.wait(timeout=2.0)
+
+        connect_handler._send_json = send_json
+        connect_thread = threading.Thread(target=connect_handler.do_POST)
+        connect_thread.start()
+        self.assertTrue(send_entered.wait(timeout=1.0))
+        self.assertTrue(server._runtime_switch_lock.acquire(timeout=0.2))
+        server._runtime_switch_lock.release()
+        release_send.set()
+        connect_thread.join(timeout=2.0)
+        self.assertFalse(connect_thread.is_alive())
+
+        stop_handler = make_handler("/api/stop")
+        stop_handler._send_json = lambda payload, status=None: None
+        server._runtime_switch_lock.acquire()
+        try:
+            stop_thread = threading.Thread(target=stop_handler.do_POST)
+            stop_thread.start()
+            self.assertTrue(runtime.stop_called.wait(timeout=0.2))
+        finally:
+            server._runtime_switch_lock.release()
+        stop_thread.join(timeout=2.0)
+        self.assertFalse(stop_thread.is_alive())
+
+    def test_disconnect_waits_for_reset_runtime_operation(self) -> None:
+        class _Runtime:
+            def __init__(self) -> None:
+                self.reset_entered = threading.Event()
+                self.release_reset = threading.Event()
+                self.disconnect_called = threading.Event()
+
+            def reset_arms(self) -> dict[str, bool]:
+                self.reset_entered.set()
+                self.release_reset.wait(timeout=2.0)
+                return {"reset": True}
+
+            def disconnect(self) -> dict[str, bool]:
+                self.disconnect_called.set()
+                return {"connected": False}
+
+        runtime = _Runtime()
+        server = object.__new__(PiperWebServer)
+        server.runtime = runtime
+        server.access_key = None
+        server._runtime_switch_lock = threading.RLock()
+
+        def make_handler(path: str) -> PiperWebHandler:
+            handler = object.__new__(PiperWebHandler)
+            handler.server = server
+            handler.path = path
+            handler.headers = {}
+            handler._send_json = lambda payload, status=None: None
+            return handler
+
+        reset_thread = threading.Thread(target=make_handler("/api/reset").do_POST)
+        disconnect_thread = threading.Thread(target=make_handler("/api/disconnect").do_POST)
+        reset_thread.start()
+        self.assertTrue(runtime.reset_entered.wait(timeout=1.0))
+        disconnect_thread.start()
+        self.assertFalse(runtime.disconnect_called.wait(timeout=0.1))
+        runtime.release_reset.set()
+        reset_thread.join(timeout=2.0)
+        disconnect_thread.join(timeout=2.0)
+
+        self.assertFalse(reset_thread.is_alive())
+        self.assertFalse(disconnect_thread.is_alive())
+        self.assertTrue(runtime.disconnect_called.is_set())
 
     def test_offline_data_mode_does_not_lease_robot_or_policy(self) -> None:
         runtime, calls = self._preview_runtime(RM2_WEB_PROFILE)

@@ -59,6 +59,7 @@ class RobotWebProfile:
     baseline_config_for_args: Callable[[Any], Mapping[str, Mapping[str, Any]]]
     include_camera_params: bool
     capabilities: RobotWebCapabilities
+    initialize_cameras_before_robot: bool = False
 
     def create_robot(self, args: Any) -> Robot:
         return create_robot(self.robot_name, args)
@@ -255,6 +256,7 @@ def _rm2_adapter(
         read_images=read_images,
         image_masks=_rm2_camera_masks(args),
         prompt=args.prompt,
+        state_transform=lambda state: infer_rm2.policy_state_from_feedback(state, args),
     )
 
     def decode(response: dict[str, Any], replan_steps: int) -> np.ndarray:
@@ -332,7 +334,15 @@ def _rm2_baseline_config(args: infer_rm2.Args) -> Mapping[str, Mapping[str, Any]
             "command_rate_hz": args.command_rate_hz,
             "command_gripper_every_step": args.command_gripper_every_step,
             "hold_last_action": args.hold_last_action,
-            "gripper": {"min": args.gripper_min, "max": args.gripper_max, "timeout": args.gripper_timeout},
+            "gripper": {
+                "min": args.gripper_min,
+                "max": args.gripper_max,
+                "timeout": args.gripper_timeout,
+                "async": args.async_gripper,
+                "command_rate_hz": args.gripper_command_rate_hz,
+                "command_deadband": args.gripper_command_deadband,
+                "flush_timeout_s": args.gripper_flush_timeout,
+            },
         },
     }
 
@@ -369,6 +379,7 @@ RM2_WEB_PROFILE = RobotWebProfile(
     baseline_config_for_args=_rm2_baseline_config,
     include_camera_params=True,
     capabilities=RobotWebCapabilities(True, True, False, True, ("sync", "rtc", "infer_only")),
+    initialize_cameras_before_robot=True,
 )
 
 WEB_PROFILES: dict[str, RobotWebProfile] = {

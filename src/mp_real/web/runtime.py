@@ -26,19 +26,27 @@ class CachedFrameObservationSource:
     read_images: Callable[[], tuple[Mapping[str, np.ndarray], Mapping[str, Any] | None]]
     image_masks: Mapping[str, np.bool_]
     prompt: str
+    state_transform: Callable[[RobotState], RobotState] | None = None
     last_observation_snapshot: ObservationSnapshot | None = dataclasses.field(default=None, init=False)
 
     def observe(self) -> dict[str, Any]:
         return self.capture_observation_snapshot().to_policy_observation()
+
+    def read_policy_state(self) -> RobotState:
+        now_ns = time.monotonic_ns()
+        state = self.robot.read_state()
+        if not isinstance(state, RobotState):
+            state = RobotState(np.asarray(state, dtype=np.float32), now_ns / 1e9, now_ns)
+        if self.state_transform is not None:
+            state = self.state_transform(state)
+        return state
 
     def capture_observation_snapshot(self) -> ObservationSnapshot:
         result = self.read_images()
         images, camera_params = result[0], result[1]
         frame_metadata = result[2] if len(result) > 2 else {}
         now_ns = time.monotonic_ns()
-        state = self.robot.read_state()
-        if not isinstance(state, RobotState):
-            state = RobotState(np.asarray(state, dtype=np.float32), now_ns / 1e9, now_ns)
+        state = self.read_policy_state()
         samples: dict[str, CameraSample] = {}
         for name, image in images.items():
             metadata = frame_metadata.get(name) if isinstance(frame_metadata, Mapping) else None
@@ -102,6 +110,9 @@ class WebInferenceAdapter:
         return self.decode_chunk(response, replan_steps)
 
     def initial_action(self) -> np.ndarray:
+        read_policy_state = getattr(self.observation_source, "read_policy_state", None)
+        if callable(read_policy_state):
+            return np.asarray(read_policy_state().values, dtype=np.float32).copy()
         return self.robot.read_state().values
 
     def stabilize_action(self, action: np.ndarray, previous: np.ndarray | None) -> np.ndarray:

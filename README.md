@@ -79,8 +79,12 @@ delayed FakeRobot replay feedback.
 The RM2 CLI defaults match the operator-provided command that has been verified
 on real hardware with ROS cameras, `follow` command mode, `fps=10`,
 `replan_steps=10`, `speed_percent=35`, raw gripper units, static left-state and
-left-arm command disabled. H6 does not claim that RM2 Web replay,
-move-to-state or robot trajectory replay are hardware validated.
+left-arm command disabled. RM2 gripper commands are coalesced on a dedicated
+non-blocking worker by default (`--async-gripper`), at 10 Hz with a 2% deadband;
+use `--no-async-gripper` to retain synchronous command behavior. The worker is
+Mock-covered; concurrent RM SDK joint/gripper calls still require hardware
+validation. H6 does not claim that RM2 Web replay, move-to-state or robot
+trajectory replay are hardware validated.
 
 H6 does not record a Piper hardware-validation pass. Piper deployment code is
 present and covered by software tests, but real move-to-state and replay remain

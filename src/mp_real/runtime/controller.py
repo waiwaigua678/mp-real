@@ -193,6 +193,7 @@ class RuntimeController:
         self._episode_id = episode_id
 
         self._lock = threading.RLock()
+        self._close_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._generation_id = 0
@@ -328,6 +329,13 @@ class RuntimeController:
         return True
 
     def close(self, *, timeout: float | None = 5.0) -> None:
+        # Multiple Web requests may race to disconnect the same runtime.
+        # Serialize the whole retryable close transaction so Robot.close()
+        # and vendor handles are never entered concurrently.
+        with self._close_lock:
+            self._close_unlocked(timeout=timeout)
+
+    def _close_unlocked(self, *, timeout: float | None) -> None:
         with self._lock:
             if self._closed:
                 return
@@ -335,20 +343,25 @@ class RuntimeController:
             raise TimeoutError("Runtime controller did not stop before close")
 
         errors: list[BaseException] = []
+        cleanup_complete = True
         try:
             self._robot.close()
         except BaseException as exc:
             errors.append(exc)
+            cleanup_complete = bool(getattr(self._robot, "close_complete", False))
         close_client = getattr(self._policy_client, "close", None)
         if callable(close_client):
             try:
                 close_client()
             except BaseException as exc:
                 errors.append(exc)
+                cleanup_complete = False
         if not self._event_dispatcher.stop(timeout=timeout):
             errors.append(TimeoutError("Runtime event dispatcher did not stop before close"))
-        with self._lock:
-            self._closed = True
+            cleanup_complete = False
+        if cleanup_complete:
+            with self._lock:
+                self._closed = True
         if errors:
             raise RuntimeError("Failed to close runtime controller resources") from errors[0]
 

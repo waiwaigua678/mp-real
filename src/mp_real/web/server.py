@@ -361,6 +361,73 @@ class PolicyMetrics:
     steady_inference_latency_ms: float | None = None
 
 
+@dataclasses.dataclass
+class _DeploymentResources:
+    """Retryable ownership for resources that must close as one deployment."""
+
+    cameras: dict[str, infer_piper.Camera] = dataclasses.field(default_factory=dict)
+    controller: RuntimeController | None = None
+    robot: Robot | None = None
+    client: PolicyClient | None = None
+    _close_lock: threading.Lock = dataclasses.field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+
+    @property
+    def complete(self) -> bool:
+        return not self.cameras and self.controller is None and self.robot is None and self.client is None
+
+    def close(self) -> None:
+        # ThreadingHTTPServer may dispatch repeated Disconnect requests in
+        # parallel. Keep one owner in the close path so a robot SDK handle is
+        # never closed twice concurrently; a later caller can still retry any
+        # resource whose first close did not complete.
+        with self._close_lock:
+            self._close_unlocked()
+
+    def _close_unlocked(self) -> None:
+        errors: list[BaseException] = []
+        if self.cameras:
+            try:
+                close_profile_cameras(self.cameras)
+            except BaseException as exc:
+                errors.append(exc)
+            else:
+                self.cameras = {}
+
+        if self.controller is not None:
+            try:
+                self.controller.close()
+            except BaseException as exc:
+                errors.append(exc)
+                if self.controller.status().closed:
+                    self.controller = None
+            else:
+                self.controller = None
+        else:
+            if self.robot is not None:
+                try:
+                    self.robot.close()
+                except BaseException as exc:
+                    errors.append(exc)
+                    if bool(getattr(self.robot, "close_complete", False)):
+                        self.robot = None
+                else:
+                    self.robot = None
+            if self.client is not None:
+                try:
+                    self.client.close()
+                except BaseException as exc:
+                    errors.append(exc)
+                else:
+                    self.client = None
+
+        if errors:
+            raise errors[0]
+
+
 def _default_args(*, camera_profile: str = "hardware") -> infer_piper.Args:
     args = infer_piper.Args()
     args.init_left_joints = RESET_LEFT_JOINTS
@@ -474,10 +541,15 @@ def _config_to_dict(
             "rm2_arm_command": args.arm_command,
             "max_joint_step_deg": args.max_joint_step_deg,
             "max_action_step_deg": args.max_action_step_deg,
+            "action_smoothing": args.action_smoothing,
             "gripper_smoothing": args.gripper_smoothing,
             "gripper_min": args.gripper_min,
             "gripper_max": args.gripper_max,
             "gripper_timeout": args.gripper_timeout,
+            "async_gripper": args.async_gripper,
+            "gripper_command_rate_hz": args.gripper_command_rate_hz,
+            "gripper_command_deadband": args.gripper_command_deadband,
+            "gripper_flush_timeout": args.gripper_flush_timeout,
             "init_left_joints": args.init_left_joints,
             "init_right_joints": args.init_right_joints,
             "init_left_gripper": args.init_left_gripper,
@@ -599,6 +671,27 @@ def _coerce_optional_int(value: Any) -> int | None:
     return parsed
 
 
+def _coerce_required_float(value: Any, *, field: str) -> float:
+    if value is None or value == "":
+        raise ApiError(f"{field} must be a finite number")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ApiError(f"{field} must be a finite number") from exc
+    if not np.isfinite(parsed):
+        raise ApiError(f"{field} must be a finite number")
+    return parsed
+
+
+def _coerce_required_int(value: Any, *, field: str) -> int:
+    if value is None or value == "":
+        raise ApiError(f"{field} must be an integer")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ApiError(f"{field} must be an integer") from exc
+
+
 def _coerce_float_tuple(value: Any, *, length: int, field: str) -> tuple[float, ...]:
     if isinstance(value, str):
         parts = value.replace(",", " ").split()
@@ -693,6 +786,7 @@ class RobotWebRuntime:
         self._replay_recorder: ReplayRecordWriter | None = None
 
         self._controller: RuntimeController | None = None
+        self._pending_deployment_cleanup: _DeploymentResources | None = None
         self._loop_hooks = WebLoopHooks(
             error_callback=self._record_loop_error,
             stopped_callback=self._record_loop_stopped,
@@ -924,6 +1018,11 @@ class RobotWebRuntime:
             return self._update_rm2_config(payload)
         with self._lock:
             self._refresh_controller_state_locked()
+            if self._pending_deployment_cleanup is not None:
+                raise ApiError(
+                    "Previous deployment cleanup is incomplete; retry Disconnect before changing parameters",
+                    HTTPStatus.CONFLICT,
+                )
             if self._evaluation_owner is not None:
                 raise ApiError(
                     "Evaluation owns this deployment; abort or complete it before changing configuration",
@@ -1181,12 +1280,25 @@ class RobotWebRuntime:
                 "max_action_step_deg",
                 "command_rate_hz",
                 "rtc_exp_weight",
+                "gripper_command_rate_hz",
+                "gripper_command_deadband",
+                "gripper_flush_timeout",
             ):
                 if field in payload:
-                    value = float(payload[field])
-                    if field in {"fps", "camera_timeout", "command_rate_hz"} and value <= 0:
+                    value = _coerce_required_float(payload[field], field=field)
+                    if field in {
+                        "fps",
+                        "camera_timeout",
+                        "command_rate_hz",
+                    } and value <= 0:
                         raise ApiError(f"{field} must be positive")
-                    if field in {"max_joint_step_deg", "max_action_step_deg", "rtc_exp_weight"} and value < 0:
+                    if field in {
+                        "max_joint_step_deg",
+                        "max_action_step_deg",
+                        "rtc_exp_weight",
+                        "gripper_command_deadband",
+                        "gripper_flush_timeout",
+                    } and value < 0:
                         raise ApiError(f"{field} must be non-negative")
                     setattr(args, field, value)
             for field in (
@@ -1204,7 +1316,7 @@ class RobotWebRuntime:
                 "gripper_timeout",
             ):
                 if field in payload:
-                    value = int(payload[field])
+                    value = _coerce_required_int(payload[field], field=field)
                     if value < 0 or (
                         field not in {"rtc_replan_stride", "rtc_prefetch_steps", "gripper_timeout"}
                         and value == 0
@@ -1214,7 +1326,7 @@ class RobotWebRuntime:
             if "max_steps" in payload:
                 args.max_steps = _coerce_optional_int(payload["max_steps"])
             if "infer_only_chunks" in payload:
-                args.infer_only_chunks = int(payload["infer_only_chunks"])
+                args.infer_only_chunks = _coerce_required_int(payload["infer_only_chunks"], field="infer_only_chunks")
                 if args.infer_only_chunks <= 0:
                     raise ApiError("infer_only_chunks must be positive")
             if "camera_backend" in payload:
@@ -1239,7 +1351,11 @@ class RobotWebRuntime:
                     raise ApiError(f"arm_command must be one of {RM2_ARM_COMMAND_MODES}")
                 args.arm_command = value
             if "arm_port" in payload:
-                args.arm_port = int(payload["arm_port"]) if payload["arm_port"] not in (None, "") else None
+                args.arm_port = (
+                    _coerce_required_int(payload["arm_port"], field="arm_port")
+                    if payload["arm_port"] not in (None, "")
+                    else None
+                )
             for field in (
                 "dry_run",
                 "infer_only",
@@ -1252,6 +1368,7 @@ class RobotWebRuntime:
                 "command_left_arm",
                 "command_right_arm",
                 "command_gripper",
+                "async_gripper",
                 "interpolate_actions",
                 "command_gripper_every_step",
                 "profile_timing",
@@ -1263,7 +1380,7 @@ class RobotWebRuntime:
                     setattr(args, field, _coerce_float_tuple(payload[field], length=args.joint_dof, field=field))
             for field in ("init_left_gripper", "init_right_gripper"):
                 if field in payload:
-                    setattr(args, field, float(payload[field]))
+                    setattr(args, field, _coerce_required_float(payload[field], field=field))
             for field in (
                 "policy_connect_timeout_s",
                 "policy_metadata_timeout_s",
@@ -1273,7 +1390,7 @@ class RobotWebRuntime:
                 "camera_stream_fps",
             ):
                 if field in payload:
-                    value = float(payload[field])
+                    value = _coerce_required_float(payload[field], field=field)
                     if value <= 0:
                         raise ApiError(f"{field} must be positive")
                     if field == "policy_connect_timeout_s":
@@ -1292,7 +1409,9 @@ class RobotWebRuntime:
             if "policy_warmup_enabled" in payload:
                 self._policy_warmup_enabled = _coerce_bool(payload["policy_warmup_enabled"])
             if "policy_warmup_requests" in payload:
-                self._policy_warmup_requests = int(payload["policy_warmup_requests"])
+                self._policy_warmup_requests = _coerce_required_int(
+                    payload["policy_warmup_requests"], field="policy_warmup_requests"
+                )
                 if self._policy_warmup_requests <= 0:
                     raise ApiError("policy_warmup_requests must be positive")
             if "policy_prefetch_first_chunk" in payload:
@@ -1320,6 +1439,7 @@ class RobotWebRuntime:
         return (
             not self._running
             and not self._stop_requested
+            and self._pending_deployment_cleanup is None
             and not self._connection_active_locked()
             and not self._startup_active_locked()
             and self._phase not in {"connecting", "connecting_cameras", "stopping"}
@@ -2296,6 +2416,11 @@ class RobotWebRuntime:
     def start(self) -> dict[str, Any]:
         with self._lock:
             self._refresh_controller_state_locked()
+            if self._pending_deployment_cleanup is not None:
+                raise ApiError(
+                    "Previous deployment cleanup is incomplete; retry Disconnect before starting",
+                    HTTPStatus.CONFLICT,
+                )
             if self._evaluation_owner is not None:
                 raise ApiError("Evaluation owns robot control; use the evaluation API", HTTPStatus.CONFLICT)
             if self._replay_active_locked():
@@ -2345,6 +2470,11 @@ class RobotWebRuntime:
     def connect(self) -> dict[str, Any]:
         with self._lock:
             self._refresh_controller_state_locked()
+            if self._pending_deployment_cleanup is not None:
+                raise ApiError(
+                    "Previous deployment cleanup is incomplete; retry Disconnect before connecting",
+                    HTTPStatus.CONFLICT,
+                )
             if self._evaluation_owner is not None:
                 raise ApiError(
                     "Evaluation owns this deployment; it must finish before reconnecting",
@@ -2403,6 +2533,11 @@ class RobotWebRuntime:
             self._resource_lease = None
 
     def _begin_deployment_connect_locked(self, args: Any, *, start_after_connect: bool) -> None:
+        if self._pending_deployment_cleanup is not None:
+            raise ApiError(
+                "Previous deployment cleanup is incomplete; retry Disconnect before connecting",
+                HTTPStatus.CONFLICT,
+            )
         if self._connection_active_locked():
             self._start_after_connect = self._start_after_connect or start_after_connect
             return
@@ -2428,13 +2563,23 @@ class RobotWebRuntime:
         stop_event: threading.Event,
         args: Any,
     ) -> None:
-        self.log(f"Connecting {self._profile.robot_name} robot")
-
         client: PolicyClient | None = None
         robot: Robot | None = None
         cameras: dict[str, infer_piper.Camera] = {}
         controller: RuntimeController | None = None
         try:
+            if self._profile.initialize_cameras_before_robot:
+                self.log(f"Connecting policy server {args.server_url}")
+                client = self._create_policy_client(args)
+                if stop_event.is_set():
+                    raise PolicyStartupCancelled("Deployment connection was cancelled")
+                self.log("Connected policy server")
+                self.log(f"Connecting {self._profile.robot_name} cameras")
+                cameras = self._camera_factory(args)
+                if stop_event.is_set():
+                    raise PolicyStartupCancelled("Deployment connection was cancelled")
+
+            self.log(f"Connecting {self._profile.robot_name} robot")
             robot = self._robot_factory(self._profile.robot_name, args)
             if stop_event.is_set():
                 raise PolicyStartupCancelled("Deployment connection was cancelled")
@@ -2443,14 +2588,18 @@ class RobotWebRuntime:
             if stop_event.is_set():
                 raise PolicyStartupCancelled("Deployment connection was cancelled")
 
-            self.log(f"Connecting policy server {args.server_url}")
-            client = self._create_policy_client(args)
-            if stop_event.is_set():
-                raise PolicyStartupCancelled("Deployment connection was cancelled")
-            self.log("Connected policy server")
-            cameras = self._camera_factory(args)
-            if stop_event.is_set():
-                raise PolicyStartupCancelled("Deployment connection was cancelled")
+            if not self._profile.initialize_cameras_before_robot:
+                self.log(f"Connecting policy server {args.server_url}")
+                client = self._create_policy_client(args)
+                if stop_event.is_set():
+                    raise PolicyStartupCancelled("Deployment connection was cancelled")
+                self.log("Connected policy server")
+                self.log(f"Connecting {self._profile.robot_name} cameras")
+                cameras = self._camera_factory(args)
+                if stop_event.is_set():
+                    raise PolicyStartupCancelled("Deployment connection was cancelled")
+
+            assert client is not None
             adapter = self._make_inference_adapter(robot, args)
             controller = RuntimeController(
                 robot,
@@ -2464,21 +2613,32 @@ class RobotWebRuntime:
                 event_sink=CompositeRuntimeEventSink(InMemoryRuntimeEventSink(), self._evaluation_service),
             )
         except BaseException as exc:
-            if cameras:
-                close_profile_cameras(cameras)
-            if controller is not None:
-                controller.close()
-            else:
-                if robot is not None:
-                    robot.close()
-                if client is not None:
-                    client.close()
+            resources = _DeploymentResources(
+                cameras=cameras,
+                controller=controller,
+                robot=robot if controller is None else None,
+                client=client if controller is None else None,
+            )
+            cleanup_error: BaseException | None = None
+            try:
+                resources.close()
+            except BaseException as cleanup_exc:
+                cleanup_error = cleanup_exc
             with self._lock:
+                if not resources.complete:
+                    self._pending_deployment_cleanup = resources
                 if generation_id != self._connect_generation_id:
                     return
                 self._connected = False
                 self._policy_connected = False
-                if isinstance(exc, PolicyStartupCancelled):
+                if not resources.complete:
+                    self._policy_state = "ERROR"
+                    self._phase = "cleanup_failed"
+                    detail = f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    self._last_error = f"Connect failed and cleanup is incomplete: {detail}"
+                    self._stop_requested = False
+                    self._start_after_connect = False
+                elif isinstance(exc, PolicyStartupCancelled) and cleanup_error is None:
                     self._policy_state = "DISCONNECTED"
                     self._phase = "idle"
                     self._last_error = None
@@ -2488,8 +2648,13 @@ class RobotWebRuntime:
                     self._policy_state = "ERROR"
                     self._phase = "error"
                     self._last_error = f"{type(exc).__name__}: {exc}"
-                self._release_resources_locked()
+                    if cleanup_error is not None:
+                        self._last_error += f"; cleanup reported {type(cleanup_error).__name__}: {cleanup_error}"
+                if resources.complete:
+                    self._release_resources_locked()
             self.log(f"Connect failed: {type(exc).__name__}: {exc}")
+            if cleanup_error is not None:
+                self.log(f"Connect cleanup reported: {type(cleanup_error).__name__}: {cleanup_error}")
             return
 
         with self._lock:
@@ -2516,9 +2681,16 @@ class RobotWebRuntime:
                     self._policy_state = "WARMING_UP"
                     self._start_policy_worker_locked(controller, args)
         if should_close:
-            if cameras:
-                close_profile_cameras(cameras)
-            controller.close()
+            resources = _DeploymentResources(cameras=cameras, controller=controller)
+            try:
+                resources.close()
+            except BaseException as exc:
+                with self._lock:
+                    if not resources.complete:
+                        self._pending_deployment_cleanup = resources
+                        self._phase = "cleanup_failed"
+                        self._last_error = f"Deployment cancellation cleanup failed: {type(exc).__name__}: {exc}"
+                self.log(f"Deployment cancellation cleanup reported: {type(exc).__name__}: {exc}")
             return
         self.log(f"Connected {self._profile.robot_name} runtime")
 
@@ -2807,8 +2979,33 @@ class RobotWebRuntime:
                 raise ApiError("Camera preview is still stopping; retry disconnect shortly", HTTPStatus.CONFLICT)
 
         with self._lock:
-            controller = self._controller
-            cameras = self._cameras
+            resources = self._pending_deployment_cleanup
+            if resources is None:
+                resources = _DeploymentResources(
+                    controller=self._controller,
+                    cameras=self._cameras,
+                )
+                self._pending_deployment_cleanup = resources
+
+        cleanup_error: BaseException | None = None
+        try:
+            resources.close()
+        except BaseException as exc:
+            cleanup_error = exc
+
+        if not resources.complete:
+            with self._lock:
+                self._phase = "cleanup_failed"
+                self._policy_state = "ERROR"
+                self._last_error = f"Deployment cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
+            raise ApiError(
+                "Deployment cleanup is incomplete; retry Disconnect after the worker stops",
+                HTTPStatus.CONFLICT,
+            ) from cleanup_error
+
+        with self._lock:
+            if self._pending_deployment_cleanup is resources:
+                self._pending_deployment_cleanup = None
             self._controller = None
             self._cameras = {}
             self._camera_thread = None
@@ -2825,13 +3022,9 @@ class RobotWebRuntime:
             self._policy_metrics = PolicyMetrics()
             self._loop_hooks.reset()
             self._reset_placeholder_frames_locked(self._args.resize_size)
-
-        if cameras:
-            close_profile_cameras(cameras)
-        if controller is not None:
-            controller.close()
-        with self._lock:
             self._release_resources_locked()
+        if cleanup_error is not None:
+            self.log(f"Deployment resources closed after reporting: {type(cleanup_error).__name__}: {cleanup_error}")
         self.log("Disconnected runtime")
         return self.status()
 
@@ -3012,9 +3205,11 @@ class RobotWebRuntime:
             startup_active = self._startup_active_locked()
             connection_active = self._connection_active_locked()
             replay_active = self._replay_active_locked()
+            cleanup_pending = self._pending_deployment_cleanup is not None
             can_reset = (
                 self._runtime_mode is RuntimeMode.DEPLOYMENT
                 and self._controller is not None
+                and not cleanup_pending
                 and not startup_active
                 and (not self._running or not self._policy_connected)
             )
@@ -3031,6 +3226,7 @@ class RobotWebRuntime:
                 "policy_connected": self._policy_connected,
                 "running": self._running,
                 "stop_requested": self._stop_requested,
+                "cleanup_pending": cleanup_pending,
                 "can_edit_config": self._can_edit_config_locked(),
                 "can_edit_connection_config": self._can_edit_connection_config_locked(),
                 "can_connect": not self._connected
@@ -3039,10 +3235,12 @@ class RobotWebRuntime:
                 and not connection_active
                 and not startup_active
                 and not replay_active
+                and not cleanup_pending
                 and self._phase in {"idle", "error", "warmup_failed"},
                 "can_start": (
                     self._runtime_mode is RuntimeMode.CAMERA_PREVIEW
                     and not self._connected
+                    and not cleanup_pending
                     and self._phase in {"idle", "error"}
                 )
                 or (
@@ -3051,6 +3249,7 @@ class RobotWebRuntime:
                     and not self._stop_requested
                     and not connection_active
                     and not startup_active
+                    and not cleanup_pending
                     and self._phase in {"idle", "stopped", "warmup_failed", "error"}
                 ),
                 "can_stop": self._running
@@ -3064,6 +3263,7 @@ class RobotWebRuntime:
                 or connection_active
                 or startup_active
                 or replay_active
+                or cleanup_pending
                 or self._phase in {"connecting", "connecting_cameras", "error", "stopped", "warmup_failed", "stopping"},
                 "can_reset": can_reset,
                 "step": loop.step,
@@ -3658,17 +3858,18 @@ class PiperWebHandler(BaseHTTPRequestHandler):
             if not self.server.authorize(self.headers.get("X-Motrix-Key")):
                 raise ApiError("Invalid access key", HTTPStatus.UNAUTHORIZED)
             if path == "/api/baselines":
-                job = self.server.runtime.create_baseline(self._read_json())
+                job = self.server.runtime_call("create_baseline", self._read_json())
                 self._send_json({"ok": True, "job": job}, HTTPStatus.ACCEPTED)
             elif path == "/api/baselines/from-evaluation":
-                job = self.server.runtime.create_baseline_from_evaluation(self._read_json())
+                job = self.server.runtime_call("create_baseline_from_evaluation", self._read_json())
                 self._send_json({"ok": True, "job": job}, HTTPStatus.ACCEPTED)
             elif path == "/api/baselines/compare":
                 payload = self._read_json()
                 baseline_ids = payload.get("baseline_ids")
                 if not isinstance(baseline_ids, list) or not all(isinstance(item, str) for item in baseline_ids):
                     raise ApiError("baseline_ids must be a list of IDs")
-                self._send_json({"ok": True, "comparison": self.server.runtime.compare_baselines(tuple(baseline_ids))})
+                comparison = self.server.runtime_call("compare_baselines", tuple(baseline_ids))
+                self._send_json({"ok": True, "comparison": comparison})
             elif path.startswith("/api/baselines/"):
                 suffix = path.removeprefix("/api/baselines/")
                 baseline_id, separator, operation = suffix.partition("/")
@@ -3677,92 +3878,100 @@ class PiperWebHandler(BaseHTTPRequestHandler):
                 baseline_id = urllib.parse.unquote(baseline_id)
                 payload = self._read_json()
                 if operation == "clone":
-                    job = self.server.runtime.clone_baseline(baseline_id, payload)
+                    job = self.server.runtime_call("clone_baseline", baseline_id, payload)
                     self._send_json({"ok": True, "job": job}, HTTPStatus.ACCEPTED)
                 elif operation == "diff":
                     other = str(payload.get("other_baseline_id", ""))
                     if not other:
                         raise ApiError("other_baseline_id is required")
-                    self._send_json({"ok": True, "diff": self.server.runtime.baseline_diff(baseline_id, other)})
+                    diff = self.server.runtime_call("baseline_diff", baseline_id, other)
+                    self._send_json({"ok": True, "diff": diff})
                 elif operation == "run":
-                    self._send_json({"ok": True, "evaluation": self.server.runtime.run_baseline(baseline_id)})
+                    evaluation = self.server.runtime_call("run_baseline", baseline_id)
+                    self._send_json({"ok": True, "evaluation": evaluation})
                 elif operation == "attach-open-loop":
+                    job = self.server.runtime_call("attach_open_loop_baseline", baseline_id, payload)
                     self._send_json(
-                        {"ok": True, "job": self.server.runtime.attach_open_loop_baseline(baseline_id, payload)},
+                        {"ok": True, "job": job},
                         HTTPStatus.ACCEPTED,
                     )
                 else:
                     raise ApiError("unknown Baseline operation", HTTPStatus.NOT_FOUND)
             elif path == "/api/evaluations":
-                evaluation = self.server.runtime.evaluation_service.create(self._read_json())
+                payload = self._read_json()
+                evaluation = self.server.runtime_operation(lambda runtime: runtime.evaluation_service.create(payload))
                 self._send_json({"ok": True, "evaluation": evaluation})
             elif path == "/api/evaluations/current/warmup":
-                self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.warmup()})
+                evaluation = self.server.runtime_operation(lambda runtime: runtime.evaluation_service.warmup())
+                self._send_json({"ok": True, "evaluation": evaluation})
             elif path == "/api/evaluations/current/reset-ready":
-                self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.reset_ready()})
+                evaluation = self.server.runtime_operation(lambda runtime: runtime.evaluation_service.reset_ready())
+                self._send_json({"ok": True, "evaluation": evaluation})
             elif path == "/api/evaluations/current/start-episode":
-                self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.start_episode()})
+                evaluation = self.server.runtime_operation(lambda runtime: runtime.evaluation_service.start_episode())
+                self._send_json({"ok": True, "evaluation": evaluation})
             elif path == "/api/evaluations/current/stop-episode":
                 self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.stop_episode()})
             elif path == "/api/evaluations/current/label":
-                evaluation = self.server.runtime.evaluation_service.label(self._read_json())
+                payload = self._read_json()
+                evaluation = self.server.runtime_operation(lambda runtime: runtime.evaluation_service.label(payload))
                 self._send_json({"ok": True, "evaluation": evaluation})
             elif path == "/api/evaluations/current/abort":
                 self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.abort()})
             elif path == "/api/evaluations/current/complete":
-                self._send_json({"ok": True, "evaluation": self.server.runtime.evaluation_service.complete()})
+                evaluation = self.server.runtime_operation(lambda runtime: runtime.evaluation_service.complete())
+                self._send_json({"ok": True, "evaluation": evaluation})
             elif path == "/api/config":
-                self._send_json({"ok": True, "config": self.server.runtime.update_config(self._read_json())})
+                config = self.server.runtime_call("update_config", self._read_json())
+                self._send_json({"ok": True, "config": config})
             elif path == "/api/replay/plan":
-                self._send_json({"ok": True, "replay": self.server.runtime.replay_plan(self._read_json())})
+                replay = self.server.runtime_call("replay_plan", self._read_json())
+                self._send_json({"ok": True, "replay": replay})
             elif path == "/api/replay/connect":
-                self._send_json({"ok": True, "replay": self.server.runtime.replay_connect()})
+                self._send_json({"ok": True, "replay": self.server.runtime_call("replay_connect")})
             elif path == "/api/replay/start":
                 payload = self._read_json()
-                self._send_json(
-                    {"ok": True, "replay": self.server.runtime.replay_start(str(payload.get("plan_hash", "")))}
-                )
+                replay = self.server.runtime_call("replay_start", str(payload.get("plan_hash", "")))
+                self._send_json({"ok": True, "replay": replay})
             elif path == "/api/replay/pause":
-                self._send_json({"ok": True, "replay": self.server.runtime.replay_pause()})
+                self._send_json({"ok": True, "replay": self.server.runtime_call("replay_pause")})
             elif path == "/api/replay/resume":
-                self._send_json({"ok": True, "replay": self.server.runtime.replay_resume()})
+                self._send_json({"ok": True, "replay": self.server.runtime_call("replay_resume")})
             elif path == "/api/replay/stop":
                 self._send_json({"ok": True, "replay": self.server.runtime.replay_stop()})
             elif path == "/api/replay/emergency-stop":
                 self._send_json({"ok": True, "replay": self.server.runtime.replay_stop(emergency=True)})
             elif path == "/api/pose/select":
-                self._send_json({"ok": True, "pose": self.server.runtime.pose_select(self._read_json())})
+                pose = self.server.runtime_call("pose_select", self._read_json())
+                self._send_json({"ok": True, "pose": pose})
             elif path == "/api/pose/connect":
-                self._send_json({"ok": True, "pose": self.server.runtime.pose_connect()})
+                self._send_json({"ok": True, "pose": self.server.runtime_call("pose_connect")})
             elif path == "/api/pose/execute":
                 payload = self._read_json()
-                self._send_json(
-                    {"ok": True, "pose": self.server.runtime.pose_execute(str(payload.get("plan_hash", "")))}
-                )
+                pose = self.server.runtime_call("pose_execute", str(payload.get("plan_hash", "")))
+                self._send_json({"ok": True, "pose": pose})
             elif path == "/api/pose/stop":
                 self._send_json({"ok": True, "pose": self.server.runtime.pose_stop()})
             elif path == "/api/pose/prepare-deployment":
                 payload = self._read_json()
-                self._send_json(
-                    {"ok": True, "pose": self.server.runtime.pose_prepare_deployment(str(payload.get("plan_hash", "")))}
-                )
+                pose = self.server.runtime_call("pose_prepare_deployment", str(payload.get("plan_hash", "")))
+                self._send_json({"ok": True, "pose": pose})
             elif path == "/api/pose/start-deployment":
                 payload = self._read_json()
-                self._send_json(
-                    {"ok": True, "pose": self.server.runtime.pose_start_deployment(str(payload.get("plan_hash", "")))}
-                )
+                pose = self.server.runtime_call("pose_start_deployment", str(payload.get("plan_hash", "")))
+                self._send_json({"ok": True, "pose": pose})
             elif path == "/api/connect":
-                self._send_json({"ok": True, "status": self.server.runtime.connect()})
+                self._send_json({"ok": True, "status": self.server.runtime_call("connect")})
             elif path == "/api/start":
-                self._send_json({"ok": True, "status": self.server.runtime.start()})
+                self._send_json({"ok": True, "status": self.server.runtime_call("start")})
             elif path == "/api/stop":
                 self._send_json({"ok": True, "status": self.server.runtime.stop(wait=False)})
             elif path == "/api/disconnect":
-                self._send_json({"ok": True, "status": self.server.runtime.disconnect()})
+                self._send_json({"ok": True, "status": self.server.runtime_call("disconnect")})
             elif path == "/api/reset":
-                self._send_json({"ok": True, "status": self.server.runtime.reset_arms()})
+                self._send_json({"ok": True, "status": self.server.runtime_call("reset_arms")})
             elif path == "/api/ping_policy":
-                self._send_json(self.server.runtime.ping_policy())
+                self._send_json(self.server.runtime_call("ping_policy"))
             elif path == "/api/robot":
                 payload = self._read_json()
                 self._send_json({"ok": True, "config": self.server.select_robot(str(payload.get("robot", "")))})
@@ -3857,6 +4066,9 @@ class PiperWebServer(ThreadingHTTPServer):
     ) -> None:
         super().__init__(server_address, handler)
         self.runtime = runtime
+        # do_POST holds this lock and /api/robot re-enters it through
+        # select_robot(), hence an RLock is intentional.
+        self._runtime_switch_lock = threading.RLock()
         self.access_key = access_key
         packaged_static = pathlib.Path(__file__).resolve().parent / "static"
         source_static = pathlib.Path(__file__).resolve().parents[3] / "static"
@@ -3867,31 +4079,64 @@ class PiperWebServer(ThreadingHTTPServer):
             provided_key is not None and secrets.compare_digest(provided_key, self.access_key)
         )
 
+    def runtime_call(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        """Call a state-changing runtime method without racing robot switch.
+
+        Request parsing and response I/O intentionally stay outside this
+        short critical section. Stop and emergency-stop handlers call the
+        runtime directly so safety operations are never queued behind an
+        unrelated request holding the switch lock. Disconnect is serialized
+        because it deletes SDK handles and must not race Reset.
+        """
+
+        with self._runtime_switch_lock:
+            method = getattr(self.runtime, method_name)
+            return method(*args, **kwargs)
+
+    def runtime_operation(self, operation: Callable[[Any], Any]) -> Any:
+        with self._runtime_switch_lock:
+            return operation(self.runtime)
+
     def select_robot(self, name: str) -> dict[str, Any]:
-        if name not in {"piper", "rm2"}:
-            raise ApiError("robot must be piper or rm2")
-        if self.runtime.status()["connected"] or self.runtime.status()["running"]:
-            raise ApiError("Disconnect before changing robot", HTTPStatus.CONFLICT)
-        if self.runtime.pose_status()["phase"] not in {
-            "idle",
-            "offline_preflighted",
-            "offline_rejected",
-            "failed",
-            "aborted",
-        }:
-            raise ApiError("Finish the recorded-state pose session before changing robot", HTTPStatus.CONFLICT)
-        self.runtime.shutdown_baselines()
-        profile = get_web_profile(name)
-        self.runtime = RobotWebRuntime(
-            profile=profile,
-            policy_timeout=self.runtime._policy_timeout,
-            resource_manager=self.runtime.resource_manager,
-            recorded_data_roots=self.runtime._recorded_data_roots,
-            pose_mapping_config=self.runtime._pose_mapping_config,
-            replay_record_root=self.runtime._replay_record_root,
-            baseline_root=self.runtime._baseline_root,
-        )
-        return self.runtime.get_config()
+        with self._runtime_switch_lock:
+            if name not in {"piper", "rm2"}:
+                raise ApiError("robot must be piper or rm2")
+            status = self.runtime.status()
+            if status.get("cleanup_pending"):
+                raise ApiError(
+                    "Retry Disconnect until deployment cleanup completes before changing robot",
+                    HTTPStatus.CONFLICT,
+                )
+            if (
+                status["connected"]
+                or status["running"]
+                or status.get("stop_requested")
+                or status.get("can_stop")
+            ):
+                raise ApiError(
+                    "Stop and Disconnect the active runtime before changing robot",
+                    HTTPStatus.CONFLICT,
+                )
+            if self.runtime.pose_status()["phase"] not in {
+                "idle",
+                "offline_preflighted",
+                "offline_rejected",
+                "failed",
+                "aborted",
+            }:
+                raise ApiError("Finish the recorded-state pose session before changing robot", HTTPStatus.CONFLICT)
+            self.runtime.shutdown_baselines()
+            profile = get_web_profile(name)
+            self.runtime = RobotWebRuntime(
+                profile=profile,
+                policy_timeout=self.runtime._policy_timeout,
+                resource_manager=self.runtime.resource_manager,
+                recorded_data_roots=self.runtime._recorded_data_roots,
+                pose_mapping_config=self.runtime._pose_mapping_config,
+                replay_record_root=self.runtime._replay_record_root,
+                baseline_root=self.runtime._baseline_root,
+            )
+            return self.runtime.get_config()
 
 
 def main() -> None:

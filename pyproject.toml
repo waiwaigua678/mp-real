@@ -17,9 +17,12 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
+    "catkin-pkg>=1.0.0,<2.0.0",
     "msgpack>=1.0.5,<2.0.0",
     "numpy>=1.24.0,<2.0.0",
     "pillow>=9.0.0,<12.0.0",
+    "pyyaml>=6.0.0,<7.0.0",
+    "rospkg>=1.5.0,<2.0.0",
     "typing-extensions>=4.12.2",
     "tyro>=0.9.5",
     "websockets>=11.0,<16.0",

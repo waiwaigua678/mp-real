@@ -400,14 +400,16 @@ function setRuntimeModeUi(statusOrMode) {
   const deployment = mode === "deployment";
   const preview = mode === "camera_preview";
   const offline = mode === "offline_replay";
-  for (const node of document.querySelectorAll("[data-deployment-only='true']")) {
-    node.hidden = !deployment;
-  }
-  for (const node of document.querySelectorAll("[data-piper-only='true']")) {
-    node.hidden = rm2;
-  }
-  for (const node of document.querySelectorAll("[data-rm2-only='true']")) {
-    node.hidden = !rm2;
+  const visibilitySelector = [
+    "[data-deployment-only='true']",
+    "[data-piper-only='true']",
+    "[data-rm2-only='true']",
+  ].join(", ");
+  for (const node of document.querySelectorAll(visibilitySelector)) {
+    node.hidden =
+      (node.dataset.deploymentOnly === "true" && !deployment) ||
+      (node.dataset.piperOnly === "true" && rm2) ||
+      (node.dataset.rm2Only === "true" && !rm2);
   }
   document.querySelector("#offlineReplayNotice").hidden = !offline;
   connectBtn.textContent = preview ? "连接相机" : offline ? "进入回放" : "连接预览";
@@ -429,13 +431,18 @@ async function selectRobot() {
 function collectForm() {
   const data = {};
   const robot = robotSelect.value;
+  const nullableNumberFields = new Set(["max_steps", "arm_port"]);
   for (const field of form.elements) {
     if (!field.name) continue;
     if (robot === "rm2" && field.name === "arm_command") continue;
     if (field.type === "checkbox") {
       data[field.name] = field.checked;
     } else if (field.type === "number") {
-      data[field.name] = field.value === "" ? null : Number(field.value);
+      if (field.value === "") {
+        if (nullableNumberFields.has(field.name)) data[field.name] = null;
+        continue;
+      }
+      data[field.name] = Number(field.value);
     } else {
       data[field.name] = field.value;
     }
