@@ -1,12 +1,14 @@
 # Piper / RM2 capability matrix
 
-`supported` means a software path exists and has fake/mock coverage. It does
-not mean hardware validation. No item below is currently marked
-`hardware-validated` without an independently recorded hardware gate.
+`supported` means a software path exists and has fake/mock coverage; it does
+not imply hardware validation. RM2 CLI deployment defaults have a separately
+recorded operator validation scope. It does not extend to RM2 Web deployment,
+recorded-state movement, or trajectory replay. Piper hardware movement/replay
+validation is not claimed.
 
 | Capability | Piper | RM2 | Status detail |
 | --- | --- | --- | --- |
-| CLI deployment | supported | supported | shared sync/RTC/infer-only loops |
+| CLI deployment | supported | supported | shared sync/RTC/infer-only loops; RM2 defaults have a limited recorded hardware-validation scope |
 | Web deployment | supported | supported | shared `RobotWebRuntime` profile path |
 | CAMERA_PREVIEW | supported | supported | no Robot or PolicyClient |
 | Web policy warmup | supported | supported | warmup actions discarded |
@@ -22,8 +24,4 @@ not mean hardware validation. No item below is currently marked
 | Baseline and A/B report | supported | supported | generic ActionSpec and runtime snapshots |
 
 Shared `runtime/`, `data/`, `evaluation/`, pose validation, replay planning and
-open-loop metrics must use `Robot`, `ActionSpec`, state fields and camera roles.
-The remaining Piper-specific reset/CAN/camera field wiring is isolated as a
-known Web-profile migration item; it must not be copied into new shared code.
-See `piper_rm2_generality_audit.md` for the exact search scope and remaining
-compatibility wiring.
+open-loop metrics use `Robot`, `ActionSpec`, state fields and camera roles.

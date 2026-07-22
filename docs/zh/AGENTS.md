@@ -16,7 +16,7 @@ mp-real 是一个轻量级真机部署、控制、评测、录制、回放和可
 - RTC 动作块执行
 - 仅推理执行
 
-修改行为前阅读 `README.md` 和相关源码。
+修改行为前阅读仓库 `README.md`、本目录的 `README.md` 和相关源码。
 
 ## 既有架构
 
@@ -61,9 +61,10 @@ src/mp_real/robots/rm2/
 - `static/app.js`
 - `tests/test_runtime.py`
 
-评测平台路线图还要阅读：
+评测平台行为与安全工作流还要阅读：
 
-- `docs/plans/evaluation-platform.md`
+- `evaluation_workflow.md`
+- `robot_capability_matrix.md`
 
 ## 架构约束
 

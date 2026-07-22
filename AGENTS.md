@@ -67,9 +67,10 @@ Read these before architectural changes:
 - static/app.js
 - tests/test_runtime.py
 
-For the evaluation-platform roadmap, also read:
+For evaluation-platform behavior and safety workflows, also read:
 
-- docs/plans/evaluation-platform.md
+- docs/en/evaluation_workflow.md
+- docs/en/robot_capability_matrix.md
 
 ## Architectural constraints
 
