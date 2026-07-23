@@ -48,6 +48,10 @@
           </div>
         </section>
 
+        <section id="dataViewEmbed" hidden aria-label="数据回放与开环评测">
+          <iframe id="dataViewFrame" title="数据回放与开环评测"></iframe>
+        </section>
+
         <section class="camera-grid" id="cameraGrid"></section>
         <template id="cameraPanelTemplate">
           <article class="camera-panel">
@@ -325,6 +329,7 @@
                 <option value="deployment">DEPLOYMENT</option>
                 <option value="camera_preview">CAMERA_PREVIEW</option>
                 <option value="offline_replay">OFFLINE_REPLAY</option>
+                <option value="data_view">DATA_VIEW</option>
               </select>
             </label>
             <label>

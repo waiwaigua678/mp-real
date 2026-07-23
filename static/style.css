@@ -441,6 +441,27 @@ button:disabled {
   color: var(--ok);
 }
 
+#dataViewEmbed {
+  min-height: calc(100vh - 102px);
+  margin: -14px;
+}
+
+#dataViewFrame {
+  display: block;
+  width: 100%;
+  min-height: calc(100vh - 102px);
+  border: 0;
+  background: var(--bg);
+}
+
+body[data-runtime-mode="data_view"] #runPage > :not(#dataViewEmbed) {
+  display: none !important;
+}
+
+body[data-runtime-mode="data_view"] main {
+  padding: 14px;
+}
+
 #errorLine {
   font-weight: 700;
 }
@@ -465,6 +486,15 @@ button:disabled {
   .topbar {
     padding-left: 10px;
     padding-right: 10px;
+  }
+
+  #dataViewEmbed {
+    min-height: calc(100vh - 88px);
+    margin: -10px;
+  }
+
+  #dataViewFrame {
+    min-height: calc(100vh - 88px);
   }
 
   .form-section,

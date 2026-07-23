@@ -11,6 +11,7 @@ validation is not claimed.
 | CLI deployment | supported | supported | shared sync/RTC/infer-only loops; RM2 defaults have a limited recorded hardware-validation scope |
 | Web deployment | supported | supported | shared `RobotWebRuntime` profile path |
 | CAMERA_PREVIEW | supported | supported | no Robot or PolicyClient |
+| Web DATA_VIEW | supported | supported | recorded-data browser; robot replay remains safety-gated |
 | Web policy warmup | supported | supported | warmup actions discarded |
 | CLI startup warmup | unsupported | unsupported | CLI follows its existing direct loop path |
 | sync / RTC | supported | supported | ActionSpec-driven |

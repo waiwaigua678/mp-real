@@ -530,6 +530,12 @@ class ReplayControllerTests(unittest.TestCase):
         self.assertEqual(controller.cursor().state, ReplayState.COMPLETED)
         self.assertEqual(len(robot.commands), len(controller.plan.steps))
 
+    def test_stop_while_armed_is_terminal(self) -> None:
+        controller, robot = self._armed_controller()
+        self.assertTrue(controller.stop(emergency=True, wait=True, timeout=2.0))
+        self.assertEqual(controller.cursor().state, ReplayState.ABORTED)
+        self.assertGreater(robot.stops, 0)
+
     def test_pause_resume_stop_and_stale_lease(self) -> None:
         controller, robot = self._armed_controller()
         controller.confirm_and_start(controller.plan.plan_hash)

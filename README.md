@@ -48,10 +48,17 @@ uv run mp-robot-replay --help
 ```
 
 `mp-real-web` is a robot-neutral alias for `mp-piper-web`. The Web server has
-three resource modes: `DEPLOYMENT` creates robot, cameras, and policy client;
+four resource modes: `DEPLOYMENT` creates robot, cameras, and policy client;
 `CAMERA_PREVIEW` creates cameras only; `OFFLINE_REPLAY` creates none of those
-resources. Policy warmup actions are discarded and a fresh chunk is prepared
-before the deployment control loop starts.
+resources; `DATA_VIEW` embeds the data viewer in the Run page and opens only
+recorded data. Give it `--recorded-data-root` options at startup or import a
+server-local dataset/storage path from the DATA_VIEW page; paths imported in
+the page exist only for the current Web process. Its explicit teacher-forced
+open-loop action creates a policy client only in a
+background worker and never creates or commands a robot. Its robot replay
+action remains separately safety-planned, low-speed, and confirmation-gated.
+Policy warmup actions are discarded and a fresh chunk is prepared before the
+deployment control loop starts.
 
 ## Safety and status
 

@@ -65,7 +65,6 @@ function numberOrEmpty(value) {
 
 function setForm(config) {
   if (config.robot) robotSelect.value = config.robot;
-  ensureCameraPanels(config.camera_roles || []);
   for (const [key, value] of Object.entries(config)) {
     if (config.robot === "rm2" && key === "arm_command" && form.elements.rm2_arm_command) {
       form.elements.rm2_arm_command.value = numberOrEmpty(value);
@@ -82,6 +81,7 @@ function setForm(config) {
     }
   }
   setRuntimeModeUi(config.runtime_mode || "deployment");
+  ensureCameraPanels(config.camera_roles || []);
   evaluationForm.elements.robot_name.value = config.robot || robotSelect.value;
   if (!evaluation) evaluationForm.elements.prompt.value = config.prompt || "";
   dirty = false;
@@ -382,7 +382,7 @@ function ensureCameraPanels(roles) {
     const image = panel.querySelector("img");
     image.id = `stream-${role}`;
     image.alt = role;
-    image.src = `/stream/${encodeURIComponent(role)}.mjpg?t=${Date.now()}`;
+    if (runtimeMode() !== "data_view") image.src = `/stream/${encodeURIComponent(role)}.mjpg?t=${Date.now()}`;
     grid.appendChild(panel);
   }
 }
@@ -400,6 +400,8 @@ function setRuntimeModeUi(statusOrMode) {
   const deployment = mode === "deployment";
   const preview = mode === "camera_preview";
   const offline = mode === "offline_replay";
+  const dataView = mode === "data_view";
+  document.body.dataset.runtimeMode = mode;
   const visibilitySelector = [
     "[data-deployment-only='true']",
     "[data-piper-only='true']",
@@ -412,8 +414,16 @@ function setRuntimeModeUi(statusOrMode) {
       (node.dataset.rm2Only === "true" && !rm2);
   }
   document.querySelector("#offlineReplayNotice").hidden = !offline;
-  connectBtn.textContent = preview ? "连接相机" : offline ? "进入回放" : "连接预览";
-  startBtn.textContent = preview ? "开始预览" : offline ? "回放（阶段 7）" : "开始";
+  const dataViewEmbed = document.querySelector("#dataViewEmbed");
+  const dataViewFrame = document.querySelector("#dataViewFrame");
+  dataViewEmbed.hidden = !dataView;
+  if (dataView && dataViewFrame.dataset.loaded !== "true") {
+    dataViewFrame.src = "/data-view";
+    dataViewFrame.dataset.loaded = "true";
+  }
+  if (!dataView) initStreams();
+  connectBtn.textContent = preview ? "连接相机" : offline ? "进入回放" : dataView ? "数据视图就绪" : "连接预览";
+  startBtn.textContent = preview ? "开始预览" : offline ? "回放（阶段 7）" : dataView ? "打开数据视图" : "开始";
   stopBtn.textContent = preview ? "停止预览" : "停止";
 }
 
@@ -468,6 +478,12 @@ async function saveConfig() {
   setForm(data.config);
   document.querySelector("#serverLine").textContent = data.config.server_url;
   document.querySelector("#promptLine").textContent = data.config.prompt;
+  if (data.config.runtime_mode === "data_view") {
+    const dataViewFrame = document.querySelector("#dataViewFrame");
+    dataViewFrame.src = `/data-view?t=${Date.now()}`;
+    dataViewFrame.dataset.loaded = "true";
+    showPage("runPage");
+  }
   setMessage("参数已保存", "ok");
 }
 
@@ -500,6 +516,10 @@ function setFieldLocks(status) {
 
 function applyStatus(status) {
   currentStatus = status;
+  // Status polling must not overwrite a disconnected user's unsaved mode.
+  // The backend still reports its persisted mode until Save succeeds.
+  const displayedMode = dirty ? form.elements.runtime_mode.value : status;
+  setRuntimeModeUi(displayedMode);
   ensureCameraPanels(status.camera_roles || []);
   const metrics = status.metrics || {};
 
@@ -542,9 +562,6 @@ function applyStatus(status) {
     }
   }
 
-  // Status polling must not overwrite a disconnected user's unsaved mode.
-  // The backend still reports its persisted mode until Save succeeds.
-  setRuntimeModeUi(dirty ? form.elements.runtime_mode.value : status);
   setFieldLocks(status);
   connectBtn.disabled = !status.can_connect;
   pingBtn.disabled = status.running || runtimeMode(status) !== "deployment";

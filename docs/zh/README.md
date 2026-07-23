@@ -32,10 +32,13 @@ uv run mp-move-to-recorded-state --help
 uv run mp-robot-replay --help
 ```
 
-`mp-real-web` 是 `mp-piper-web` 的机器人无关别名。Web 有三种资源模式：
+`mp-real-web` 是 `mp-piper-web` 的机器人无关别名。Web 有四种资源模式：
 `DEPLOYMENT` 创建机器人、相机和策略客户端；`CAMERA_PREVIEW` 只创建相机；
-`OFFLINE_REPLAY` 不创建这些资源。策略预热产生的动作会丢弃，控制环开始前会准备一份
-新的动作块。
+`OFFLINE_REPLAY` 不创建这些资源；`DATA_VIEW` 会在“运行”页嵌入数据查看器，只打开录制
+数据。可在启动时传入 `--recorded-data-root`，也可进入 `DATA_VIEW` 后导入运行 Web 服务的
+机器上可读取的数据集目录；页面导入仅在当前 Web 进程有效。显式提交开环评测时才会由
+后台 worker 连接策略服务，绝不创建 Robot 或下发动作；真机数据回放仍须单独生成安全计划、
+低速连接和二次确认。策略预热产生的动作会丢弃，控制环开始前会准备一份新的动作块。
 
 ## 安全与状态
 

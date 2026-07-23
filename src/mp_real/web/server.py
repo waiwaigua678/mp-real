@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 import copy
+from contextlib import contextmanager
 import dataclasses
 import enum
+import hashlib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
@@ -32,7 +34,7 @@ except ImportError:
 
 from mp_real.common.image import preprocess_image
 from mp_real.common.runtime import rtc_replan_stride
-from mp_real.data.view import DataViewSession
+from mp_real.data.view import DataViewError, DataViewSession, downsample_series
 from mp_real.evaluation.baseline import (
     BaselineConfigurationConflict,
     BaselineReferenceWriter,
@@ -40,6 +42,13 @@ from mp_real.evaluation.baseline import (
     BaselineStore,
 )
 from mp_real.evaluation.service import EvaluationConflict, EvaluationRuntimeLease, EvaluationService
+from mp_real.evaluation.open_loop.jobs import OpenLoopEvaluationJobManager, OpenLoopJobState
+from mp_real.evaluation.open_loop.models import (
+    AlignmentMode,
+    EvaluationRequestMode,
+    OpenLoopEvaluationConfig,
+    PredictionResultSource,
+)
 from mp_real.policy_client.client import PolicyClient
 from mp_real.robots.base import Robot
 from mp_real.robots.pose import PoseControlCapability
@@ -114,6 +123,8 @@ RESET_LEFT_JOINTS = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 RESET_RIGHT_JOINTS = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 RESET_LEFT_GRIPPER = 1.0
 RESET_RIGHT_GRIPPER = 1.0
+DATA_VIEW_MAX_IMPORTED_ROOTS = 16
+DATA_VIEW_MAX_PATH_CHARS = 4096
 
 
 def _git_commit() -> str | None:
@@ -180,6 +191,7 @@ class RuntimeMode(enum.StrEnum):
     DEPLOYMENT = "deployment"
     CAMERA_PREVIEW = "camera_preview"
     OFFLINE_REPLAY = "offline_replay"
+    DATA_VIEW = "data_view"
 
 
 def _pose_validation_json(report: PoseValidationReport | None) -> dict[str, Any] | None:
@@ -426,6 +438,31 @@ class _DeploymentResources:
 
         if errors:
             raise errors[0]
+
+
+class _LeasedPolicyClient:
+    """Release an in-process policy lease exactly when an evaluator closes it."""
+
+    def __init__(self, client: Any, lease: ResourceLease) -> None:
+        self._client = client
+        self._lease = lease
+        self._closed = False
+        self._close_lock = threading.Lock()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+    def close(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            close = getattr(self._client, "close", None)
+            if callable(close):
+                close()
+        finally:
+            self._lease.release()
 
 
 def _default_args(*, camera_profile: str = "hardware") -> infer_piper.Args:
@@ -705,6 +742,45 @@ def _coerce_float_tuple(value: Any, *, length: int, field: str) -> tuple[float, 
     return tuple(float(part) for part in parts)
 
 
+def _optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    result = str(value)
+    return result if result.strip() else None
+
+
+def _optional_positive_int(value: object, *, field: str) -> int | None:
+    if value is None or value == "":
+        return None
+    result = int(value)
+    if result <= 0:
+        raise ValueError(f"{field} must be positive")
+    return result
+
+
+def _normalized_data_view_roots(roots: tuple[pathlib.Path | str, ...]) -> tuple[pathlib.Path, ...]:
+    """Canonicalize and deduplicate local recording roots without requiring them to exist.
+
+    Startup roots preserve the existing behavior: a missing mount can become
+    available after the Web process starts.  Paths supplied from the browser
+    are validated separately with ``strict=True`` before reaching this helper.
+    """
+
+    result: list[pathlib.Path] = []
+    for root in roots:
+        path = pathlib.Path(root).expanduser().resolve(strict=False)
+        if path not in result:
+            result.append(path)
+    return tuple(result)
+
+
+def _data_view_root_id(root: pathlib.Path) -> str:
+    """Return a stable opaque identifier without disclosing an absolute path."""
+
+    digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:20]
+    return f"root_{digest}"
+
+
 class RobotWebRuntime:
     def __init__(
         self,
@@ -717,9 +793,11 @@ class RobotWebRuntime:
         camera_factory: Callable[[Any], dict[str, infer_piper.Camera]] | None = None,
         resource_manager: ResourceLeaseManager | None = None,
         recorded_data_roots: tuple[pathlib.Path | str, ...] = (),
+        data_view_web_roots: tuple[pathlib.Path | str, ...] = (),
         pose_mapping_config: PoseMappingConfig | None = None,
         replay_record_root: pathlib.Path | str | None = None,
         baseline_root: pathlib.Path | str = "recordings/baselines",
+        open_loop_output_root: pathlib.Path | str = "open_loop_results",
     ) -> None:
         self._lock = threading.RLock()
         self._frame_condition = threading.Condition(self._lock)
@@ -745,8 +823,30 @@ class RobotWebRuntime:
         self._baseline_service = BaselineService(BaselineStore(self._baseline_root))
         self._baseline_writer: BaselineReferenceWriter | None = None
         self._evaluation_service = EvaluationService(self, terminal_sink=self._submit_baseline_reference)
-        self._recorded_data_roots = tuple(recorded_data_roots)
+        self._startup_recorded_data_roots = _normalized_data_view_roots(recorded_data_roots)
+        self._data_view_web_roots = tuple(
+            root
+            for root in _normalized_data_view_roots(data_view_web_roots)
+            if root not in self._startup_recorded_data_roots
+        )
+        self._recorded_data_roots = (
+            *self._startup_recorded_data_roots,
+            *self._data_view_web_roots,
+        )
         self._recorded_data_view = DataViewSession(self._recorded_data_roots) if self._recorded_data_roots else None
+        # A browser request can keep a session open after it leaves the
+        # runtime lock.  Root replacement therefore retires (rather than
+        # immediately closes) old sessions until their bounded viewer lease
+        # count reaches zero.
+        self._data_view_viewer_leases: dict[int, int] = {}
+        self._retired_data_view_sessions: list[DataViewSession] = []
+        self._data_view_root_dataset_counts: dict[pathlib.Path, int | None] = {
+            root: None for root in self._recorded_data_roots
+        }
+        self._open_loop_output_root = pathlib.Path(open_loop_output_root).expanduser().resolve(strict=False)
+        self._data_view_open_loop_jobs: OpenLoopEvaluationJobManager | None = None
+        self._data_view_generation_id = 0
+        self._data_view_session_id: str | None = None
         self._pose_mapping_config = pose_mapping_config
         self._replay_record_root = pathlib.Path(replay_record_root) if replay_record_root is not None else None
         self._pose_target = None
@@ -1505,6 +1605,577 @@ class RobotWebRuntime:
             prefetch_first_chunk=self._policy_prefetch_first_chunk,
         )
 
+    # DATA_VIEW deliberately owns only recorded-data browsing and the
+    # background open-loop worker.  It has no Robot, Camera, or PolicyClient
+    # construction path.  A policy client is created only inside the existing
+    # OpenLoopEvaluationJobManager worker after an explicit user submission.
+    def _data_view_ready_locked(self) -> bool:
+        return (
+            self._runtime_mode is RuntimeMode.DATA_VIEW
+            and self._connected
+            and self._phase == "data_view"
+            and self._recorded_data_view is not None
+            and self._data_view_open_loop_jobs is not None
+        )
+
+    def _require_data_view_viewer(self) -> DataViewSession:
+        """Return the read-only viewer before or after DATA_VIEW Connect.
+
+        The iframe loads its dataset catalog immediately after the mode is
+        selected.  Browsing recorded files does not need a resource lease or
+        create any hardware/policy object, so it intentionally remains usable
+        before the virtual DATA_VIEW connection is opened.
+        """
+        with self._lock:
+            if self._runtime_mode is not RuntimeMode.DATA_VIEW:
+                raise ApiError("Data view APIs require DATA_VIEW mode", HTTPStatus.CONFLICT)
+            if self._recorded_data_view is None:
+                raise ApiError(
+                    "Import a recording directory in DATA_VIEW or configure --recorded-data-root at Web server startup",
+                    HTTPStatus.CONFLICT,
+                )
+            return self._recorded_data_view
+
+    @contextmanager
+    def _data_view_viewer_lease(self) -> Iterator[DataViewSession]:
+        """Keep a DataViewSession alive while one API request reads from it."""
+
+        with self._lock:
+            if self._runtime_mode is not RuntimeMode.DATA_VIEW:
+                raise ApiError("Data view APIs require DATA_VIEW mode", HTTPStatus.CONFLICT)
+            viewer = self._recorded_data_view
+            if viewer is None:
+                raise ApiError(
+                    "Import a recording directory in DATA_VIEW or configure --recorded-data-root at Web server startup",
+                    HTTPStatus.CONFLICT,
+                )
+            viewer_key = self._retain_data_view_viewer_locked(viewer)
+        try:
+            yield viewer
+        finally:
+            self._release_data_view_viewer_lease(viewer_key)
+
+    def _retain_data_view_viewer_locked(self, viewer: DataViewSession) -> int:
+        viewer_key = id(viewer)
+        self._data_view_viewer_leases[viewer_key] = self._data_view_viewer_leases.get(viewer_key, 0) + 1
+        return viewer_key
+
+    def _release_data_view_viewer_lease(self, viewer_key: int) -> None:
+        closable: list[DataViewSession] = []
+        with self._lock:
+            remaining = self._data_view_viewer_leases.get(viewer_key, 0) - 1
+            if remaining > 0:
+                self._data_view_viewer_leases[viewer_key] = remaining
+            else:
+                self._data_view_viewer_leases.pop(viewer_key, None)
+            closable = self._collect_retired_data_view_sessions_locked()
+        self._close_replaced_data_views(closable)
+
+    def _collect_retired_data_view_sessions_locked(self) -> list[DataViewSession]:
+        closable: list[DataViewSession] = []
+        retained: list[DataViewSession] = []
+        for viewer in self._retired_data_view_sessions:
+            if self._data_view_viewer_leases.get(id(viewer), 0) == 0:
+                closable.append(viewer)
+            else:
+                retained.append(viewer)
+        self._retired_data_view_sessions = retained
+        return closable
+
+    def _require_data_view_ready(self) -> tuple[DataViewSession, OpenLoopEvaluationJobManager]:
+        with self._lock:
+            if self._runtime_mode is not RuntimeMode.DATA_VIEW:
+                raise ApiError("Data view APIs require DATA_VIEW mode", HTTPStatus.CONFLICT)
+            if not self._data_view_ready_locked():
+                raise ApiError("Connect DATA_VIEW before browsing recorded data", HTTPStatus.CONFLICT)
+            assert self._recorded_data_view is not None
+            assert self._data_view_open_loop_jobs is not None
+            return self._recorded_data_view, self._data_view_open_loop_jobs
+
+    @staticmethod
+    def _validate_data_view_import_path(payload: Mapping[str, Any]) -> tuple[pathlib.Path, int]:
+        """Validate one explicitly submitted recording root without browsing elsewhere.
+
+        There is intentionally no filesystem listing endpoint.  The only
+        local path a browser can cause us to inspect is the exact directory it
+        submits here, and validation reads only LeRobot metadata through the
+        existing read-only catalog/source abstractions.
+        """
+
+        raw_path = payload.get("path")
+        if not isinstance(raw_path, str):
+            raise ApiError("path must be a local directory string")
+        raw_path = raw_path.strip()
+        if not raw_path or len(raw_path) > DATA_VIEW_MAX_PATH_CHARS or "\x00" in raw_path:
+            raise ApiError("path must be a non-empty local directory")
+        try:
+            requested = pathlib.Path(raw_path).expanduser()
+        except (OSError, RuntimeError) as exc:
+            raise ApiError("path is not a valid local directory") from exc
+        if not requested.is_absolute():
+            raise ApiError("path must be absolute (or begin with ~)")
+        try:
+            root = requested.resolve(strict=True)
+        except OSError as exc:
+            raise ApiError("path is not an accessible local directory") from exc
+        if not root.is_dir() or root == root.parent:
+            raise ApiError("path must be a recording directory, not a filesystem root")
+
+        session: DataViewSession | None = None
+        try:
+            session = DataViewSession((root,))
+            datasets = session.datasets()
+            if not datasets:
+                raise ApiError("No readable LeRobot v2.1 dataset was found in the submitted directory")
+            # Catalog scanning intentionally remains metadata-only.  Probe one
+            # catalog entry through the source constructor as well so a stale
+            # or incompatible info.json cannot be imported and fail later on
+            # the first sample request.
+            for dataset in datasets:
+                try:
+                    session.replay_source(str(dataset["dataset_id"])).get_dataset_metadata()
+                except Exception:
+                    continue
+                return root, len(datasets)
+        except ApiError:
+            raise
+        except Exception as exc:
+            raise ApiError("The submitted directory is not a readable LeRobot v2.1 recording root") from exc
+        finally:
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    logging.exception("Failed to close temporary DATA_VIEW validation session")
+        raise ApiError("No compatible LeRobot v2.1 dataset was found in the submitted directory")
+
+    def _data_view_root_summaries_locked(self) -> list[dict[str, Any]]:
+        web_roots = set(self._data_view_web_roots)
+        return [
+            {
+                "root_id": _data_view_root_id(root),
+                # Do not serialize the absolute path.  A caller that imported
+                # it already knows it; other Web clients only need an opaque
+                # selector for removal.
+                "label": root.name or "filesystem-root",
+                "origin": "web" if root in web_roots else "startup",
+                # Startup roots are deliberately not scanned on every status
+                # poll; null means the count has not been indexed in this Web
+                # process yet.  A Web-imported root has a validated count.
+                "dataset_count": self._data_view_root_dataset_counts.get(root),
+            }
+            for root in self._recorded_data_roots
+        ]
+
+    def _data_view_open_loop_active_locked(self) -> bool:
+        manager = self._data_view_open_loop_jobs
+        if manager is None:
+            return False
+        active_states = {OpenLoopJobState.QUEUED.value, OpenLoopJobState.RUNNING.value}
+        return any(job["state"] in active_states for job in manager.list_status())
+
+    def _check_data_view_catalog_mutation_locked(self) -> None:
+        if self._runtime_mode is not RuntimeMode.DATA_VIEW:
+            raise ApiError("Recording directories can only be changed in DATA_VIEW mode", HTTPStatus.CONFLICT)
+        if self._data_view_open_loop_active_locked():
+            raise ApiError(
+                "Stop the active open-loop evaluation before changing recording directories",
+                HTTPStatus.CONFLICT,
+            )
+        if self._replay_active_locked() or self._replay_view_locked:
+            raise ApiError("Stop robot trajectory replay before changing recording directories", HTTPStatus.CONFLICT)
+        if self._pose_worker_active_locked() or self._pose_phase in {
+            "moving",
+            "stopping",
+            "awaiting_move_confirmation",
+        }:
+            raise ApiError(
+                "Finish the recorded-state pose session before changing recording directories",
+                HTTPStatus.CONFLICT,
+            )
+
+    def _invalidate_data_view_replay_plan_locked(self) -> bool:
+        """Discard an idle plan whose source catalog may just have changed."""
+
+        if self._replay_plan is None:
+            return False
+        self._replay_plan = None
+        self._replay_report = None
+        self._replay_error = None
+        self._replay_phase = ReplayState.IDLE
+        return True
+
+    def _replace_data_view_roots_locked(
+        self, web_roots: tuple[pathlib.Path, ...]
+    ) -> list[DataViewSession]:
+        """Install a fresh catalog and retire its predecessor safely."""
+
+        self._data_view_web_roots = web_roots
+        self._recorded_data_roots = (
+            *self._startup_recorded_data_roots,
+            *self._data_view_web_roots,
+        )
+        old_viewer = self._recorded_data_view
+        self._recorded_data_view = (
+            DataViewSession(self._recorded_data_roots) if self._recorded_data_roots else None
+        )
+        if old_viewer is not None:
+            self._retired_data_view_sessions.append(old_viewer)
+        self._invalidate_data_view_replay_plan_locked()
+        return self._collect_retired_data_view_sessions_locked()
+
+    @staticmethod
+    def _close_replaced_data_views(viewers: Iterable[DataViewSession]) -> None:
+        for viewer in viewers:
+            try:
+                viewer.close()
+            except Exception:
+                logging.exception("Failed to close replaced DATA_VIEW catalog")
+
+    def data_view_import_root(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Add a runtime-only recording root without constructing hardware."""
+
+        root, dataset_count = self._validate_data_view_import_path(payload)
+        retired_viewers: list[DataViewSession] = []
+        with self._lock:
+            self._check_data_view_catalog_mutation_locked()
+            if root in self._recorded_data_roots:
+                self._data_view_root_dataset_counts[root] = dataset_count
+                summary = next(
+                    item
+                    for item in self._data_view_root_summaries_locked()
+                    if item["root_id"] == _data_view_root_id(root)
+                )
+                return {
+                    "added": False,
+                    "root": {**summary, "dataset_count": dataset_count},
+                    "data_view": self._data_view_status_locked(),
+                }
+            if any(
+                root.is_relative_to(existing) or existing.is_relative_to(root)
+                for existing in self._recorded_data_roots
+            ):
+                raise ApiError(
+                    "The submitted recording directory overlaps an already configured directory",
+                    HTTPStatus.CONFLICT,
+                )
+            if len(self._data_view_web_roots) >= DATA_VIEW_MAX_IMPORTED_ROOTS:
+                raise ApiError(
+                    f"At most {DATA_VIEW_MAX_IMPORTED_ROOTS} Web-imported recording directories are allowed",
+                    HTTPStatus.CONFLICT,
+                )
+            self._data_view_root_dataset_counts[root] = dataset_count
+            retired_viewers = self._replace_data_view_roots_locked((*self._data_view_web_roots, root))
+            summary = next(
+                item for item in self._data_view_root_summaries_locked() if item["root_id"] == _data_view_root_id(root)
+            )
+            result = {
+                "added": True,
+                "root": {**summary, "dataset_count": dataset_count},
+                "data_view": self._data_view_status_locked(),
+            }
+        self._close_replaced_data_views(retired_viewers)
+        self.log("Imported a runtime-only DATA_VIEW recording directory")
+        return result
+
+    def data_view_remove_root(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Remove one Web-imported root; startup roots remain immutable."""
+
+        root_id = payload.get("root_id")
+        if not isinstance(root_id, str) or not root_id:
+            raise ApiError("root_id is required")
+        retired_viewers: list[DataViewSession] = []
+        with self._lock:
+            self._check_data_view_catalog_mutation_locked()
+            root = next((item for item in self._recorded_data_roots if _data_view_root_id(item) == root_id), None)
+            if root is None:
+                raise ApiError("Unknown recording directory", HTTPStatus.NOT_FOUND)
+            if root not in self._data_view_web_roots:
+                raise ApiError("Recording directories configured at startup cannot be removed", HTTPStatus.CONFLICT)
+            remaining_web_roots = tuple(item for item in self._data_view_web_roots if item != root)
+            remaining_roots = (*self._startup_recorded_data_roots, *remaining_web_roots)
+            if self._connected and not remaining_roots:
+                raise ApiError(
+                    "Disconnect DATA_VIEW before removing its last recording directory",
+                    HTTPStatus.CONFLICT,
+                )
+            self._data_view_root_dataset_counts.pop(root, None)
+            retired_viewers = self._replace_data_view_roots_locked(remaining_web_roots)
+            result = {
+                "removed": True,
+                "root_id": root_id,
+                "data_view": self._data_view_status_locked(),
+            }
+        self._close_replaced_data_views(retired_viewers)
+        self.log("Removed a runtime-only DATA_VIEW recording directory")
+        return result
+
+    def _data_view_status_locked(self) -> dict[str, Any]:
+        manager = self._data_view_open_loop_jobs
+        jobs = manager.list_status() if manager is not None else []
+        active_states = {OpenLoopJobState.QUEUED.value, OpenLoopJobState.RUNNING.value}
+        return {
+            # ``ready`` means the iframe can browse recorded files now;
+            # ``connected`` means the optional DATA_VIEW worker/lease has
+            # been activated by Connect or an explicit open-loop submission.
+            "ready": self._runtime_mode is RuntimeMode.DATA_VIEW and self._recorded_data_view is not None,
+            "connected": self._data_view_ready_locked(),
+            "session_id": self._data_view_session_id,
+            "generation_id": self._data_view_generation_id,
+            "dataset_roots_configured": len(self._recorded_data_roots),
+            "dataset_roots": self._data_view_root_summaries_locked(),
+            "web_import_root_limit": DATA_VIEW_MAX_IMPORTED_ROOTS,
+            "root_persistence": "runtime_only",
+            "open_loop_worker_ready": manager is not None,
+            "open_loop_active": any(job["state"] in active_states for job in jobs),
+            "open_loop_jobs": jobs,
+        }
+
+    def data_view_status(self) -> dict[str, Any]:
+        with self._lock:
+            return self._data_view_status_locked()
+
+    def data_view_datasets(self) -> list[dict[str, Any]]:
+        with self._lock:
+            if self._runtime_mode is not RuntimeMode.DATA_VIEW:
+                raise ApiError("Data view APIs require DATA_VIEW mode", HTTPStatus.CONFLICT)
+            # An empty catalog is a normal first-run DATA_VIEW state.  It lets
+            # the iframe present its path-import UI without treating absence
+            # of a startup CLI flag as an API failure.
+            if self._recorded_data_view is None:
+                return []
+        with self._data_view_viewer_lease() as viewer:
+            return viewer.datasets()
+
+    def data_view_episodes(self, dataset_id: str) -> list[dict[str, Any]]:
+        with self._data_view_viewer_lease() as viewer:
+            return viewer.episodes(dataset_id)
+
+    def data_view_episode_metadata(self, dataset_id: str, episode_index: int) -> dict[str, Any]:
+        with self._data_view_viewer_lease() as viewer:
+            return viewer.episode_metadata(dataset_id, episode_index)
+
+    def data_view_sample(self, dataset_id: str, episode_index: int, sample_index: int) -> dict[str, Any]:
+        with self._data_view_viewer_lease() as viewer:
+            return viewer.sample(dataset_id, episode_index, sample_index)
+
+    def data_view_sample_at_timestamp(self, dataset_id: str, episode_index: int, timestamp: float) -> dict[str, Any]:
+        with self._data_view_viewer_lease() as viewer:
+            return viewer.sample_at_timestamp(dataset_id, episode_index, timestamp)
+
+    def data_view_camera_frame(
+        self, dataset_id: str, episode_index: int, sample_index: int, role: str
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        with self._data_view_viewer_lease() as viewer:
+            return viewer.camera_frame(dataset_id, episode_index, sample_index, role)
+
+    def data_view_curves(
+        self,
+        dataset_id: str,
+        episode_index: int,
+        *,
+        series: tuple[str, ...],
+        max_points: int,
+    ) -> dict[str, Any]:
+        with self._data_view_viewer_lease() as viewer:
+            return viewer.curves(dataset_id, episode_index, series=series, max_points=max_points)
+
+    def data_view_runtime_events(self, dataset_id: str, episode_index: int, *, limit: int) -> dict[str, Any]:
+        with self._data_view_viewer_lease() as viewer:
+            return viewer.runtime_events(dataset_id, episode_index, limit=limit)
+
+    def data_view_metrics(self, dataset_id: str, episode_index: int) -> dict[str, Any]:
+        with self._data_view_viewer_lease() as viewer:
+            return viewer.metrics(dataset_id, episode_index)
+
+    def data_view_selection(self) -> dict[str, Any]:
+        with self._data_view_viewer_lease() as viewer:
+            return viewer.selection()
+
+    def data_view_select(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        with self._data_view_viewer_lease() as viewer:
+            with self._lock:
+                if self._replay_view_locked:
+                    raise ApiError(
+                        "Recorded playback cursor is locked while robot replay owns the session",
+                        HTTPStatus.CONFLICT,
+                    )
+            return viewer.select(
+                str(payload["dataset_id"]),
+                int(payload["episode_index"]),
+                int(payload["sample_index"]),
+                playing=bool(payload.get("playing", False)),
+                playback_rate=float(payload.get("playback_rate", 1.0)),
+            )
+
+    def data_view_submit_open_loop(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        with self._data_view_viewer_lease() as viewer:
+            with self._lock:
+                if self._replay_active_locked():
+                    raise ApiError(
+                        "Stop robot trajectory replay before submitting open-loop evaluation",
+                        HTTPStatus.CONFLICT,
+                    )
+                # The iframe intentionally works before the normal Web Connect
+                # action.  Activating this virtual session still creates no robot,
+                # camera, or policy client; it only starts the bounded job worker.
+                self._activate_data_view_locked()
+                assert self._data_view_open_loop_jobs is not None
+                jobs = self._data_view_open_loop_jobs
+                generation_id = self._data_view_generation_id
+                session_id = self._data_view_session_id
+            dataset_id = str(payload["dataset_id"])
+            episode_index = int(payload["episode_index"])
+            source = viewer.replay_source(dataset_id)
+            raw_roles = payload.get("camera_roles", ())
+            if not isinstance(raw_roles, list | tuple):
+                raise ValueError("camera_roles must be a list when supplied")
+            config = OpenLoopEvaluationConfig(
+                dataset=source.get_dataset_metadata().root,
+                episode_indices=(episode_index,),
+                policy_url=str(payload["policy_url"]),
+                policy_label=str(payload["policy_label"]),
+                output_dir=self._open_loop_output_root / "pending",
+                prompt_override=_optional_text(payload.get("prompt_override")),
+                policy_api_key=_optional_text(payload.get("policy_api_key")),
+                connection_timeout_s=float(payload.get("connection_timeout", 10.0)),
+                metadata_timeout_s=float(payload.get("metadata_timeout", 10.0)),
+                target_source=PredictionResultSource(str(payload.get("target_source", "action"))),
+                alignment_mode=AlignmentMode(str(payload.get("alignment", "sample_index"))),
+                max_timestamp_error_s=float(payload.get("max_timestamp_error", 0.05)),
+                selected_camera_roles=tuple(str(role) for role in raw_roles) or None,
+                request_mode=EvaluationRequestMode(str(payload.get("mode", "sequential"))),
+                allow_frame_index_as_control_step=bool(payload.get("allow_frame_index_as_control_step", False)),
+                limit=_optional_positive_int(payload.get("limit"), field="limit"),
+            )
+            job = jobs.submit(config)
+            # The job ID is the durable result identity.  The DATA_VIEW session and
+            # generation let the browser reject a stale result after disconnect or
+            # a mode switch without changing the manager's stable artifact layout.
+            job["data_view_session_id"] = session_id
+            job["data_view_generation_id"] = generation_id
+            return job
+
+    def data_view_open_loop_jobs(self) -> list[dict[str, Any]]:
+        with self._data_view_viewer_lease():
+            with self._lock:
+                jobs = self._data_view_open_loop_jobs
+            return jobs.list_status() if jobs is not None else []
+
+    def data_view_open_loop_job(self, job_id: str) -> dict[str, Any]:
+        _, jobs = self._require_data_view_ready()
+        return jobs.status(job_id)
+
+    def data_view_stop_open_loop(self, job_id: str) -> dict[str, Any]:
+        _, jobs = self._require_data_view_ready()
+        return jobs.stop(job_id)
+
+    def _data_view_stop_active_open_loop(self) -> None:
+        with self._lock:
+            manager = self._data_view_open_loop_jobs
+        if manager is None:
+            return
+        active = {OpenLoopJobState.QUEUED.value, OpenLoopJobState.RUNNING.value}
+        for job in manager.list_status():
+            if job["state"] in active:
+                manager.stop(str(job["job_id"]))
+
+    def _close_data_view_open_loop_jobs(self, *, timeout: float = 10.0) -> None:
+        with self._lock:
+            manager = self._data_view_open_loop_jobs
+        if manager is None:
+            return
+        try:
+            manager.close(timeout=timeout)
+        except TimeoutError as exc:
+            raise ApiError("Open-loop worker is still stopping; retry Disconnect shortly", HTTPStatus.CONFLICT) from exc
+        with self._lock:
+            if self._data_view_open_loop_jobs is manager:
+                self._data_view_open_loop_jobs = None
+                self._data_view_session_id = None
+                self._data_view_generation_id += 1
+
+    def data_view_open_loop_report(self, job_id: str, episode_index: int, *, include_curves: bool) -> dict[str, Any]:
+        _, jobs = self._require_data_view_ready()
+        report_path = jobs.report_path(job_id, episode_index)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if include_curves:
+            report["curves"] = self.data_view_open_loop_curves(job_id, episode_index)
+        return report
+
+    def data_view_open_loop_curves(self, job_id: str, episode_index: int) -> list[dict[str, Any]]:
+        _, jobs = self._require_data_view_ready()
+        prediction_path = jobs.prediction_path(job_id, episode_index)
+        with np.load(prediction_path, allow_pickle=False) as archive:
+            predicted = np.asarray(archive["predicted_chunks"], dtype=np.float32)
+            target = np.asarray(archive["targets"], dtype=np.float32)
+            valid = np.asarray(archive["valid_mask"], dtype=np.bool_)
+        if predicted.ndim != 3 or target.shape != predicted.shape or valid.shape != predicted.shape[:2]:
+            raise DataViewError("open-loop prediction artifact has an invalid shape")
+        action_names = self._data_view_open_loop_action_names(
+            jobs,
+            job_id,
+            episode_index,
+            expected_dimensions=predicted.shape[2],
+        )
+        curves: list[dict[str, Any]] = []
+        for dimension in range(predicted.shape[2]):
+            points = valid[:, 0]
+            predicted_values = np.where(points, predicted[:, 0, dimension], np.nan)
+            target_values = np.where(points, target[:, 0, dimension], np.nan)
+            field_name = action_names[dimension]
+            # Pair IDs intentionally share the same suffix so the frontend
+            # assigns prediction and recorded target for one ActionSpec field
+            # the same color while retaining a stable machine-readable ID.
+            curve_suffix = f"{dimension}.{field_name}"
+            curves.append(
+                {
+                    "id": f"prediction.{curve_suffix}",
+                    "label": f"prediction {field_name}",
+                    "field_name": field_name,
+                    "dimension": dimension,
+                    "points": downsample_series(predicted_values, max_points=600),
+                    "kind": "prediction",
+                }
+            )
+            curves.append(
+                {
+                    "id": f"target.{curve_suffix}",
+                    "label": f"target {field_name}",
+                    "field_name": field_name,
+                    "dimension": dimension,
+                    "points": downsample_series(target_values, max_points=600),
+                    "kind": "target",
+                }
+            )
+        return curves
+
+    @staticmethod
+    def _data_view_open_loop_action_names(
+        jobs: OpenLoopEvaluationJobManager,
+        job_id: str,
+        episode_index: int,
+        *,
+        expected_dimensions: int,
+    ) -> tuple[str, ...]:
+        """Read the persisted ActionSpec rather than assuming a robot layout."""
+        report_path = jobs.report_path(job_id, episode_index)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        input_payload = report.get("input", {}) if isinstance(report, Mapping) else {}
+        action_spec = input_payload.get("action_spec", {}) if isinstance(input_payload, Mapping) else {}
+        raw_names = action_spec.get("action_names") if isinstance(action_spec, Mapping) else None
+        if not isinstance(raw_names, list):
+            raw_fields = action_spec.get("action_fields", ()) if isinstance(action_spec, Mapping) else ()
+            raw_names = [item.get("name") if isinstance(item, Mapping) else None for item in raw_fields]
+        names = tuple(
+            (str(raw_names[index]).strip() if index < len(raw_names) and raw_names[index] is not None else "")
+            or f"dim_{index}"
+            for index in range(expected_dimensions)
+        )
+        # A malformed legacy report must still be viewable.  Fallback labels
+        # are only used where the persisted ActionSpec omitted a field name.
+        return names
+
     def replay_plan(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Queue a fully offline replay preflight; this never constructs hardware."""
         dataset_id = str(payload.get("dataset_id", ""))
@@ -1523,8 +2194,12 @@ class RobotWebRuntime:
         with self._lock:
             if self._recorded_data_view is None:
                 raise ApiError("No recorded-data root is configured for this Web server", HTTPStatus.CONFLICT)
+            # DATA_VIEW has a virtual recorded-data connection only.  It must
+            # not prevent the existing offline replay preflight from running;
+            # normal deployment/camera connections still do.
+            data_view_ready = self._data_view_ready_locked()
             if (
-                self._connected
+                (self._connected and not data_view_ready)
                 or self._running
                 or self._pose_worker_active_locked()
                 or self._replay_active_locked()
@@ -1534,6 +2209,7 @@ class RobotWebRuntime:
             if self._replay_plan_thread is not None and self._replay_plan_thread.is_alive():
                 raise ApiError("Replay planning is already in progress", HTTPStatus.CONFLICT)
             viewer = self._recorded_data_view
+            viewer_key = self._retain_data_view_viewer_locked(viewer)
             profile = self._profile
             args = copy.deepcopy(self._args)
             safety_profile = profile.safety_profile_for_args(args)
@@ -1571,6 +2247,7 @@ class RobotWebRuntime:
                     generation_id,
                     self._resource_owner_id,
                     replay_safety_profile,
+                    viewer_key,
                 ),
                 name=f"{profile.robot_name}-replay-plan-g{generation_id}",
                 daemon=False,
@@ -1596,39 +2273,43 @@ class RobotWebRuntime:
         generation_id: int,
         resource_owner_id: str,
         safety_profile: Any,
+        viewer_key: int,
     ) -> None:
         try:
-            result = ReplayPlanner(viewer.replay_source(dataset_id)).plan(
-                robot_name=robot_name,
-                target_action_spec=action_spec,
-                dataset_id=dataset_id,
-                episode_index=episode_index,
-                start_sample=start_sample,
-                end_sample=end_sample,
-                mode=mode,
-                timing_mode=timing_mode,
-                fps=fps,
-                speed_scale=speed_scale,
-                constraints=constraints,
-                generation_id=generation_id,
-                resource_owner_id=resource_owner_id,
-                safety_profile=safety_profile,
-            )
-        except BaseException as exc:
-            with self._lock:
-                if generation_id == self._replay_generation_id:
-                    self._replay_phase = ReplayState.ERROR
-                    self._replay_error = f"{type(exc).__name__}: {exc}"
-            return
-        with self._lock:
-            if generation_id != self._replay_generation_id or self._replay_stop_event.is_set():
+            try:
+                result = ReplayPlanner(viewer.replay_source(dataset_id)).plan(
+                    robot_name=robot_name,
+                    target_action_spec=action_spec,
+                    dataset_id=dataset_id,
+                    episode_index=episode_index,
+                    start_sample=start_sample,
+                    end_sample=end_sample,
+                    mode=mode,
+                    timing_mode=timing_mode,
+                    fps=fps,
+                    speed_scale=speed_scale,
+                    constraints=constraints,
+                    generation_id=generation_id,
+                    resource_owner_id=resource_owner_id,
+                    safety_profile=safety_profile,
+                )
+            except BaseException as exc:
+                with self._lock:
+                    if generation_id == self._replay_generation_id:
+                        self._replay_phase = ReplayState.ERROR
+                        self._replay_error = f"{type(exc).__name__}: {exc}"
                 return
-            self._replay_report = result.report
-            self._replay_plan = result.plan
-            self._replay_phase = ReplayState.VALIDATED if result.report.valid else ReplayState.ERROR
-            self._replay_error = (
-                None if result.report.valid else "; ".join(item.message for item in result.report.errors)
-            )
+            with self._lock:
+                if generation_id != self._replay_generation_id or self._replay_stop_event.is_set():
+                    return
+                self._replay_report = result.report
+                self._replay_plan = result.plan
+                self._replay_phase = ReplayState.VALIDATED if result.report.valid else ReplayState.ERROR
+                self._replay_error = (
+                    None if result.report.valid else "; ".join(item.message for item in result.report.errors)
+                )
+        finally:
+            self._release_data_view_viewer_lease(viewer_key)
 
     def replay_connect(self) -> dict[str, Any]:
         """Create only the selected Robot, then let ReplayController move to start."""
@@ -1636,8 +2317,16 @@ class RobotWebRuntime:
             plan = self._replay_plan
             if self._replay_phase is not ReplayState.VALIDATED or plan is None:
                 raise ApiError("A valid offline replay plan is required", HTTPStatus.CONFLICT)
-            if self._connected or self._running or self._pose_worker_active_locked() or self._replay_active_locked():
+            data_view_ready = self._data_view_ready_locked()
+            if (
+                (self._connected and not data_view_ready)
+                or self._running
+                or self._pose_worker_active_locked()
+                or self._replay_active_locked()
+            ):
                 raise ApiError("Another robot-control lifecycle is active", HTTPStatus.CONFLICT)
+            if data_view_ready and self._data_view_status_locked()["open_loop_active"]:
+                raise ApiError("Stop open-loop evaluation before connecting the robot for replay", HTTPStatus.CONFLICT)
             try:
                 lease = self._resource_manager.acquire(
                     self._resource_owner_id,
@@ -1834,9 +2523,34 @@ class RobotWebRuntime:
     def replay_stop(self, *, emergency: bool = False) -> dict[str, Any]:
         with self._lock:
             controller = self._replay_controller
+            robot = self._replay_robot
+            lease = self._replay_lease
+            generation_id = self._replay_generation_id
+            armed_without_run_worker = controller is not None and controller.cursor().state is ReplayState.ARMED
         if controller is None:
             return self.replay_status()
         controller.stop(emergency=emergency, wait=False)
+        if armed_without_run_worker and robot is not None and lease is not None:
+            # The prepare watcher intentionally returns while ARMED so it does
+            # not wait for operator confirmation forever.  Re-install a
+            # joinable watcher for the cancellation path; ownership checks in
+            # _release_replay_resources make this safe if the prepare watcher
+            # wins a tight stop/prepare race.
+            watcher = threading.Thread(
+                target=self._watch_replay_run,
+                args=(controller, robot, lease, generation_id),
+                name=f"{self._profile.robot_name}-replay-armed-stop-watch-{controller.plan.plan_id[:8]}",
+                daemon=False,
+            )
+            with self._lock:
+                if (
+                    generation_id == self._replay_generation_id
+                    and self._replay_controller is controller
+                    and self._replay_robot is robot
+                    and self._replay_lease is lease
+                ):
+                    self._replay_watch_thread = watcher
+                    watcher.start()
         return self.replay_status()
 
     def _watch_replay_run(
@@ -1849,9 +2563,20 @@ class RobotWebRuntime:
         self, controller: RobotReplayController, robot: Robot, lease: ResourceLease, generation_id: int
     ) -> None:
         with self._lock:
-            recorder = self._replay_recorder if self._replay_controller is controller else None
-            if self._replay_controller is controller:
-                self._replay_recorder = None
+            if (
+                generation_id != self._replay_generation_id
+                or self._replay_controller is not controller
+                or self._replay_robot is not robot
+                or self._replay_lease is not lease
+            ):
+                return
+            recorder = self._replay_recorder
+            # Claim these ownership slots before close/release.  A prepare
+            # watcher and an ARMED-stop watcher can otherwise race to close
+            # the same real robot after a cancellation at the state boundary.
+            self._replay_recorder = None
+            self._replay_robot = None
+            self._replay_lease = None
         if recorder is not None:
             recorder.stop(result=controller.cursor().state.value)
         try:
@@ -1860,8 +2585,6 @@ class RobotWebRuntime:
             lease.release()
         with self._lock:
             if generation_id == self._replay_generation_id and self._replay_controller is controller:
-                self._replay_robot = None
-                self._replay_lease = None
                 self._replay_phase = controller.cursor().state
                 if recorder is not None and recorder.error is not None:
                     self._replay_phase = ReplayState.ERROR
@@ -1927,9 +2650,13 @@ class RobotWebRuntime:
                     HTTPStatus.CONFLICT,
                 )
             viewer = self._recorded_data_view
+            viewer_key = self._retain_data_view_viewer_locked(viewer)
             profile = self._profile
             args = copy.deepcopy(self._args)
-        target = viewer.pose_target(dataset_id, episode_index, sample_index)
+        try:
+            target = viewer.pose_target(dataset_id, episode_index, sample_index)
+        finally:
+            self._release_data_view_viewer_lease(viewer_key)
         validation = (
             MoveToStateValidator(
                 profile.robot_name,
@@ -2436,6 +3163,10 @@ class RobotWebRuntime:
                 if not self._connected:
                     self._connect_offline_replay_locked()
                 return self.status()
+            elif mode is RuntimeMode.DATA_VIEW:
+                if not self._connected:
+                    self._connect_data_view_locked()
+                return self.status()
             elif self._running or self._stop_requested or self._startup_active_locked():
                 raise ApiError("Runtime is already running or stopping", HTTPStatus.CONFLICT)
             elif self._connection_active_locked():
@@ -2498,6 +3229,9 @@ class RobotWebRuntime:
         elif mode is RuntimeMode.OFFLINE_REPLAY:
             with self._lock:
                 self._connect_offline_replay_locked()
+        elif mode is RuntimeMode.DATA_VIEW:
+            with self._lock:
+                self._connect_data_view_locked()
         else:
             with self._lock:
                 self._begin_deployment_connect_locked(args, start_after_connect=False)
@@ -2514,6 +3248,8 @@ class RobotWebRuntime:
             )
         if mode is RuntimeMode.CAMERA_PREVIEW:
             return (ResourceRequest(ResourceType.CAMERAS, camera_scope),)
+        if mode is RuntimeMode.DATA_VIEW:
+            return (ResourceRequest(ResourceType.RECORDED_DATA, f"{robot_scope}:data-view"),)
         return (ResourceRequest(ResourceType.RECORDED_DATA, robot_scope),)
 
     def _acquire_resources_locked(self, mode: RuntimeMode, args: Any) -> None:
@@ -2728,6 +3464,64 @@ class RobotWebRuntime:
         self._last_error = None
         self.log("Offline replay mode is ready; playback is scheduled for stage 7")
 
+    def _make_data_view_policy_client(
+        self, server_url: str, api_key: str | None, timeout: float, metadata_timeout: float
+    ) -> _LeasedPolicyClient:
+        """Create a policy client for one open-loop job without claiming a robot."""
+        owner_id = f"{self._resource_owner_id}-open-loop-{secrets.token_hex(8)}"
+        try:
+            lease = self._resource_manager.acquire(
+                owner_id,
+                (ResourceRequest(ResourceType.POLICY_CLIENT, str(server_url)),),
+            )
+        except ResourceLeaseConflict as exc:
+            raise RuntimeError(f"open-loop policy resource is unavailable: {exc}") from exc
+        try:
+            if self._policy_client_factory is not None:
+                client = self._policy_client_factory(server_url, api_key, timeout)
+            else:
+                client = PolicyClient(server_url, api_key, timeout=timeout, metadata_timeout=metadata_timeout)
+        except BaseException:
+            lease.release()
+            raise
+        return _LeasedPolicyClient(client, lease)
+
+    def _connect_data_view_locked(self) -> None:
+        if self._recorded_data_view is None:
+            raise ApiError(
+                "Import a recording directory in DATA_VIEW before connecting",
+                HTTPStatus.CONFLICT,
+            )
+        self._activate_data_view_locked()
+
+    def _activate_data_view_locked(self) -> None:
+        """Activate the optional DATA_VIEW worker/lease without hardware."""
+        if self._recorded_data_view is None:
+            raise ApiError(
+                "Import a recording directory in DATA_VIEW before connecting",
+                HTTPStatus.CONFLICT,
+            )
+        if self._data_view_ready_locked():
+            return
+        self._acquire_resources_locked(RuntimeMode.DATA_VIEW, self._args)
+        if self._data_view_open_loop_jobs is None:
+            try:
+                self._data_view_open_loop_jobs = OpenLoopEvaluationJobManager(
+                    self._open_loop_output_root,
+                    policy_factory=self._make_data_view_policy_client,
+                )
+            except BaseException:
+                self._release_resources_locked()
+                raise
+            self._data_view_generation_id += 1
+            self._data_view_session_id = f"data-view-{secrets.token_hex(8)}"
+        self._connected = True
+        self._policy_connected = False
+        self._policy_state = "DISCONNECTED"
+        self._phase = "data_view"
+        self._last_error = None
+        self.log("DATA_VIEW is ready; no robot, camera, or policy client was created")
+
     def _start_policy_worker_locked(self, controller: RuntimeController, args: Any) -> None:
         self._startup_generation_id += 1
         generation_id = self._startup_generation_id
@@ -2836,6 +3630,7 @@ class RobotWebRuntime:
         self._camera_thread.start()
 
     def stop(self, *, wait: bool = False) -> dict[str, Any]:
+        stop_data_view_jobs = False
         with self._lock:
             self._refresh_controller_state_locked()
             if self._evaluation_owner is not None:
@@ -2852,6 +3647,16 @@ class RobotWebRuntime:
                 connection_active = False
             elif self._runtime_mode is RuntimeMode.OFFLINE_REPLAY:
                 return self.status()
+            elif self._runtime_mode is RuntimeMode.DATA_VIEW:
+                # Stop only explicitly submitted policy work.  Browsing stays
+                # ready and does not close its read-only data session.
+                stop_data_view_jobs = True
+                camera_thread = None
+                controller = None
+                startup_thread = None
+                startup_active = False
+                connection_thread = None
+                connection_active = False
             else:
                 startup_thread = self._startup_thread
                 startup_active = self._startup_active_locked()
@@ -2871,6 +3676,9 @@ class RobotWebRuntime:
                 controller = self._controller
                 camera_thread = None
         self.log("Stop requested")
+        if stop_data_view_jobs:
+            self._data_view_stop_active_open_loop()
+            return self.status()
         if startup_active and controller is not None:
             close_client = getattr(controller.policy_client, "close", None)
             if callable(close_client):
@@ -2929,6 +3737,10 @@ class RobotWebRuntime:
             replay_lease.release()
         if replay_recorder is not None:
             replay_recorder.stop(result="disconnected")
+        # DATA_VIEW has a non-daemon open-loop worker.  Close it before
+        # releasing the read-only resource lease so a stale worker cannot
+        # publish a result into a later DATA_VIEW session.
+        self._close_data_view_open_loop_jobs()
         if pose_controller is not None and pose_moving:
             pose_controller.stop(wait=True, timeout=2.0)
         with self._lock:
@@ -3206,6 +4018,7 @@ class RobotWebRuntime:
             connection_active = self._connection_active_locked()
             replay_active = self._replay_active_locked()
             cleanup_pending = self._pending_deployment_cleanup is not None
+            data_view = self._data_view_status_locked()
             can_reset = (
                 self._runtime_mode is RuntimeMode.DEPLOYMENT
                 and self._controller is not None
@@ -3244,6 +4057,12 @@ class RobotWebRuntime:
                     and self._phase in {"idle", "error"}
                 )
                 or (
+                    self._runtime_mode is RuntimeMode.DATA_VIEW
+                    and not self._connected
+                    and not cleanup_pending
+                    and self._phase in {"idle", "error"}
+                )
+                or (
                     self._runtime_mode is RuntimeMode.DEPLOYMENT
                     and not self._running
                     and not self._stop_requested
@@ -3257,7 +4076,8 @@ class RobotWebRuntime:
                 or connection_active
                 or startup_active
                 or replay_active
-                or (self._runtime_mode is RuntimeMode.CAMERA_PREVIEW and self._phase == "previewing"),
+                or (self._runtime_mode is RuntimeMode.CAMERA_PREVIEW and self._phase == "previewing")
+                or data_view["open_loop_active"],
                 "can_disconnect": self._connected
                 or self._running
                 or connection_active
@@ -3305,6 +4125,7 @@ class RobotWebRuntime:
                 "evaluation": evaluation,
                 "pose": self.pose_status(),
                 "replay": self.replay_status(),
+                "data_view": data_view,
                 "logs": list(self._logs),
                 "resource_leases": self._resource_manager.snapshot(),
             }
@@ -3804,8 +4625,12 @@ class PiperWebHandler(BaseHTTPRequestHandler):
         try:
             if path in {"/", "/replay"}:
                 self._send_file(self.server.static_dir / "index.html")
+            elif path == "/data-view":
+                self._send_file(self.server.static_dir / "data_view.html")
             elif path.startswith("/static/"):
                 self._send_file(self.server.static_dir / path.removeprefix("/static/"))
+            elif path.startswith("/api/data-view/"):
+                self._handle_data_view_get(path, urllib.parse.parse_qs(parsed.query))
             elif path == "/api/status":
                 self._send_json(self.server.runtime.status())
             elif path == "/api/config":
@@ -3842,6 +4667,12 @@ class PiperWebHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
         except ApiError as exc:
             self._send_json({"ok": False, "error": str(exc)}, exc.status)
+        except DataViewError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        except FileNotFoundError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except BrokenPipeError:
             pass
         except Exception as exc:
@@ -3857,7 +4688,23 @@ class PiperWebHandler(BaseHTTPRequestHandler):
         try:
             if not self.server.authorize(self.headers.get("X-Motrix-Key")):
                 raise ApiError("Invalid access key", HTTPStatus.UNAUTHORIZED)
-            if path == "/api/baselines":
+            if path == "/api/data-view/datasets":
+                imported = self.server.runtime_call("data_view_import_root", self._read_json())
+                self._send_json({"ok": True, **imported}, HTTPStatus.CREATED)
+            elif path == "/api/data-view/datasets/remove":
+                removed = self.server.runtime_call("data_view_remove_root", self._read_json())
+                self._send_json({"ok": True, **removed})
+            elif path == "/api/data-view/selection":
+                selection = self.server.runtime_call("data_view_select", self._read_json())
+                self._send_json({"ok": True, **selection})
+            elif path == "/api/data-view/open-loop-evaluations":
+                job = self.server.runtime_call("data_view_submit_open_loop", self._read_json())
+                self._send_json({"ok": True, "job": job}, HTTPStatus.ACCEPTED)
+            elif self._is_data_view_open_loop_stop(path):
+                job_id = path.split("/")[4]
+                job = self.server.runtime_call("data_view_stop_open_loop", job_id)
+                self._send_json({"ok": True, "job": job})
+            elif path == "/api/baselines":
                 job = self.server.runtime_call("create_baseline", self._read_json())
                 self._send_json({"ok": True, "job": job}, HTTPStatus.ACCEPTED)
             elif path == "/api/baselines/from-evaluation":
@@ -3986,6 +4833,10 @@ class PiperWebHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": str(exc), "diff": exc.diff.to_dict()}, HTTPStatus.CONFLICT)
         except ApiError as exc:
             self._send_json({"ok": False, "error": str(exc)}, exc.status)
+        except DataViewError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        except FileNotFoundError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.NOT_FOUND)
         except ValueError as exc:
             self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except Exception as exc:
@@ -3994,6 +4845,150 @@ class PiperWebHandler(BaseHTTPRequestHandler):
                 {"ok": False, "error": f"{type(exc).__name__}: {exc}", "error_type": type(exc).__name__},
                 HTTPStatus.INTERNAL_SERVER_ERROR,
             )
+
+    @staticmethod
+    def _query_text(query: Mapping[str, list[str]], name: str, default: str | None = None) -> str:
+        values = query.get(name)
+        if not values:
+            if default is None:
+                raise DataViewError(f"missing query parameter: {name}")
+            return default
+        return values[0]
+
+    def _query_int(self, query: Mapping[str, list[str]], name: str) -> int:
+        return int(self._query_text(query, name))
+
+    def _query_float(self, query: Mapping[str, list[str]], name: str) -> float:
+        return float(self._query_text(query, name))
+
+    @staticmethod
+    def _is_data_view_open_loop_stop(path: str) -> bool:
+        parts = path.split("/")
+        return (
+            len(parts) == 6
+            and parts[:4] == ["", "api", "data-view", "open-loop-evaluations"]
+            and bool(parts[4])
+            and parts[5] == "stop"
+        )
+
+    def _handle_data_view_get(self, path: str, query: Mapping[str, list[str]]) -> None:
+        """Serve the standalone mp-data-view API from the shared Web runtime."""
+        if path == "/api/data-view/status":
+            self._send_json({"ok": True, "data_view": self.server.runtime_call("data_view_status")})
+            return
+        if path == "/api/data-view/datasets":
+            self._send_json({"ok": True, "datasets": self.server.runtime_call("data_view_datasets")})
+            return
+        if path == "/api/data-view/selection":
+            self._send_json({"ok": True, **self.server.runtime_call("data_view_selection")})
+            return
+        if path == "/api/data-view/open-loop-evaluations":
+            self._send_json({"ok": True, "jobs": self.server.runtime_call("data_view_open_loop_jobs")})
+            return
+
+        open_loop_prefix = "/api/data-view/open-loop-evaluations/"
+        if path.startswith(open_loop_prefix):
+            parts = path.split("/")
+            if len(parts) == 5 and parts[4]:
+                self._send_json({"ok": True, "job": self.server.runtime_call("data_view_open_loop_job", parts[4])})
+                return
+            if len(parts) == 7 and parts[4] and parts[5] == "reports":
+                report = self.server.runtime_call(
+                    "data_view_open_loop_report",
+                    parts[4],
+                    int(parts[6]),
+                    include_curves=self._query_text(query, "curves", "0") == "1",
+                )
+                self._send_json({"ok": True, "report": report})
+                return
+            raise ApiError("not found", HTTPStatus.NOT_FOUND)
+
+        parts = path.split("/")
+        # /api/data-view/datasets/{id}/episodes[/index/{operation}]
+        if len(parts) < 6 or parts[3] != "datasets" or parts[5] != "episodes":
+            raise ApiError("not found", HTTPStatus.NOT_FOUND)
+        dataset_id = urllib.parse.unquote(parts[4])
+        if len(parts) == 6:
+            self._send_json({"ok": True, "episodes": self.server.runtime_call("data_view_episodes", dataset_id)})
+            return
+        if len(parts) < 8:
+            raise ApiError("not found", HTTPStatus.NOT_FOUND)
+        episode_index = int(parts[6])
+        operation = parts[7]
+        if operation == "metadata":
+            self._send_json(
+                {"ok": True, **self.server.runtime_call("data_view_episode_metadata", dataset_id, episode_index)}
+            )
+        elif operation == "sample":
+            self._send_json(
+                {
+                    "ok": True,
+                    **self.server.runtime_call(
+                        "data_view_sample", dataset_id, episode_index, self._query_int(query, "sample_index")
+                    ),
+                }
+            )
+        elif operation == "sample-at":
+            self._send_json(
+                {
+                    "ok": True,
+                    **self.server.runtime_call(
+                        "data_view_sample_at_timestamp",
+                        dataset_id,
+                        episode_index,
+                        self._query_float(query, "timestamp"),
+                    ),
+                }
+            )
+        elif operation == "frame":
+            frame, metadata = self.server.runtime_call(
+                "data_view_camera_frame",
+                dataset_id,
+                episode_index,
+                self._query_int(query, "sample_index"),
+                self._query_text(query, "role"),
+            )
+            self._send_data_view_jpeg(frame, metadata)
+        elif operation == "curves":
+            requested = tuple(item for item in self._query_text(query, "series", "action").split(",") if item)
+            max_points = int(self._query_text(query, "max_points", "600"))
+            self._send_json(
+                {
+                    "ok": True,
+                    **self.server.runtime_call(
+                        "data_view_curves",
+                        dataset_id,
+                        episode_index,
+                        series=requested,
+                        max_points=max_points,
+                    ),
+                }
+            )
+        elif operation == "events":
+            limit = int(self._query_text(query, "limit", "2000"))
+            self._send_json(
+                {
+                    "ok": True,
+                    **self.server.runtime_call("data_view_runtime_events", dataset_id, episode_index, limit=limit),
+                }
+            )
+        elif operation == "metrics":
+            self._send_json({"ok": True, **self.server.runtime_call("data_view_metrics", dataset_id, episode_index)})
+        else:
+            raise ApiError("not found", HTTPStatus.NOT_FOUND)
+
+    def _send_data_view_jpeg(self, frame: np.ndarray, metadata: Mapping[str, Any]) -> None:
+        data = _encode_jpeg_rgb(np.asarray(frame, dtype=np.uint8), quality=90)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Index", str(metadata["frame_index"]))
+        self.send_header("X-Frame-Id", str(metadata["frame_id"]))
+        self.send_header("X-Rendered-Frame-Index", str(metadata.get("rendered_frame_index", metadata["frame_index"])))
+        self.send_header("X-Frame-Reused", "true" if metadata.get("frame_reused") else "false")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -4131,10 +5126,12 @@ class PiperWebServer(ThreadingHTTPServer):
                 profile=profile,
                 policy_timeout=self.runtime._policy_timeout,
                 resource_manager=self.runtime.resource_manager,
-                recorded_data_roots=self.runtime._recorded_data_roots,
+                recorded_data_roots=self.runtime._startup_recorded_data_roots,
+                data_view_web_roots=self.runtime._data_view_web_roots,
                 pose_mapping_config=self.runtime._pose_mapping_config,
                 replay_record_root=self.runtime._replay_record_root,
                 baseline_root=self.runtime._baseline_root,
+                open_loop_output_root=self.runtime._open_loop_output_root,
             )
             return self.runtime.get_config()
 
@@ -4189,6 +5186,12 @@ def main() -> None:
         default=pathlib.Path("recordings/baselines"),
         help="Directory for immutable Baseline JSON documents and compact run references.",
     )
+    parser.add_argument(
+        "--open-loop-output-root",
+        type=pathlib.Path,
+        default=pathlib.Path("open_loop_results"),
+        help="Directory for isolated DATA_VIEW teacher-forced evaluation artifacts.",
+    )
     cli_args = parser.parse_args()
 
     if cli_args.policy_timeout <= 0:
@@ -4238,6 +5241,7 @@ def main() -> None:
         pose_mapping_config=pose_mapping_config,
         replay_record_root=cli_args.replay_record_root,
         baseline_root=cli_args.baseline_root,
+        open_loop_output_root=cli_args.open_loop_output_root,
     )
     access_key = cli_args.access_key or os.environ.get("MOTRIX_WEB_ACCESS_KEY")
     server = PiperWebServer((cli_args.host, cli_args.port), PiperWebHandler, runtime, access_key=access_key)

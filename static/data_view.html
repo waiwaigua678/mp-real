@@ -3,92 +3,97 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>离线数据查看 · mp-real</title>
+    <title>数据回放与开环评测 · mp-real</title>
     <link rel="stylesheet" href="/static/data_view.css" />
   </head>
-  <body>
-    <header>
-      <div>
-        <h1>离线数据查看</h1>
-        <p>Episode 查看器 · 浏览时不会创建 Robot、Camera 或 PolicyClient；开环任务仅在显式提交后连接 Policy。</p>
-      </div>
-      <span class="readonly">READ ONLY</span>
-    </header>
-    <main>
-      <section class="card controls">
-        <label>数据集<select id="datasetSelect"></select></label>
-        <label>Episode<select id="episodeSelect"></select></label>
-        <div class="episode-meta" id="episodeMeta">正在载入数据目录…</div>
-      </section>
-
-      <section class="card open-loop">
-        <div class="section-heading"><div><h2>Teacher-forced 开环评测</h2><span>使用真实录制 observation；不创建 Robot，不发送动作。</span></div></div>
-        <div class="open-loop-controls">
-          <label>Policy URL<input id="openLoopPolicyUrl" value="ws://127.0.0.1:8000" /></label>
-          <label>Policy label<input id="openLoopPolicyLabel" value="policy" /></label>
-          <label>target source<select id="openLoopTargetSource"><option value="action">action</option><option value="executed_action">executed_action</option><option value="expert_action">expert_action</option></select></label>
-          <label>alignment<select id="openLoopAlignment"><option value="sample_index">sample index</option><option value="timestamp">timestamp</option><option value="absolute_control_step">absolute control step</option></select></label>
-          <label>timestamp tolerance (s)<input id="openLoopTimestampError" type="number" min="0" step="0.001" value="0.05" /></label>
-          <label>camera roles（逗号分隔，留空为全部）<input id="openLoopCameraRoles" /></label>
-          <label class="checkbox"><input id="openLoopFrameControl" type="checkbox" /> frame_index 是 control step</label>
+  <body class="data-view-body">
+    <main class="data-view-shell">
+      <header class="data-view-header">
+        <div class="data-view-title">
+          <h1>数据回放与开环评测</h1>
+          <span id="episodeMeta">正在读取数据目录…</span>
         </div>
-        <div class="sample-actions"><button id="startOpenLoop" type="button" class="primary">开始开环评测</button><button id="stopOpenLoop" type="button" disabled>停止评测</button></div>
-        <div class="selected" id="openLoopStatus">尚未提交开环评测。</div>
-        <div class="open-loop-result" id="openLoopResult"></div>
-      </section>
-
-      <section class="card playback">
-        <div class="playback-buttons">
-          <button id="jumpStart" type="button">⏮ 开始</button>
-          <button id="previousFrame" type="button">◀ 上一帧</button>
-          <button id="playPause" type="button" class="primary">▶ 播放</button>
-          <button id="nextFrame" type="button">下一帧 ▶</button>
-          <button id="jumpEnd" type="button">结束 ⏭</button>
-          <label class="rate">速度<select id="playbackRate"><option value="0.25">0.25x</option><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option></select></label>
+        <div class="data-view-controls">
+          <details class="data-view-menu" id="datasetImportMenu" hidden>
+            <summary>导入数据路径</summary>
+            <div class="data-view-menu-content">
+              <p>输入运行 mp-real-web 的这台机器上可读取的目录。导入只建立录制数据目录索引，不会连接机器人、相机或策略服务。</p>
+              <label class="data-view-menu-wide">数据集或存储目录<input id="datasetPath" type="text" autocomplete="off" spellcheck="false" placeholder="例如 /home/rm/recordings 或 /data/my_dataset" /></label>
+              <div class="data-view-menu-actions"><button id="importDatasetPath" type="button" class="primary">导入路径</button></div>
+              <div class="data-view-job data-view-import-status" id="datasetImportStatus">尚未导入额外数据路径。</div>
+              <div class="data-view-root-list" id="datasetRootList"></div>
+            </div>
+          </details>
+          <label>数据集<select id="datasetSelect" aria-label="数据集"></select></label>
+          <label>Episode<select id="episodeSelect" aria-label="Episode"></select></label>
+          <button id="selectSample" type="button">标记当前样本</button>
+          <details class="data-view-menu">
+            <summary>开环评测</summary>
+            <div class="data-view-menu-content open-loop-controls">
+              <p>仅发送录制的图像和状态给推理服务；绝不创建 Robot 或发送动作。</p>
+              <label>Policy URL<input id="openLoopPolicyUrl" value="ws://127.0.0.1:8000" /></label>
+              <label>Policy label<input id="openLoopPolicyLabel" value="policy" /></label>
+              <label>Policy API key（可选）<input id="openLoopPolicyApiKey" type="password" autocomplete="off" /></label>
+              <label>目标动作<select id="openLoopTargetSource"><option value="action">录制 action</option><option value="executed_action">executed action</option><option value="expert_action">expert action</option></select></label>
+              <label>对齐<select id="openLoopAlignment"><option value="sample_index">sample index</option><option value="timestamp">timestamp</option><option value="absolute_control_step">absolute control step</option></select></label>
+              <label>时间容差（秒）<input id="openLoopTimestampError" type="number" min="0" step="0.001" value="0.05" /></label>
+              <label>相机角色（逗号，留空为全部）<input id="openLoopCameraRoles" /></label>
+              <label class="data-view-check"><input id="openLoopFrameControl" type="checkbox" /> frame_index 是 control step</label>
+              <div class="data-view-menu-actions"><button id="startOpenLoop" type="button" class="primary">开始开环评测</button><button id="stopOpenLoop" type="button" class="danger" disabled>停止评测</button></div>
+              <div class="data-view-job" id="openLoopStatus">尚未提交开环评测。</div>
+              <div class="data-view-job" id="openLoopResult"></div>
+            </div>
+          </details>
+          <details class="data-view-menu" id="robotReplayMenu" hidden>
+            <summary>连接机器人回放</summary>
+            <div class="data-view-menu-content replay-controls">
+              <p>仅在生成离线安全计划、连接机器人并完成二次确认后才会运动。开环评测不会经过这里。</p>
+              <label>Start sample<input id="replayStartSample" type="number" min="0" /></label>
+              <label>End sample<input id="replayEndSample" type="number" min="0" /></label>
+              <label>模式<select id="replayMode"><option value="command">命令回放</option><option value="state">状态轨迹跟随</option></select></label>
+              <label>时间<select id="replayTiming"><option value="recorded">记录时间戳</option><option value="fixed">固定 FPS</option></select></label>
+              <label>FPS<input id="replayFps" type="number" min="1" step="0.1" placeholder="固定模式" /></label>
+              <label>速度比例<input id="replaySpeedScale" type="number" min="0.01" max="1" step="0.01" value="0.1" /></label>
+              <div class="data-view-menu-actions"><button id="replayPlanBtn" type="button">生成安全计划</button><button id="replayConnectBtn" type="button">连接并移至起点</button><button id="replayStartBtn" type="button" class="danger">确认开始回放</button><button id="replayPauseBtn" type="button">暂停</button><button id="replayResumeBtn" type="button">继续</button><button id="replayStopBtn" type="button" class="danger">停止</button><button id="replayEmergencyBtn" type="button" class="danger">紧急停止</button></div>
+              <div class="data-view-job" id="replayStatus">尚未生成真机回放计划。</div>
+            </div>
+          </details>
         </div>
-        <input id="progress" type="range" min="0" max="0" value="0" step="1" aria-label="Episode sample progress" />
-        <div class="current-line" id="currentLine">sample 0</div>
-      </section>
+      </header>
 
-      <div class="notice" id="message"></div>
+      <div class="data-view-notice" id="message"></div>
+      <div class="data-view-selection" id="selectionState">尚未标记 sample</div>
 
-      <section>
-        <div class="section-heading"><h2>同步相机</h2><span>以 sample index 对齐；缺失帧不会插值。</span></div>
-        <div class="camera-grid" id="cameraGrid"></div>
-      </section>
+      <section class="data-view-camera-grid" id="cameraGrid" aria-label="录制相机画面"></section>
 
-      <section class="two-column">
-        <article class="card">
-          <h2>当前 sample</h2>
-          <dl class="sample-details" id="sampleDetails"></dl>
-          <div class="sample-actions">
-            <button id="selectSample" type="button" class="primary">选择当前样本</button>
-            <button type="button" disabled title="阶段 8 仅查看数据">移动到此状态（仅离线预检）</button>
-            <button type="button" disabled title="阶段 8 不连接 Policy">从此状态开始推理</button>
-            <button type="button" disabled title="阶段 8 不执行真实机器人回放">从此处开始真机回放</button>
-          </div>
-          <div class="selected" id="selectionState">尚未选择 sample</div>
+      <section class="data-view-chart-grid">
+        <article class="data-view-chart-card">
+          <header><h2>observation.state</h2><span id="stateChartRange">—</span></header>
+          <div class="data-view-chart-content"><svg id="stateChart" viewBox="0 0 960 360" preserveAspectRatio="none" role="img" aria-label="录制状态曲线"></svg><div class="data-view-legend" id="stateLegend"></div></div>
         </article>
-        <article class="card">
-          <h2>基础指标</h2>
-          <dl class="metrics" id="metrics"></dl>
+        <article class="data-view-chart-card">
+          <header><h2>action <span class="data-view-chart-note" id="actionChartNote">录制动作</span></h2><span id="actionChartRange">—</span></header>
+          <div class="data-view-chart-content"><svg id="actionChart" viewBox="0 0 960 360" preserveAspectRatio="none" role="img" aria-label="动作与开环预测曲线"></svg><div class="data-view-legend" id="actionLegend"></div></div>
         </article>
       </section>
 
-      <section class="card">
-        <div class="section-heading">
-          <div><h2>状态与动作曲线</h2><span>有界降采样保留首尾、局部极值、异常峰值和事件附近点。</span></div>
-          <label class="curve-picker">显示<select id="curveSeries" multiple size="4"><option value="state">robot state</option><option value="action" selected>expert action</option><option value="selected_raw_action">selected raw action</option><option value="stabilized_action">stabilized action</option><option value="executed_action">executed action</option><option value="inference_latency">inference latency</option><option value="control_cycle">control cycle</option><option value="camera_skew">camera skew</option><option value="action_jump">action jump</option><option value="jerk">jerk</option><option value="safety_modification">safety modification</option></select></label>
-        </div>
-        <div id="curveLegend" class="legend"></div>
-        <svg id="curveChart" viewBox="0 0 900 280" preserveAspectRatio="none" role="img" aria-label="Episode curves"></svg>
-      </section>
-
-      <section class="card">
-        <div class="section-heading"><h2>Runtime events</h2><span>点击事件可跳转到对应 sample。</span></div>
-        <div class="event-list" id="eventList"></div>
+      <section class="data-view-detail-grid">
+        <article class="data-view-detail-card"><h2>当前 sample</h2><dl id="sampleDetails"></dl></article>
+        <article class="data-view-detail-card"><h2>数据指标</h2><dl id="metrics"></dl><h2 class="data-view-events-heading">Runtime events</h2><div id="eventList"></div></article>
       </section>
     </main>
+
+    <footer class="data-view-playback">
+      <button id="jumpStart" type="button" title="跳到开始">⏮</button>
+      <button id="previousFrame" type="button" title="上一帧">◀</button>
+      <button id="playPause" type="button" class="primary">▶ 播放</button>
+      <button id="nextFrame" type="button" title="下一帧">▶</button>
+      <button id="jumpEnd" type="button" title="跳到结尾">⏭</button>
+      <span class="data-view-time" id="currentLine">0.00 s · frame 0</span>
+      <label class="data-view-rate">播放速度<select id="playbackRate"><option value="0.25">0.25x</option><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option></select></label>
+      <input id="progress" type="range" min="0" max="0" value="0" step="1" aria-label="Episode sample progress" />
+      <span class="data-view-duration" id="durationLine">—</span>
+    </footer>
     <script src="/static/data_view.js"></script>
   </body>
 </html>

@@ -176,10 +176,19 @@ class RobotReplayController:
     def stop(self, *, emergency: bool = False, wait: bool = False, timeout: float | None = None) -> bool:
         """Request an operator or emergency stop and optionally join safely."""
         with self._pause_condition:
-            if self._cursor.state in {ReplayState.COMPLETED, ReplayState.ABORTED, ReplayState.ERROR, ReplayState.IDLE}:
+            state = self._cursor.state
+            if state in {ReplayState.COMPLETED, ReplayState.ABORTED, ReplayState.ERROR, ReplayState.IDLE}:
                 return self.join(timeout=timeout)
             self._stop_event.set()
-            self._set_cursor_locked(ReplayState.STOPPING, message="emergency stop" if emergency else "operator stop")
+            # Once move-to-start has completed, the prepare thread has no more
+            # work to observe the stop event.  Keep this cancellation terminal
+            # instead of leaving an ARMED controller forever in STOPPING with
+            # a robot lease still held by its owner.
+            terminal_without_replay_worker = state is ReplayState.ARMED
+            self._set_cursor_locked(
+                ReplayState.ABORTED if terminal_without_replay_worker else ReplayState.STOPPING,
+                message="emergency stop" if emergency else "operator stop",
+            )
             self._pause_condition.notify_all()
             pose_controller = self._pose_controller
         if pose_controller is not None:
